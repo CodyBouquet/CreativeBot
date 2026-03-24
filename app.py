@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for
+from dotenv import load_dotenv
 import requests
 import logging
 import os
@@ -10,6 +11,8 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 from functools import wraps
+
+load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-in-production")
