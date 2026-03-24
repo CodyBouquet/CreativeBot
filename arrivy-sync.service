@@ -1,0 +1,15 @@
+[Unit]
+Description=CreativeBot — Arrivy to Pipedrive Sync Service
+After=network.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/home/admin/CreativeBot
+EnvironmentFile=/home/admin/CreativeBot/.env
+ExecStart=/home/admin/CreativeBot/venv/bin/python app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

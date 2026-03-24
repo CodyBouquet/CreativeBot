@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>CreativeBot — Unlock</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;600&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0a0e13;
+    --surface:  #111820;
+    --border:   #1e2d3d;
+    --accent:   #00c8ff;
+    --accent2:  #0077aa;
+    --text:     #c8d8e8;
+    --muted:    #4a6070;
+    --danger:   #ff4060;
+    --success:  #00e890;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Barlow', sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  /* Subtle grid background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(var(--border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size: 40px 40px;
+    opacity: 0.3;
+    pointer-events: none;
+  }
+
+  .container {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 32px;
+    z-index: 1;
+  }
+
+  .logo {
+    text-align: center;
+  }
+
+  .logo-title {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 22px;
+    letter-spacing: 6px;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+
+  .logo-sub {
+    font-size: 11px;
+    letter-spacing: 3px;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-top: 4px;
+  }
+
+  /* PIN dots */
+  .pin-display {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    height: 48px;
+  }
+
+  .pin-dot {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+    background: transparent;
+    transition: all 0.15s ease;
+  }
+
+  .pin-dot.filled {
+    background: var(--accent);
+    border-color: var(--accent);
+    box-shadow: 0 0 12px var(--accent);
+  }
+
+  .pin-dot.error {
+    background: var(--danger);
+    border-color: var(--danger);
+    box-shadow: 0 0 12px var(--danger);
+    animation: shake 0.4s ease;
+  }
+
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    20% { transform: translateX(-6px); }
+    40% { transform: translateX(6px); }
+    60% { transform: translateX(-4px); }
+    80% { transform: translateX(4px); }
+  }
+
+  /* Keypad */
+  .keypad {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    width: 280px;
+  }
+
+  .key {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: 'Barlow', sans-serif;
+    font-size: 24px;
+    font-weight: 300;
+    height: 72px;
+    cursor: pointer;
+    transition: all 0.1s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .key:active, .key.pressed {
+    background: var(--accent2);
+    border-color: var(--accent);
+    color: white;
+    transform: scale(0.95);
+  }
+
+  .key.zero {
+    grid-column: 2;
+  }
+
+  .key.del {
+    grid-column: 3;
+    font-size: 18px;
+    color: var(--muted);
+  }
+
+  .key.del:active {
+    color: var(--danger);
+    border-color: var(--danger);
+    background: rgba(255, 64, 96, 0.1);
+  }
+
+  .status-msg {
+    font-size: 12px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--muted);
+    height: 20px;
+    transition: color 0.2s;
+  }
+
+  .status-msg.error { color: var(--danger); }
+  .status-msg.success { color: var(--success); }
+
+  /* Scan line effect */
+  body::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.03) 2px,
+      rgba(0,0,0,0.03) 4px
+    );
+    pointer-events: none;
+    z-index: 100;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="logo">
+    <div class="logo-title">CreativeBot</div>
+    <div class="logo-sub">Creative Carpet Inc &nbsp;·&nbsp; Operations</div>
+  </div>
+
+  <div class="pin-display" id="pinDisplay">
+    <div class="pin-dot" id="d0"></div>
+    <div class="pin-dot" id="d1"></div>
+    <div class="pin-dot" id="d2"></div>
+    <div class="pin-dot" id="d3"></div>
+  </div>
+
+  <div class="status-msg" id="statusMsg">ENTER PIN</div>
+
+  <div class="keypad">
+    <button class="key" onclick="pressKey('1')">1</button>
+    <button class="key" onclick="pressKey('2')">2</button>
+    <button class="key" onclick="pressKey('3')">3</button>
+    <button class="key" onclick="pressKey('4')">4</button>
+    <button class="key" onclick="pressKey('5')">5</button>
+    <button class="key" onclick="pressKey('6')">6</button>
+    <button class="key" onclick="pressKey('7')">7</button>
+    <button class="key" onclick="pressKey('8')">8</button>
+    <button class="key" onclick="pressKey('9')">9</button>
+    <button class="key zero" onclick="pressKey('0')">0</button>
+    <button class="key del" onclick="deleteLast()">⌫</button>
+  </div>
+</div>
+
+<script>
+  let pin = '';
+
+  function updateDots() {
+    for (let i = 0; i < 4; i++) {
+      const dot = document.getElementById('d' + i);
+      dot.classList.toggle('filled', i < pin.length);
+      dot.classList.remove('error');
+    }
+  }
+
+  function pressKey(digit) {
+    if (pin.length >= 4) return;
+    pin += digit;
+    updateDots();
+    if (pin.length === 4) submitPin();
+  }
+
+  function deleteLast() {
+    pin = pin.slice(0, -1);
+    updateDots();
+    setStatus('ENTER PIN', '');
+  }
+
+  function setStatus(msg, type) {
+    const el = document.getElementById('statusMsg');
+    el.textContent = msg;
+    el.className = 'status-msg ' + type;
+  }
+
+  async function submitPin() {
+    try {
+      const res = await fetch('/pin/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin })
+      });
+      if (res.ok) {
+        setStatus('UNLOCKED', 'success');
+        setTimeout(() => window.location.href = '/', 400);
+      } else {
+        setStatus('INCORRECT PIN', 'error');
+        for (let i = 0; i < 4; i++) {
+          document.getElementById('d' + i).classList.add('error');
+        }
+        setTimeout(() => {
+          pin = '';
+          updateDots();
+          setStatus('ENTER PIN', '');
+        }, 1000);
+      }
+    } catch (e) {
+      setStatus('CONNECTION ERROR', 'error');
+      pin = '';
+      updateDots();
+    }
+  }
+</script>
+</body>
+</html>
