@@ -362,6 +362,7 @@ def arrivy_webhook():
         external_id = payload.get("OBJECT_EXTERNAL_ID")
         task_id     = payload.get("OBJECT_ID")
 
+        logger.info(f"Arrivy raw payload: {json.dumps(payload)}")
         logger.info(f"Arrivy: {event_type} | template={template_id} | deal={external_id} | task={task_id}")
 
         if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED"):
