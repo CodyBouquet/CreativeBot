@@ -11,6 +11,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 from functools import wraps
+import threading
 
 load_dotenv()
 
@@ -438,10 +439,13 @@ def deploy():
         if not hmac.compare_digest(expected, signature):
             return jsonify({"error": "unauthorized"}), 401
 
-        subprocess.run(["git", "-C", REPO_PATH, "pull"], check=True)
-        subprocess.run(["sudo", "systemctl", "restart", SERVICE_NAME], check=True)
-        logger.info("Auto-deploy successful")
-        return jsonify({"status": "deployed"}), 200
+        def _restart():
+            subprocess.run(["git", "-C", REPO_PATH, "pull"], check=True)
+            logger.info("Auto-deploy: pulled latest code, restarting service")
+            subprocess.run(["sudo", "systemctl", "restart", SERVICE_NAME], check=True)
+
+        threading.Thread(target=_restart, daemon=True).start()
+        return jsonify({"status": "deploying"}), 200
     except Exception as e:
         logger.exception(f"Deploy failed: {e}")
         return jsonify({"error": str(e)}), 500
