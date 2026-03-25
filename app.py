@@ -355,6 +355,9 @@ def arrivy_webhook():
         if not external_id:
             return jsonify({"status": "ignored", "reason": "no external id"}), 200
 
+        if str(external_id) != "29905":
+            return jsonify({"status": "ignored", "reason": "not test deal"}), 200
+
         deal_id   = int(external_id)
         task_type = TEMPLATE_MAP.get(template_id)
 
