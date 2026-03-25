@@ -48,7 +48,7 @@ PD_FIELDS = {
 
 INSTALL_COMPLETE_STAGE_ID = 12
 
-ALLOWED_DASHBOARD_IP = "50.171.14.50"
+ALLOWED_DASHBOARD_IP = "127.0.0.1"
 DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats"}
 
 # ---------------------------------------------------------------------------
