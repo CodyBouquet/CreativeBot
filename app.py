@@ -262,7 +262,7 @@ def restrict_dashboard_by_ip():
         client_ip = client_ip.split(",")[0].strip()
         if client_ip != ALLOWED_DASHBOARD_IP:
             logger.warning(f"Blocked {client_ip} from {request.endpoint}")
-            return jsonify({"error": "forbidden"}), 403
+            return redirect("https://www.creativecarpetinc.com")
 
 # ---------------------------------------------------------------------------
 # PIN AUTH
