@@ -165,7 +165,9 @@ def parse_arrivy_date(date_str):
     if not date_str:
         return None
     try:
-        return datetime.fromisoformat(date_str).strftime("%Y-%m-%d")
+        # Strip timezone offset so fromisoformat works on Python < 3.11
+        clean = date_str[:19]
+        return datetime.fromisoformat(clean).strftime("%Y-%m-%d")
     except Exception:
         return None
 
@@ -356,14 +358,26 @@ def arrivy_webhook():
         if not payload:
             return jsonify({"error": "empty payload"}), 400
 
-        event_type  = payload.get("EVENT_TYPE")
+        raw_event_type = payload.get("EVENT_TYPE")
+        sub_type    = payload.get("EVENT_SUB_TYPE", "")
         template_id = payload.get("OBJECT_TEMPLATE_ID")
         object_date = payload.get("OBJECT_DATE")
         external_id = payload.get("OBJECT_EXTERNAL_ID")
         task_id     = payload.get("OBJECT_ID")
 
+        # Map Arrivy's TASK_STATUS + subtype to internal event types
+        STATUS_SUBTYPE_MAP = {
+            "COMPLETE":  "TASK_COMPLETED",
+            "CANCEL":    "TASK_CANCELLED",
+            "CANCELLED": "TASK_CANCELLED",
+        }
+        if raw_event_type == "TASK_STATUS":
+            event_type = STATUS_SUBTYPE_MAP.get(sub_type.upper())
+        else:
+            event_type = raw_event_type
+
         logger.info(f"Arrivy raw payload: {json.dumps(payload)}")
-        logger.info(f"Arrivy: {event_type} | template={template_id} | deal={external_id} | task={task_id}")
+        logger.info(f"Arrivy: {event_type} (raw={raw_event_type}/{sub_type}) | template={template_id} | deal={external_id} | task={task_id}")
 
         if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED"):
             return jsonify({"status": "ignored"}), 200
