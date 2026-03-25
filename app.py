@@ -42,7 +42,7 @@ TEMPLATE_MAP = {
 # Pipedrive custom field keys
 PD_FIELDS = {
     "install_start":  "197d71fa84fd5221fa4a875fbac9526c1d554139",
-    "install_part2":  "17492f008b747af364836514d752961176f1f0307",
+    "install_part2":  "7492f008b747af364836514d752961176f1f0307",
     "measure_date":   "e23dc895627529b276d3b1b0ec7c8acc75317b1c",
     "delivery_date":  "d0d424fcacbdf264297a050ff96a799823316d9f",
 }
