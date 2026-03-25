@@ -48,6 +48,9 @@ PD_FIELDS = {
 
 INSTALL_COMPLETE_STAGE_ID = 12
 
+ALLOWED_DASHBOARD_IP = "50.171.14.50"
+DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats"}
+
 # ---------------------------------------------------------------------------
 # DATABASE
 # ---------------------------------------------------------------------------
@@ -248,6 +251,18 @@ def _install_slot_date(date, install_start, install_part2, deal_id):
         })
     else:
         pd_update_deal(deal_id, {PD_FIELDS["install_part2"]: date})
+
+# ---------------------------------------------------------------------------
+# IP RESTRICTION
+# ---------------------------------------------------------------------------
+@app.before_request
+def restrict_dashboard_by_ip():
+    if request.endpoint in DASHBOARD_ENDPOINTS:
+        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+        client_ip = client_ip.split(",")[0].strip()
+        if client_ip != ALLOWED_DASHBOARD_IP:
+            logger.warning(f"Blocked {client_ip} from {request.endpoint}")
+            return jsonify({"error": "forbidden"}), 403
 
 # ---------------------------------------------------------------------------
 # PIN AUTH
