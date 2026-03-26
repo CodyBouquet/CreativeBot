@@ -81,7 +81,7 @@ def init_db():
                 task_id      INTEGER PRIMARY KEY,
                 deal_id      INTEGER NOT NULL,
                 task_type    TEXT    NOT NULL,
-                current_date TEXT,
+                task_date    TEXT,
                 status       TEXT    NOT NULL DEFAULT 'active',
                 last_updated TEXT    NOT NULL,
                 archived     INTEGER NOT NULL DEFAULT 0
@@ -121,15 +121,15 @@ def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload):
     )
 
 
-def upsert_task_state(conn, task_id, deal_id, task_type, current_date, status="active"):
+def upsert_task_state(conn, task_id, deal_id, task_type, task_date, status="active"):
     conn.execute(
-        """INSERT INTO task_state (task_id, deal_id, task_type, current_date, status, last_updated)
+        """INSERT INTO task_state (task_id, deal_id, task_type, task_date, status, last_updated)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(task_id) DO UPDATE SET
-               current_date = excluded.current_date,
+               task_date    = excluded.task_date,
                status       = excluded.status,
                last_updated = excluded.last_updated""",
-        (task_id, deal_id, task_type, current_date, status, datetime.utcnow().isoformat())
+        (task_id, deal_id, task_type, task_date, status, datetime.utcnow().isoformat())
     )
 
 def archive_deal(conn, deal_id):
@@ -174,64 +174,64 @@ def parse_arrivy_date(date_str):
 # TASK HANDLERS
 # ---------------------------------------------------------------------------
 def handle_measure(conn, event_type, deal_id, task_id, object_date):
-    date = parse_arrivy_date(object_date)
+    task_date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
-        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
-        upsert_task_state(conn, task_id, deal_id, "measure", date)
+        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: task_date})
+        upsert_task_state(conn, task_id, deal_id, "measure", task_date)
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
-        upsert_task_state(conn, task_id, deal_id, "measure", date, status="cancelled")
+        upsert_task_state(conn, task_id, deal_id, "measure", task_date, status="cancelled")
     elif event_type == "TASK_COMPLETED":
-        upsert_task_state(conn, task_id, deal_id, "measure", date, status="completed")
+        upsert_task_state(conn, task_id, deal_id, "measure", task_date, status="completed")
 
 def handle_delivery(conn, event_type, deal_id, task_id, object_date):
-    date = parse_arrivy_date(object_date)
+    task_date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
-        pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: date})
-        upsert_task_state(conn, task_id, deal_id, "delivery", date)
+        pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: task_date})
+        upsert_task_state(conn, task_id, deal_id, "delivery", task_date)
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: None})
-        upsert_task_state(conn, task_id, deal_id, "delivery", date, status="cancelled")
+        upsert_task_state(conn, task_id, deal_id, "delivery", task_date, status="cancelled")
     elif event_type == "TASK_COMPLETED":
-        upsert_task_state(conn, task_id, deal_id, "delivery", date, status="completed")
+        upsert_task_state(conn, task_id, deal_id, "delivery", task_date, status="completed")
 
 def handle_install(conn, event_type, deal_id, task_id, object_date):
-    date = parse_arrivy_date(object_date)
+    task_date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
-        upsert_task_state(conn, task_id, deal_id, "install", date)
+        upsert_task_state(conn, task_id, deal_id, "install", task_date)
         recalc_install(conn, deal_id)
     elif event_type == "TASK_CANCELLED":
-        upsert_task_state(conn, task_id, deal_id, "install", date, status="cancelled")
+        upsert_task_state(conn, task_id, deal_id, "install", task_date, status="cancelled")
         active = recalc_install(conn, deal_id)
         if active == 0:
             pd_move_stage(deal_id, INSTALL_UNSCHEDULED_STAGE_ID)
     elif event_type == "TASK_COMPLETED":
-        upsert_task_state(conn, task_id, deal_id, "install", date, status="completed")
+        upsert_task_state(conn, task_id, deal_id, "install", task_date, status="completed")
         pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
         set_setting(f"pending_recalc_{deal_id}", "1")
 
 def recalc_measure(conn, deal_id):
     rows = conn.execute(
-        "SELECT current_date FROM task_state WHERE deal_id=? AND task_type='measure' AND status='active' AND archived=0 ORDER BY current_date",
+        "SELECT task_date FROM task_state WHERE deal_id=? AND task_type='measure' AND status='active' AND archived=0 ORDER BY task_date",
         (deal_id,)
     ).fetchall()
-    date = rows[0]["current_date"] if rows else None
+    date = rows[0]["task_date"] if rows else None
     pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
 
 def recalc_delivery(conn, deal_id):
     rows = conn.execute(
-        "SELECT current_date FROM task_state WHERE deal_id=? AND task_type='delivery' AND status='active' AND archived=0 ORDER BY current_date",
+        "SELECT task_date FROM task_state WHERE deal_id=? AND task_type='delivery' AND status='active' AND archived=0 ORDER BY task_date",
         (deal_id,)
     ).fetchall()
-    date = rows[0]["current_date"] if rows else None
+    date = rows[0]["task_date"] if rows else None
     pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: date})
 
 def recalc_install(conn, deal_id):
     rows = conn.execute(
-        "SELECT current_date FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY current_date",
+        "SELECT task_date FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY task_date",
         (deal_id,)
     ).fetchall()
-    dates = [r["current_date"] for r in rows]
+    dates = [r["task_date"] for r in rows]
     pd_update_deal(deal_id, {
         PD_FIELDS["install_start"]: dates[0] if len(dates) > 0 else None,
         PD_FIELDS["install_part2"]: dates[1] if len(dates) > 1 else None,
