@@ -47,7 +47,9 @@ PD_FIELDS = {
     "delivery_date":  "d0d424fcacbdf264297a050ff96a799823316d9f",
 }
 
-INSTALL_COMPLETE_STAGE_ID = 12
+INSTALL_COMPLETE_STAGE_ID      = 12
+INSTALL_SCHEDULED_STAGE_ID     = 10
+INSTALL_UNSCHEDULED_STAGE_ID   = 9
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
 DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats"}
@@ -106,6 +108,10 @@ def set_setting(key, value):
     with get_db() as conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
+def delete_setting(key):
+    with get_db() as conn:
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
 def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload):
     conn.execute(
         """INSERT INTO events (received_at, deal_id, task_id, event_type, task_type, raw_json)
@@ -114,8 +120,6 @@ def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload):
          json.dumps(raw_payload))
     )
 
-def get_task_state(conn, task_id):
-    return conn.execute("SELECT * FROM task_state WHERE task_id = ?", (task_id,)).fetchone()
 
 def upsert_task_state(conn, task_id, deal_id, task_type, current_date, status="active"):
     conn.execute(
@@ -138,13 +142,6 @@ def archive_deal(conn, deal_id):
 # ---------------------------------------------------------------------------
 PD_BASE = "https://api.pipedrive.com/v1"
 
-def pd_get_deal(deal_id):
-    r = requests.get(f"{PD_BASE}/deals/{deal_id}", params={"api_token": PIPEDRIVE_API_TOKEN})
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("success"):
-        raise Exception(f"Pipedrive get deal failed: {data}")
-    return data["data"]
 
 def pd_update_deal(deal_id, fields):
     r = requests.put(f"{PD_BASE}/deals/{deal_id}",
@@ -172,10 +169,6 @@ def parse_arrivy_date(date_str):
     except Exception:
         return None
 
-def dates_match(a, b):
-    da = parse_arrivy_date(a) if a else None
-    db = parse_arrivy_date(b) if b else None
-    return bool(da and db and da == db)
 
 # ---------------------------------------------------------------------------
 # TASK HANDLERS
@@ -203,39 +196,19 @@ def handle_delivery(conn, event_type, deal_id, task_id, object_date):
         upsert_task_state(conn, task_id, deal_id, "delivery", date, status="completed")
 
 def handle_install(conn, event_type, deal_id, task_id, object_date):
-    date           = parse_arrivy_date(object_date)
-    previous_state = get_task_state(conn, task_id)
-    previous_date  = previous_state["current_date"] if previous_state else None
-    deal           = pd_get_deal(deal_id)
-    install_start  = deal.get(PD_FIELDS["install_start"])
-    install_part2  = deal.get(PD_FIELDS["install_part2"])
-
-    if event_type == "TASK_CREATED":
-        _install_slot_date(date, install_start, install_part2, deal_id)
+    date = parse_arrivy_date(object_date)
+    if event_type in ("TASK_CREATED", "TASK_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", date)
-    elif event_type == "TASK_UPDATED":
-        if previous_date:
-            if dates_match(previous_date, install_start):
-                pd_update_deal(deal_id, {PD_FIELDS["install_start"]: None})
-                install_start = None
-            elif dates_match(previous_date, install_part2):
-                pd_update_deal(deal_id, {PD_FIELDS["install_part2"]: None})
-                install_part2 = None
-        _install_slot_date(date, install_start, install_part2, deal_id)
-        upsert_task_state(conn, task_id, deal_id, "install", date)
+        recalc_install(conn, deal_id)
     elif event_type == "TASK_CANCELLED":
-        if dates_match(date, install_start):
-            pd_update_deal(deal_id, {
-                PD_FIELDS["install_start"]: install_part2,
-                PD_FIELDS["install_part2"]: None,
-            })
-        elif dates_match(date, install_part2):
-            pd_update_deal(deal_id, {PD_FIELDS["install_part2"]: None})
         upsert_task_state(conn, task_id, deal_id, "install", date, status="cancelled")
+        active = recalc_install(conn, deal_id)
+        if active == 0:
+            pd_move_stage(deal_id, INSTALL_UNSCHEDULED_STAGE_ID)
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "install", date, status="completed")
-        if dates_match(date, install_start):
-            pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
+        pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
+        set_setting(f"pending_recalc_{deal_id}", "1")
 
 def recalc_measure(conn, deal_id):
     rows = conn.execute(
@@ -263,6 +236,7 @@ def recalc_install(conn, deal_id):
         PD_FIELDS["install_start"]: dates[0] if len(dates) > 0 else None,
         PD_FIELDS["install_part2"]: dates[1] if len(dates) > 1 else None,
     })
+    return len(dates)
 
 def handle_deleted(conn, task_id, deal_id, task_type):
     conn.execute("DELETE FROM task_state WHERE task_id=?", (task_id,))
@@ -273,25 +247,10 @@ def handle_deleted(conn, task_id, deal_id, task_type):
     elif task_type == "delivery":
         recalc_delivery(conn, deal_id)
     elif task_type == "install":
-        recalc_install(conn, deal_id)
+        active = recalc_install(conn, deal_id)
+        if active == 0:
+            pd_move_stage(deal_id, INSTALL_UNSCHEDULED_STAGE_ID)
 
-def _install_slot_date(date, install_start, install_part2, deal_id):
-    if not install_start:
-        pd_update_deal(deal_id, {PD_FIELDS["install_start"]: date})
-        return
-    try:
-        new_dt   = datetime.strptime(date, "%Y-%m-%d")
-        start_dt = datetime.strptime(install_start[:10], "%Y-%m-%d")
-    except Exception as e:
-        logger.error(f"Date parse error: {e}")
-        return
-    if new_dt < start_dt:
-        pd_update_deal(deal_id, {
-            PD_FIELDS["install_start"]: date,
-            PD_FIELDS["install_part2"]: install_start[:10],
-        })
-    else:
-        pd_update_deal(deal_id, {PD_FIELDS["install_part2"]: date})
 
 # ---------------------------------------------------------------------------
 # IP RESTRICTION
@@ -469,13 +428,24 @@ def pipedrive_webhook():
         payload = request.get_json(force=True)
         if not payload:
             return jsonify({"error": "empty payload"}), 400
-        event   = payload.get("event")
-        current = payload.get("current", {})
-        status  = current.get("status")
-        deal_id = current.get("id")
-        if event == "updated.deal" and status in ("won", "lost") and deal_id:
-            with get_db() as conn:
-                archive_deal(conn, deal_id)
+        event    = payload.get("event")
+        current  = payload.get("current", {})
+        status   = current.get("status")
+        deal_id  = current.get("id")
+        stage_id = current.get("stage_id")
+
+        if event == "updated.deal" and deal_id:
+            if status in ("won", "lost"):
+                with get_db() as conn:
+                    archive_deal(conn, deal_id)
+            elif stage_id == INSTALL_SCHEDULED_STAGE_ID:
+                flag_key = f"pending_recalc_{deal_id}"
+                if get_setting(flag_key):
+                    with get_db() as conn:
+                        recalc_install(conn, deal_id)
+                    delete_setting(flag_key)
+                    logger.info(f"Post-completion recalc ran for deal {deal_id}")
+
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         logger.exception(f"Pipedrive webhook error: {e}")
