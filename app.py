@@ -626,13 +626,13 @@ def arrivy_webhook():
         logger.info(f"Arrivy: {event_type} (raw={raw_event_type}/{sub_type}) | template={template_id} | deal={external_id} | task={task_id}")
 
         if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED"):
-            return jsonify({"status": "ignored"}), 200
+            return jsonify({"status": "ok"}), 200
 
         if not external_id:
-            return jsonify({"status": "ignored", "reason": "no external id"}), 200
+            return jsonify({"status": "ok"}), 200
 
         if str(external_id) != "29905":
-            return jsonify({"status": "ignored", "reason": "not test deal"}), 200
+            return jsonify({"status": "ok"}), 200
 
         deal_id   = int(external_id)
         task_type = TEMPLATE_MAP.get(template_id)
