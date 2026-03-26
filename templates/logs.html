@@ -289,7 +289,17 @@
   }
 
   loadLogs();
-  setInterval(loadLogs, 30000);
+  setInterval(loadLogs, 60000);
+
+  // SSE — push refresh on new webhook
+  (function() {
+    function connect() {
+      const es = new EventSource('/api/stream');
+      es.onmessage = function(e) { if (e.data === 'refresh') loadLogs(); };
+      es.onerror   = function() { es.close(); setTimeout(connect, 5000); };
+    }
+    connect();
+  })();
 
   // Auto-lock / screen sleep
   (function() {
