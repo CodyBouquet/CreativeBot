@@ -135,6 +135,7 @@ def init_db():
     with get_db() as conn:
         for migration in [
             "ALTER TABLE events ADD COLUMN outcome TEXT",
+            "ALTER TABLE task_state ADD COLUMN task_date TEXT",
         ]:
             try:
                 conn.execute(migration)
