@@ -307,26 +307,53 @@
     text-transform: uppercase;
   }
 
-  .pin-input-row {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 16px;
+  /* Modal PIN keypad */
+  .pin-dot {
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+    background: transparent;
+    transition: all 0.15s ease;
+  }
+  .pin-dot.filled { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 10px var(--accent); }
+  .pin-dot.error  { background: var(--danger);  border-color: var(--danger);  box-shadow: 0 0 10px var(--danger); animation: pmShake 0.4s ease; }
+
+  @keyframes pmShake {
+    0%,100% { transform: translateX(0); }
+    20%     { transform: translateX(-5px); }
+    40%     { transform: translateX(5px); }
+    60%     { transform: translateX(-3px); }
+    80%     { transform: translateX(3px); }
   }
 
-  .pin-digit {
-    flex: 1;
+  .modal-pin-dots { display: flex; gap: 14px; justify-content: center; align-items: center; height: 40px; margin: 8px 0; }
+
+  .modal-status { font-size: 10px; letter-spacing: 2px; text-transform: uppercase; color: var(--muted); text-align: center; height: 18px; margin-bottom: 12px; transition: color 0.2s; }
+  .modal-status.error   { color: var(--danger); }
+  .modal-status.success { color: var(--success); }
+
+  .modal-keypad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+
+  .mkey {
     background: var(--card);
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 8px;
     color: var(--text);
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 20px;
-    text-align: center;
-    padding: 10px 0;
-    outline: none;
+    font-family: 'Barlow', sans-serif;
+    font-size: 22px;
+    font-weight: 300;
+    height: 60px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.1s ease;
+    -webkit-tap-highlight-color: transparent;
   }
-
-  .pin-digit:focus { border-color: var(--accent); }
+  .mkey:active        { background: var(--accent2); border-color: var(--accent); color: white; transform: scale(0.95); }
+  .mkey.mzero         { grid-column: 2; }
+  .mkey.mdel          { grid-column: 3; font-size: 16px; color: var(--muted); }
+  .mkey.mdel:active   { color: var(--danger); border-color: var(--danger); background: rgba(255,64,96,0.1); }
 
   .modal-buttons {
     display: flex;
@@ -425,6 +452,9 @@
   </div>
   <div class="header-right">
     <div class="clock" id="clock">--:--:--</div>
+    {% if is_admin %}
+    <button class="btn accent" onclick="window.location.href='/users'">Users</button>
+    {% endif %}
     <button class="btn accent" onclick="openChangePIN()">PIN</button>
     <button class="btn danger" onclick="window.location.href='/logout'">Lock</button>
   </div>
@@ -542,18 +572,29 @@
 
 <!-- Change PIN Modal -->
 <div class="modal-overlay" id="pinModal">
-  <div class="modal">
+  <div class="modal" style="width:320px;padding:20px">
     <div class="modal-title">Change PIN</div>
-    <div class="pin-input-row">
-      <input class="pin-digit" id="p0" maxlength="1" type="password" inputmode="numeric" pattern="[0-9]">
-      <input class="pin-digit" id="p1" maxlength="1" type="password" inputmode="numeric" pattern="[0-9]">
-      <input class="pin-digit" id="p2" maxlength="1" type="password" inputmode="numeric" pattern="[0-9]">
-      <input class="pin-digit" id="p3" maxlength="1" type="password" inputmode="numeric" pattern="[0-9]">
+    <div class="modal-pin-dots">
+      <div class="pin-dot" id="pm0"></div>
+      <div class="pin-dot" id="pm1"></div>
+      <div class="pin-dot" id="pm2"></div>
+      <div class="pin-dot" id="pm3"></div>
     </div>
-    <div class="modal-buttons">
-      <button class="btn" onclick="closePINModal()">Cancel</button>
-      <button class="btn accent" onclick="savePIN()">Save</button>
+    <div class="modal-status" id="pmStatus">NEW PIN</div>
+    <div class="modal-keypad">
+      <button class="mkey" onclick="pmPress('1')">1</button>
+      <button class="mkey" onclick="pmPress('2')">2</button>
+      <button class="mkey" onclick="pmPress('3')">3</button>
+      <button class="mkey" onclick="pmPress('4')">4</button>
+      <button class="mkey" onclick="pmPress('5')">5</button>
+      <button class="mkey" onclick="pmPress('6')">6</button>
+      <button class="mkey" onclick="pmPress('7')">7</button>
+      <button class="mkey" onclick="pmPress('8')">8</button>
+      <button class="mkey" onclick="pmPress('9')">9</button>
+      <button class="mkey mzero" onclick="pmPress('0')">0</button>
+      <button class="mkey mdel" onclick="pmDel()">⌫</button>
     </div>
+    <button class="btn" style="width:100%;text-align:center;margin-top:12px" onclick="closePINModal()">Cancel</button>
   </div>
 </div>
 
@@ -627,46 +668,68 @@
   refreshStats();
   setInterval(refreshStats, 30000);
 
-  // PIN Modal
+  // Change PIN keypad
+  let pmPin = '';
+
+  function pmUpdateDots() {
+    for (let i = 0; i < 4; i++) {
+      const d = document.getElementById('pm' + i);
+      d.classList.toggle('filled', i < pmPin.length);
+      d.classList.remove('error');
+    }
+  }
+
+  function pmSetStatus(msg, type) {
+    const el = document.getElementById('pmStatus');
+    el.textContent = msg;
+    el.className = 'modal-status ' + type;
+  }
+
+  function pmPress(digit) {
+    if (pmPin.length >= 4) return;
+    pmPin += digit;
+    pmUpdateDots();
+    if (pmPin.length === 4) pmSubmit();
+  }
+
+  function pmDel() {
+    pmPin = pmPin.slice(0, -1);
+    pmUpdateDots();
+    pmSetStatus('NEW PIN', '');
+  }
+
   function openChangePIN() {
+    pmPin = '';
+    pmUpdateDots();
+    pmSetStatus('NEW PIN', '');
     document.getElementById('pinModal').classList.add('open');
-    document.getElementById('p0').focus();
   }
 
   function closePINModal() {
+    pmPin = '';
+    pmUpdateDots();
     document.getElementById('pinModal').classList.remove('open');
-    ['p0','p1','p2','p3'].forEach(id => document.getElementById(id).value = '');
   }
 
-  // Auto-advance PIN inputs
-  ['p0','p1','p2','p3'].forEach((id, i) => {
-    document.getElementById(id).addEventListener('input', function() {
-      if (this.value.length === 1 && i < 3) {
-        document.getElementById('p' + (i+1)).focus();
-      }
-    });
-  });
-
-  async function savePIN() {
-    const pin = ['p0','p1','p2','p3'].map(id => document.getElementById(id).value).join('');
-    if (pin.length !== 4 || !/^\d{4}$/.test(pin)) {
-      showToast('Enter all 4 digits', 'error');
-      return;
-    }
+  async function pmSubmit() {
     try {
       const res = await fetch('/pin/change', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pin })
+        body: JSON.stringify({ pin: pmPin })
       });
       if (res.ok) {
-        closePINModal();
+        pmSetStatus('SAVED', 'success');
+        setTimeout(() => closePINModal(), 800);
         showToast('PIN updated', 'success');
       } else {
-        showToast('Failed to update PIN', 'error');
+        pmSetStatus('FAILED', 'error');
+        for (let i = 0; i < 4; i++) document.getElementById('pm' + i).classList.add('error');
+        setTimeout(() => { pmPin = ''; pmUpdateDots(); pmSetStatus('NEW PIN', ''); }, 1000);
       }
     } catch (e) {
-      showToast('Connection error', 'error');
+      pmSetStatus('ERROR', 'error');
+      pmPin = ''; pmUpdateDots();
     }
   }
 

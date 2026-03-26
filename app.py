@@ -52,7 +52,8 @@ INSTALL_SCHEDULED_STAGE_ID     = 10
 INSTALL_UNSCHEDULED_STAGE_ID   = 9
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "logs", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_logs"}
+DASHBOARD_ENDPOINTS  = {"dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout",
+                        "api_stats", "api_logs", "api_users", "api_user_delete", "api_access_log"}
 
 # ---------------------------------------------------------------------------
 # DATABASE
@@ -93,17 +94,46 @@ def init_db():
                 value TEXT NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_events_deal ON events(deal_id);
-            CREATE INDEX IF NOT EXISTS idx_task_deal   ON task_state(deal_id);
+            CREATE TABLE IF NOT EXISTS users (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                username   TEXT    NOT NULL UNIQUE,
+                pin        TEXT    NOT NULL UNIQUE,
+                role       TEXT    NOT NULL DEFAULT 'user',
+                created_at TEXT    NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS access_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                username     TEXT    NOT NULL,
+                logged_in_at TEXT    NOT NULL,
+                ip_address   TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_events_deal  ON events(deal_id);
+            CREATE INDEX IF NOT EXISTS idx_task_deal    ON task_state(deal_id);
+            CREATE INDEX IF NOT EXISTS idx_access_user  ON access_log(username);
 
             INSERT OR IGNORE INTO settings (key, value) VALUES ('pin', '0000');
         """)
-    # Migrate existing DBs
+    # Migrations for existing DBs
     with get_db() as conn:
-        try:
-            conn.execute("ALTER TABLE events ADD COLUMN outcome TEXT")
-        except Exception:
-            pass  # Column already exists
+        for migration in [
+            "ALTER TABLE events ADD COLUMN outcome TEXT",
+        ]:
+            try:
+                conn.execute(migration)
+            except Exception:
+                pass
+        # Migrate legacy PIN from settings → admin user
+        row = conn.execute("SELECT value FROM settings WHERE key='pin'").fetchone()
+        if row:
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (username, pin, role, created_at) VALUES (?,?,?,?)",
+                    ("admin", row["value"], "admin", datetime.utcnow().isoformat())
+                )
+            except Exception:
+                pass
     logger.info(f"Database initialised at {DB_PATH}")
 
 def get_setting(key):
@@ -307,18 +337,38 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("authenticated"):
+            return redirect(url_for("pin_page"))
+        if session.get("role") != "admin":
+            return redirect(url_for("dashboard"))
+        return f(*args, **kwargs)
+    return decorated
+
 @app.route("/pin", methods=["GET"])
 def pin_page():
     return render_template("pin.html")
 
 @app.route("/pin/verify", methods=["POST"])
 def verify_pin():
-    data = request.get_json(force=True)
+    data    = request.get_json(force=True)
     entered = data.get("pin", "")
-    stored  = get_setting("pin") or "0000"
-    if entered == stored:
+    with get_db() as conn:
+        user = conn.execute("SELECT * FROM users WHERE pin=?", (entered,)).fetchone()
+    if user:
         session["authenticated"] = True
-        return jsonify({"status": "ok"}), 200
+        session["username"]      = user["username"]
+        session["role"]          = user["role"]
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr).split(",")[0].strip()
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO access_log (username, logged_in_at, ip_address) VALUES (?,?,?)",
+                (user["username"], datetime.utcnow().isoformat(), ip)
+            )
+        logger.info(f"Login: {user['username']} ({user['role']}) from {ip}")
+        return jsonify({"status": "ok", "role": user["role"]}), 200
     return jsonify({"status": "error", "message": "Incorrect PIN"}), 401
 
 @app.route("/pin/change", methods=["POST"])
@@ -328,7 +378,12 @@ def change_pin():
     new_pin = data.get("pin", "")
     if not new_pin.isdigit() or len(new_pin) != 4:
         return jsonify({"status": "error", "message": "PIN must be 4 digits"}), 400
-    set_setting("pin", new_pin)
+    username = session.get("username", "admin")
+    with get_db() as conn:
+        existing = conn.execute("SELECT id FROM users WHERE pin=? AND username!=?", (new_pin, username)).fetchone()
+        if existing:
+            return jsonify({"status": "error", "message": "PIN already in use"}), 400
+        conn.execute("UPDATE users SET pin=? WHERE username=?", (new_pin, username))
     return jsonify({"status": "ok"}), 200
 
 @app.route("/logout")
@@ -361,7 +416,9 @@ def dashboard():
                            recent_events=recent_events,
                            event_counts=event_counts,
                            active_tasks=active_tasks,
-                           total_events=total_events)
+                           total_events=total_events,
+                           username=session.get("username", ""),
+                           is_admin=session.get("role") == "admin")
 
 @app.route("/api/clear-db", methods=["POST"])
 @login_required
@@ -390,6 +447,66 @@ def api_stats():
         "active_tasks": active,
         "recent": [dict(r) for r in recent]
     })
+
+@app.route("/users")
+@admin_required
+def users():
+    return render_template("users.html", username=session.get("username", ""))
+
+@app.route("/api/users", methods=["GET", "POST"])
+@admin_required
+def api_users():
+    if request.method == "GET":
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT id, username, role, created_at FROM users ORDER BY created_at"
+            ).fetchall()
+        return jsonify({"users": [dict(r) for r in rows]})
+
+    data     = request.get_json(force=True)
+    username = (data.get("username") or "").strip()
+    pin      = (data.get("pin") or "").strip()
+    role     = data.get("role", "user")
+
+    if not username or not pin.isdigit() or len(pin) != 4:
+        return jsonify({"error": "Username and 4-digit PIN required"}), 400
+    if role not in ("admin", "user"):
+        role = "user"
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO users (username, pin, role, created_at) VALUES (?,?,?,?)",
+                (username, pin, role, datetime.utcnow().isoformat())
+            )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    logger.info(f"User created: {username} ({role})")
+    return jsonify({"status": "ok"}), 201
+
+@app.route("/api/users/<int:user_id>", methods=["DELETE"])
+@admin_required
+def api_user_delete(user_id):
+    with get_db() as conn:
+        user = conn.execute("SELECT username, role FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        if user["username"] == session.get("username"):
+            return jsonify({"error": "Cannot delete your own account"}), 400
+        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+    logger.info(f"User deleted: {user['username']}")
+    return jsonify({"status": "ok"}), 200
+
+@app.route("/api/access-log")
+@admin_required
+def api_access_log():
+    limit = min(int(request.args.get("limit", 100)), 1000)
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT username, logged_in_at, ip_address FROM access_log ORDER BY logged_in_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    return jsonify({"entries": [dict(r) for r in rows]})
 
 @app.route("/logs")
 @login_required
