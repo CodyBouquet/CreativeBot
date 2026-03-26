@@ -279,9 +279,12 @@ def handle_install(conn, event_type, deal_id, task_id, object_date):
         return f"Cancelled. Recalculated → install_start={s}, part2={p}"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "install", task_date, status="completed")
-        pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
-        set_setting(f"pending_recalc_{deal_id}", "1")
-        return f"Completed {task_date} → moved to stage 12"
+        remaining = recalc_install(conn, deal_id)
+        if len(remaining) == 0:
+            pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
+            return f"Completed {task_date} → all installs done, moved to stage 12"
+        s = remaining[0]; p = remaining[1] if len(remaining) > 1 else None
+        return f"Completed {task_date} → {len(remaining)} install(s) still active, recalculated → start={s}, part2={p}"
     return "No action"
 
 def recalc_measure(conn, deal_id):
