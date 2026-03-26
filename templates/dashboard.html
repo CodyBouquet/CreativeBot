@@ -507,10 +507,10 @@
         <div class="action-name">Manual Sync</div>
         <div class="action-desc">Force sync a deal by ID</div>
       </div>
-      <div class="action-card" onclick="showToast('Coming soon', 'success')">
+      <div class="action-card" onclick="window.location.href='/logs'">
         <div class="action-icon">📋</div>
         <div class="action-name">View Logs</div>
-        <div class="action-desc">Recent service activity</div>
+        <div class="action-desc">Full event history</div>
       </div>
       <div class="action-card" onclick="showToast('Coming soon', 'success')">
         <div class="action-icon">🗓️</div>
@@ -572,7 +572,7 @@
   // Logs
   async function refreshLogs() {
     try {
-      const res  = await fetch('/api/logs');
+      const res  = await fetch('/api/logs?limit=10');
       const data = await res.json();
       const table = document.getElementById('logTable');
       const header = table.querySelector('.log-row.header');

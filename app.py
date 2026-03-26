@@ -52,7 +52,7 @@ INSTALL_SCHEDULED_STAGE_ID     = 10
 INSTALL_UNSCHEDULED_STAGE_ID   = 9
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_logs"}
+DASHBOARD_ENDPOINTS  = {"dashboard", "logs", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_logs"}
 
 # ---------------------------------------------------------------------------
 # DATABASE
@@ -391,13 +391,20 @@ def api_stats():
         "recent": [dict(r) for r in recent]
     })
 
+@app.route("/logs")
+@login_required
+def logs():
+    return render_template("logs.html")
+
 @app.route("/api/logs")
 @login_required
 def api_logs():
+    limit = min(int(request.args.get("limit", 100)), 1000)
     with get_db() as conn:
         rows = conn.execute(
             """SELECT id, received_at, deal_id, task_id, event_type, task_type, outcome, raw_json
-               FROM events WHERE archived=0 ORDER BY received_at DESC LIMIT 100"""
+               FROM events WHERE archived=0 ORDER BY received_at DESC LIMIT ?""",
+            (limit,)
         ).fetchall()
     logs = []
     for row in rows:
