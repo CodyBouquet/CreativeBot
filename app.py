@@ -52,7 +52,7 @@ INSTALL_SCHEDULED_STAGE_ID     = 10
 INSTALL_UNSCHEDULED_STAGE_ID   = 9
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats"}
+DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_logs"}
 
 # ---------------------------------------------------------------------------
 # DATABASE
@@ -74,6 +74,7 @@ def init_db():
                 event_type  TEXT,
                 task_type   TEXT,
                 raw_json    TEXT    NOT NULL,
+                outcome     TEXT,
                 archived    INTEGER NOT NULL DEFAULT 0
             );
 
@@ -97,6 +98,12 @@ def init_db():
 
             INSERT OR IGNORE INTO settings (key, value) VALUES ('pin', '0000');
         """)
+    # Migrate existing DBs
+    with get_db() as conn:
+        try:
+            conn.execute("ALTER TABLE events ADD COLUMN outcome TEXT")
+        except Exception:
+            pass  # Column already exists
     logger.info(f"Database initialised at {DB_PATH}")
 
 def get_setting(key):
@@ -113,12 +120,16 @@ def delete_setting(key):
         conn.execute("DELETE FROM settings WHERE key = ?", (key,))
 
 def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload):
-    conn.execute(
+    cur = conn.execute(
         """INSERT INTO events (received_at, deal_id, task_id, event_type, task_type, raw_json)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (datetime.utcnow().isoformat(), deal_id, task_id, event_type, task_type,
          json.dumps(raw_payload))
     )
+    return cur.lastrowid
+
+def set_event_outcome(conn, event_id, outcome):
+    conn.execute("UPDATE events SET outcome=? WHERE id=?", (outcome, event_id))
 
 
 def upsert_task_state(conn, task_id, deal_id, task_type, task_date, status="active"):
@@ -178,37 +189,53 @@ def handle_measure(conn, event_type, deal_id, task_id, object_date):
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: task_date})
         upsert_task_state(conn, task_id, deal_id, "measure", task_date)
+        return f"Set measure_date → {task_date}"
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "measure", task_date, status="cancelled")
+        return "Cleared measure_date"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "measure", task_date, status="completed")
+        return "Marked completed"
+    return "No action"
 
 def handle_delivery(conn, event_type, deal_id, task_id, object_date):
     task_date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: task_date})
         upsert_task_state(conn, task_id, deal_id, "delivery", task_date)
+        return f"Set delivery_date → {task_date}"
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "delivery", task_date, status="cancelled")
+        return "Cleared delivery_date"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "delivery", task_date, status="completed")
+        return "Marked completed"
+    return "No action"
 
 def handle_install(conn, event_type, deal_id, task_id, object_date):
     task_date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", task_date)
-        recalc_install(conn, deal_id)
+        dates = recalc_install(conn, deal_id)
+        s = dates[0] if len(dates) > 0 else None
+        p = dates[1] if len(dates) > 1 else None
+        return f"Recalculated → install_start={s}, part2={p}"
     elif event_type == "TASK_CANCELLED":
         upsert_task_state(conn, task_id, deal_id, "install", task_date, status="cancelled")
-        active = recalc_install(conn, deal_id)
-        if active == 0:
+        dates = recalc_install(conn, deal_id)
+        if len(dates) == 0:
             pd_move_stage(deal_id, INSTALL_UNSCHEDULED_STAGE_ID)
+            return "Cancelled. No active installs → moved to stage 9"
+        s = dates[0]; p = dates[1] if len(dates) > 1 else None
+        return f"Cancelled. Recalculated → install_start={s}, part2={p}"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "install", task_date, status="completed")
         pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
         set_setting(f"pending_recalc_{deal_id}", "1")
+        return f"Completed {task_date} → moved to stage 12"
+    return "No action"
 
 def recalc_measure(conn, deal_id):
     rows = conn.execute(
@@ -236,20 +263,25 @@ def recalc_install(conn, deal_id):
         PD_FIELDS["install_start"]: dates[0] if len(dates) > 0 else None,
         PD_FIELDS["install_part2"]: dates[1] if len(dates) > 1 else None,
     })
-    return len(dates)
+    return dates
 
 def handle_deleted(conn, task_id, deal_id, task_type):
     conn.execute("DELETE FROM task_state WHERE task_id=?", (task_id,))
-    conn.execute("DELETE FROM events     WHERE task_id=?", (task_id,))
-    logger.info(f"Deleted task {task_id} (deal={deal_id}, type={task_type}) from database")
+    logger.info(f"Deleted task {task_id} (deal={deal_id}, type={task_type}) from task_state")
     if task_type == "measure":
         recalc_measure(conn, deal_id)
+        return "Deleted. Recalculated measure_date"
     elif task_type == "delivery":
         recalc_delivery(conn, deal_id)
+        return "Deleted. Recalculated delivery_date"
     elif task_type == "install":
-        active = recalc_install(conn, deal_id)
-        if active == 0:
+        dates = recalc_install(conn, deal_id)
+        if len(dates) == 0:
             pd_move_stage(deal_id, INSTALL_UNSCHEDULED_STAGE_ID)
+            return "Deleted. No active installs → moved to stage 9"
+        s = dates[0]; p = dates[1] if len(dates) > 1 else None
+        return f"Deleted. Recalculated → install_start={s}, part2={p}"
+    return "Deleted (unknown type — no Pipedrive action)"
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +391,29 @@ def api_stats():
         "recent": [dict(r) for r in recent]
     })
 
+@app.route("/api/logs")
+@login_required
+def api_logs():
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT id, received_at, deal_id, task_id, event_type, task_type, outcome, raw_json
+               FROM events WHERE archived=0 ORDER BY received_at DESC LIMIT 100"""
+        ).fetchall()
+    logs = []
+    for row in rows:
+        raw = json.loads(row["raw_json"])
+        logs.append({
+            "id":         row["id"],
+            "time":       row["received_at"][11:19] if row["received_at"] else "—",
+            "deal_id":    row["deal_id"],
+            "event_type": (row["event_type"] or "—").replace("TASK_", ""),
+            "task_type":  row["task_type"] or "unknown",
+            "task_date":  (raw.get("OBJECT_DATE") or "")[:10] or "—",
+            "title":      raw.get("TITLE") or "—",
+            "outcome":    row["outcome"] or "—",
+        })
+    return jsonify({"logs": logs})
+
 # ---------------------------------------------------------------------------
 # WEBHOOK ENDPOINTS
 # ---------------------------------------------------------------------------
@@ -403,17 +458,20 @@ def arrivy_webhook():
         task_type = TEMPLATE_MAP.get(template_id)
 
         with get_db() as conn:
-            store_event(conn, deal_id, task_id, event_type, task_type, payload)
+            event_id = store_event(conn, deal_id, task_id, event_type, task_type, payload)
             if event_type == "TASK_DELETED":
-                handle_deleted(conn, task_id, deal_id, task_type)
+                outcome = handle_deleted(conn, task_id, deal_id, task_type)
             elif not task_type:
-                return jsonify({"status": "stored", "reason": "unknown template"}), 200
+                outcome = "Stored — unknown template, no Pipedrive action"
             elif task_type == "measure":
-                handle_measure(conn, event_type, deal_id, task_id, object_date)
+                outcome = handle_measure(conn, event_type, deal_id, task_id, object_date)
             elif task_type == "delivery":
-                handle_delivery(conn, event_type, deal_id, task_id, object_date)
+                outcome = handle_delivery(conn, event_type, deal_id, task_id, object_date)
             elif task_type == "install":
-                handle_install(conn, event_type, deal_id, task_id, object_date)
+                outcome = handle_install(conn, event_type, deal_id, task_id, object_date)
+            else:
+                outcome = "No handler"
+            set_event_outcome(conn, event_id, outcome)
 
         return jsonify({"status": "ok"}), 200
 

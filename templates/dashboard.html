@@ -370,6 +370,44 @@
   .danger-zone-label { font-size: 11px; letter-spacing: 1px; color: var(--muted); }
   .danger-zone-title { font-size: 12px; font-weight: 600; color: var(--danger); margin-bottom: 2px; }
 
+  /* Logs */
+  .log-row {
+    display: grid;
+    grid-template-columns: 60px 60px 80px 70px 80px 1fr;
+    gap: 8px;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    align-items: start;
+  }
+
+  .log-row:last-child { border-bottom: none; }
+
+  .log-row.header {
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 9px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    align-items: center;
+  }
+
+  .log-outcome {
+    color: var(--text);
+    font-size: 10px;
+    line-height: 1.4;
+    word-break: break-word;
+  }
+
+  .log-title {
+    color: var(--muted);
+    font-size: 9px;
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   /* Scrollbar */
   main::-webkit-scrollbar { width: 4px; }
   main::-webkit-scrollbar-track { background: transparent; }
@@ -430,32 +468,21 @@
     </div>
   </div>
 
-  <!-- Recent Events -->
+  <!-- Event Log -->
   <div>
-    <div class="section-title">Recent Events</div>
-    <div class="events-table">
-      <div class="event-row header">
+    <div class="section-title">Event Log</div>
+    <div class="events-table" id="logTable">
+      <div class="log-row header">
+        <span>Time</span>
         <span>Deal</span>
         <span>Event</span>
         <span>Type</span>
-        <span>Time</span>
+        <span>Task Date</span>
+        <span>Outcome</span>
       </div>
-      {% for event in recent_events %}
-      <div class="event-row">
-        <span class="deal-id">#{{ event.deal_id or '—' }}</span>
-        <span class="event-type">{{ event.event_type.replace('TASK_','') if event.event_type else '—' }}</span>
-        <span>
-          <span class="badge {{ event.task_type or 'unknown' }}">
-            {{ event.task_type or '?' }}
-          </span>
-        </span>
-        <span class="event-time">{{ event.received_at[11:19] if event.received_at else '—' }}</span>
+      <div class="log-row" id="logEmpty">
+        <span style="color:var(--muted);grid-column:1/-1;text-align:center">Loading...</span>
       </div>
-      {% else %}
-      <div class="event-row">
-        <span style="color:var(--muted);grid-column:1/-1;text-align:center">No events yet</span>
-      </div>
-      {% endfor %}
     </div>
   </div>
 
@@ -541,6 +568,49 @@
   }
   updateClock();
   setInterval(updateClock, 1000);
+
+  // Logs
+  async function refreshLogs() {
+    try {
+      const res  = await fetch('/api/logs');
+      const data = await res.json();
+      const table = document.getElementById('logTable');
+      const header = table.querySelector('.log-row.header');
+
+      // Remove all rows except header
+      [...table.querySelectorAll('.log-row:not(.header)')].forEach(r => r.remove());
+
+      if (!data.logs || data.logs.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'log-row';
+        empty.innerHTML = '<span style="color:var(--muted);grid-column:1/-1;text-align:center">No events yet</span>';
+        table.appendChild(empty);
+        return;
+      }
+
+      const BADGE = { install: 'install', measure: 'measure', delivery: 'delivery' };
+      data.logs.forEach(log => {
+        const row = document.createElement('div');
+        row.className = 'log-row';
+        const badge = BADGE[log.task_type] || 'unknown';
+        row.innerHTML = `
+          <span class="event-time">${log.time}</span>
+          <span class="deal-id">${log.deal_id ? '#' + log.deal_id : '—'}</span>
+          <span class="event-type">${log.event_type}</span>
+          <span><span class="badge ${badge}">${log.task_type}</span></span>
+          <span class="event-time">${log.task_date}</span>
+          <span>
+            <div class="log-outcome">${log.outcome}</div>
+            <div class="log-title">${log.title}</div>
+          </span>`;
+        table.appendChild(row);
+      });
+    } catch (e) {
+      console.error('Log fetch failed', e);
+    }
+  }
+  refreshLogs();
+  setInterval(refreshLogs, 30000);
 
   // Auto-refresh stats every 30s
   async function refreshStats() {
