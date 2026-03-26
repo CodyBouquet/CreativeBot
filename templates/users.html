@@ -281,7 +281,7 @@
 
   .access-row {
     display: grid;
-    grid-template-columns: 1fr auto 90px;
+    grid-template-columns: 1fr 130px;
     gap: 10px;
     padding: 10px 14px;
     border-bottom: 1px solid var(--border);
@@ -292,7 +292,6 @@
   .access-row.header { background: var(--surface); font-size: 9px; letter-spacing: 2px; color: var(--muted); text-transform: uppercase; }
 
   .access-user { font-family: 'Share Tech Mono', monospace; color: var(--accent); }
-  .access-ip   { color: var(--muted); font-size: 10px; font-family: 'Share Tech Mono', monospace; }
   .access-time { color: var(--muted); font-size: 10px; font-family: 'Share Tech Mono', monospace; text-align: right; }
 
   main::-webkit-scrollbar { width: 4px; }
@@ -574,11 +573,10 @@
       }
 
       el.innerHTML =
-        '<div class="access-row header"><span>User</span><span>IP</span><span>Time</span></div>' +
+        '<div class="access-row header"><span>User</span><span>Time</span></div>' +
         logs.map(l => `
           <div class="access-row">
             <span class="access-user">${esc(l.username)}</span>
-            <span class="access-ip">${esc(l.ip_address || '—')}</span>
             <span class="access-time">${esc(l.logged_in_at)}</span>
           </div>`).join('');
     } catch (e) {
