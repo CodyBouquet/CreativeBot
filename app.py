@@ -491,6 +491,8 @@ def api_user_delete(user_id):
         user = conn.execute("SELECT username, role FROM users WHERE id=?", (user_id,)).fetchone()
         if not user:
             return jsonify({"error": "User not found"}), 404
+        if user["role"] == "admin":
+            return jsonify({"error": "Cannot delete admin users"}), 400
         if user["username"] == session.get("username"):
             return jsonify({"error": "Cannot delete your own account"}), 400
         conn.execute("DELETE FROM users WHERE id=?", (user_id,))
@@ -506,7 +508,7 @@ def api_access_log():
             "SELECT username, logged_in_at, ip_address FROM access_log ORDER BY logged_in_at DESC LIMIT ?",
             (limit,)
         ).fetchall()
-    return jsonify({"entries": [dict(r) for r in rows]})
+    return jsonify({"logs": [dict(r) for r in rows]})
 
 @app.route("/logs")
 @login_required
