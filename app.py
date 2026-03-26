@@ -69,7 +69,7 @@ def sse_notify():
                 q.put_nowait("refresh")
             except queue.Full:
                 dead.add(q)
-        _sse_clients -= dead
+        _sse_clients.difference_update(dead)
 
 # ---------------------------------------------------------------------------
 # DATABASE
