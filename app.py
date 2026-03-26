@@ -52,8 +52,9 @@ INSTALL_SCHEDULED_STAGE_ID     = 10
 INSTALL_UNSCHEDULED_STAGE_ID   = 9
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout",
-                        "api_stats", "api_logs", "api_users", "api_user_delete", "api_access_log"}
+DASHBOARD_ENDPOINTS  = {"dashboard", "logs", "users", "settings_page", "pin_page", "verify_pin",
+                        "change_pin", "logout", "api_stats", "api_logs", "api_users",
+                        "api_user_delete", "api_access_log", "api_settings"}
 
 # ---------------------------------------------------------------------------
 # DATABASE
@@ -509,6 +510,23 @@ def api_access_log():
             (limit,)
         ).fetchall()
     return jsonify({"logs": [dict(r) for r in rows]})
+
+@app.route("/settings")
+@admin_required
+def settings_page():
+    return render_template("settings.html")
+
+@app.route("/api/settings", methods=["GET", "POST"])
+@login_required
+def api_settings():
+    SETTING_KEYS = {"auto_lock_minutes", "screen_sleep_minutes"}
+    if request.method == "GET":
+        return jsonify({k: get_setting(k) or "0" for k in SETTING_KEYS})
+    data = request.get_json(force=True)
+    for key, val in data.items():
+        if key in SETTING_KEYS:
+            set_setting(key, str(val))
+    return jsonify({"status": "ok"})
 
 @app.route("/logs")
 @login_required

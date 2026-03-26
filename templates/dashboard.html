@@ -547,10 +547,10 @@
         <div class="action-name">Clear Date</div>
         <div class="action-desc">Reset a date field on a deal</div>
       </div>
-      <div class="action-card" onclick="showToast('Coming soon', 'success')">
+      <div class="action-card" onclick="window.location.href='/settings'">
         <div class="action-icon">⚙️</div>
         <div class="action-name">Settings</div>
-        <div class="action-desc">Configure service options</div>
+        <div class="action-desc">Auto-lock &amp; screen sleep</div>
       </div>
     </div>
   </div>
@@ -756,6 +756,37 @@
       showToast('Connection error', 'error');
     }
   }
+
+  // Auto-lock / screen sleep
+  (function() {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'display:none;position:fixed;inset:0;background:#000;z-index:9999;cursor:pointer';
+    document.body.appendChild(overlay);
+
+    let lockTimer, sleepTimer, lockMins = 0, sleepMins = 0;
+
+    overlay.addEventListener('pointerdown', function() {
+      overlay.style.display = 'none';
+      resetTimers();
+    });
+
+    function resetTimers() {
+      clearTimeout(lockTimer);
+      clearTimeout(sleepTimer);
+      if (sleepMins > 0) sleepTimer = setTimeout(() => { overlay.style.display = 'block'; }, sleepMins * 60000);
+      if (lockMins  > 0) lockTimer  = setTimeout(() => { window.location.href = '/logout'; }, lockMins * 60000);
+    }
+
+    ['pointerdown', 'pointermove', 'keydown'].forEach(ev =>
+      document.addEventListener(ev, resetTimers, { passive: true })
+    );
+
+    fetch('/api/settings').then(r => r.json()).then(s => {
+      lockMins  = parseFloat(s.auto_lock_minutes)    || 0;
+      sleepMins = parseFloat(s.screen_sleep_minutes) || 0;
+      resetTimers();
+    }).catch(() => {});
+  })();
 
   // Toast
   function showToast(msg, type = '') {
