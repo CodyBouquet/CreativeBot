@@ -355,6 +355,21 @@
   .toast.success { border-color: var(--success); color: var(--success); }
   .toast.error { border-color: var(--danger); color: var(--danger); }
 
+  /* Danger zone */
+  .danger-zone {
+    background: var(--card);
+    border: 1px solid rgba(255,64,96,0.3);
+    border-radius: 8px;
+    padding: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .danger-zone-label { font-size: 11px; letter-spacing: 1px; color: var(--muted); }
+  .danger-zone-title { font-size: 12px; font-weight: 600; color: var(--danger); margin-bottom: 2px; }
+
   /* Scrollbar */
   main::-webkit-scrollbar { width: 4px; }
   main::-webkit-scrollbar-track { background: transparent; }
@@ -444,6 +459,18 @@
     </div>
   </div>
 
+  <!-- Danger Zone -->
+  <div>
+    <div class="section-title">Dev Tools</div>
+    <div class="danger-zone">
+      <div>
+        <div class="danger-zone-title">Clear Database</div>
+        <div class="danger-zone-label">Wipe all events and task state (testing only)</div>
+      </div>
+      <button class="btn danger" onclick="openClearModal()">Clear DB</button>
+    </div>
+  </div>
+
   <!-- Actions -->
   <div>
     <div class="section-title">Actions</div>
@@ -471,6 +498,20 @@
     </div>
   </div>
 </main>
+
+<!-- Clear DB Confirm Modal -->
+<div class="modal-overlay" id="clearModal">
+  <div class="modal">
+    <div class="modal-title" style="color:var(--danger)">Clear Database</div>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:20px;line-height:1.6">
+      This will permanently delete all events and task state. This cannot be undone.
+    </p>
+    <div class="modal-buttons">
+      <button class="btn" onclick="closeClearModal()">Cancel</button>
+      <button class="btn danger" onclick="confirmClearDB()">Clear</button>
+    </div>
+  </div>
+</div>
 
 <!-- Change PIN Modal -->
 <div class="modal-overlay" id="pinModal">
@@ -553,6 +594,30 @@
         showToast('PIN updated', 'success');
       } else {
         showToast('Failed to update PIN', 'error');
+      }
+    } catch (e) {
+      showToast('Connection error', 'error');
+    }
+  }
+
+  // Clear DB
+  function openClearModal() {
+    document.getElementById('clearModal').classList.add('open');
+  }
+
+  function closeClearModal() {
+    document.getElementById('clearModal').classList.remove('open');
+  }
+
+  async function confirmClearDB() {
+    closeClearModal();
+    try {
+      const res = await fetch('/api/clear-db', { method: 'POST' });
+      if (res.ok) {
+        showToast('Database cleared', 'success');
+        refreshStats();
+      } else {
+        showToast('Clear failed', 'error');
       }
     } catch (e) {
       showToast('Connection error', 'error');

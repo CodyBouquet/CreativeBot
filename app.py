@@ -237,6 +237,44 @@ def handle_install(conn, event_type, deal_id, task_id, object_date):
         if dates_match(date, install_start):
             pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
 
+def recalc_measure(conn, deal_id):
+    rows = conn.execute(
+        "SELECT current_date FROM task_state WHERE deal_id=? AND task_type='measure' AND status='active' AND archived=0 ORDER BY current_date",
+        (deal_id,)
+    ).fetchall()
+    date = rows[0]["current_date"] if rows else None
+    pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
+
+def recalc_delivery(conn, deal_id):
+    rows = conn.execute(
+        "SELECT current_date FROM task_state WHERE deal_id=? AND task_type='delivery' AND status='active' AND archived=0 ORDER BY current_date",
+        (deal_id,)
+    ).fetchall()
+    date = rows[0]["current_date"] if rows else None
+    pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: date})
+
+def recalc_install(conn, deal_id):
+    rows = conn.execute(
+        "SELECT current_date FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY current_date",
+        (deal_id,)
+    ).fetchall()
+    dates = [r["current_date"] for r in rows]
+    pd_update_deal(deal_id, {
+        PD_FIELDS["install_start"]: dates[0] if len(dates) > 0 else None,
+        PD_FIELDS["install_part2"]: dates[1] if len(dates) > 1 else None,
+    })
+
+def handle_deleted(conn, task_id, deal_id, task_type):
+    conn.execute("DELETE FROM task_state WHERE task_id=?", (task_id,))
+    conn.execute("DELETE FROM events     WHERE task_id=?", (task_id,))
+    logger.info(f"Deleted task {task_id} (deal={deal_id}, type={task_type}) from database")
+    if task_type == "measure":
+        recalc_measure(conn, deal_id)
+    elif task_type == "delivery":
+        recalc_delivery(conn, deal_id)
+    elif task_type == "install":
+        recalc_install(conn, deal_id)
+
 def _install_slot_date(date, install_start, install_part2, deal_id):
     if not install_start:
         pd_update_deal(deal_id, {PD_FIELDS["install_start"]: date})
@@ -334,6 +372,19 @@ def dashboard():
                            active_tasks=active_tasks,
                            total_events=total_events)
 
+@app.route("/api/clear-db", methods=["POST"])
+@login_required
+def clear_db():
+    try:
+        with get_db() as conn:
+            conn.execute("DELETE FROM events")
+            conn.execute("DELETE FROM task_state")
+        logger.warning("Database cleared via dashboard")
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        logger.exception(f"Clear DB failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/stats")
 @login_required
 def api_stats():
@@ -380,7 +431,7 @@ def arrivy_webhook():
         logger.info(f"Arrivy raw payload: {json.dumps(payload)}")
         logger.info(f"Arrivy: {event_type} (raw={raw_event_type}/{sub_type}) | template={template_id} | deal={external_id} | task={task_id}")
 
-        if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED"):
+        if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED"):
             return jsonify({"status": "ignored"}), 200
 
         if not external_id:
@@ -394,9 +445,11 @@ def arrivy_webhook():
 
         with get_db() as conn:
             store_event(conn, deal_id, task_id, event_type, task_type, payload)
-            if not task_type:
+            if event_type == "TASK_DELETED":
+                handle_deleted(conn, task_id, deal_id, task_type)
+            elif not task_type:
                 return jsonify({"status": "stored", "reason": "unknown template"}), 200
-            if task_type == "measure":
+            elif task_type == "measure":
                 handle_measure(conn, event_type, deal_id, task_id, object_date)
             elif task_type == "delivery":
                 handle_delivery(conn, event_type, deal_id, task_id, object_date)
