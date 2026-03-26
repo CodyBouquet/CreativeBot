@@ -272,15 +272,12 @@ def handle_install(conn, event_type, deal_id, task_id, object_date):
     elif event_type == "TASK_CANCELLED":
         upsert_task_state(conn, task_id, deal_id, "install", task_date, status="cancelled")
         dates = recalc_install(conn, deal_id)
-        if len(dates) == 0:
-            pd_move_stage(deal_id, INSTALL_UNSCHEDULED_STAGE_ID)
-            return "Cancelled. No active installs → moved to stage 9"
-        s = dates[0]; p = dates[1] if len(dates) > 1 else None
+        s = dates[0] if len(dates) > 0 else None
+        p = dates[1] if len(dates) > 1 else None
         return f"Cancelled. Recalculated → install_start={s}, part2={p}"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "install", task_date, status="completed")
         pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
-        set_setting(f"pending_recalc_{deal_id}", "1")
         return f"Completed {task_date} → moved to stage 12"
     return "No action"
 
@@ -323,10 +320,8 @@ def handle_deleted(conn, task_id, deal_id, task_type):
         return "Deleted. Recalculated delivery_date"
     elif task_type == "install":
         dates = recalc_install(conn, deal_id)
-        if len(dates) == 0:
-            pd_move_stage(deal_id, INSTALL_UNSCHEDULED_STAGE_ID)
-            return "Deleted. No active installs → moved to stage 9"
-        s = dates[0]; p = dates[1] if len(dates) > 1 else None
+        s = dates[0] if len(dates) > 0 else None
+        p = dates[1] if len(dates) > 1 else None
         return f"Deleted. Recalculated → install_start={s}, part2={p}"
     return "Deleted (unknown type — no Pipedrive action)"
 
@@ -679,12 +674,9 @@ def pipedrive_webhook():
                 with get_db() as conn:
                     archive_deal(conn, deal_id)
             elif stage_id == INSTALL_SCHEDULED_STAGE_ID:
-                flag_key = f"pending_recalc_{deal_id}"
-                if get_setting(flag_key):
-                    with get_db() as conn:
-                        recalc_install(conn, deal_id)
-                    delete_setting(flag_key)
-                    logger.info(f"Post-completion recalc ran for deal {deal_id}")
+                with get_db() as conn:
+                    recalc_install(conn, deal_id)
+                logger.info(f"Stage 10 recalc ran for deal {deal_id}")
 
         return jsonify({"status": "ok"}), 200
     except Exception as e:
