@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template, session, redirect, url_for, Response
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for
 from dotenv import load_dotenv
 import requests
 import logging
@@ -12,7 +12,6 @@ from datetime import datetime
 from pathlib import Path
 from functools import wraps
 import threading
-import queue
 
 load_dotenv()
 
@@ -48,28 +47,10 @@ PD_FIELDS = {
     "delivery_date":  "d0d424fcacbdf264297a050ff96a799823316d9f",
 }
 
-INSTALL_COMPLETE_STAGE_ID      = 12
-INSTALL_SCHEDULED_STAGE_ID     = 10
-INSTALL_UNSCHEDULED_STAGE_ID   = 9
+INSTALL_COMPLETE_STAGE_ID = 12
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "logs", "users", "settings_page", "pin_page", "verify_pin",
-                        "change_pin", "logout", "api_stats", "api_logs", "api_users",
-                        "api_user_delete", "api_access_log", "api_settings", "api_stream"}
-
-# SSE client queues
-_sse_clients     = set()
-_sse_clients_lock = threading.Lock()
-
-def sse_notify():
-    with _sse_clients_lock:
-        dead = set()
-        for q in _sse_clients:
-            try:
-                q.put_nowait("refresh")
-            except queue.Full:
-                dead.add(q)
-        _sse_clients.difference_update(dead)
+DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats"}
 
 # ---------------------------------------------------------------------------
 # DATABASE
@@ -91,7 +72,6 @@ def init_db():
                 event_type  TEXT,
                 task_type   TEXT,
                 raw_json    TEXT    NOT NULL,
-                outcome     TEXT,
                 archived    INTEGER NOT NULL DEFAULT 0
             );
 
@@ -99,7 +79,7 @@ def init_db():
                 task_id      INTEGER PRIMARY KEY,
                 deal_id      INTEGER NOT NULL,
                 task_type    TEXT    NOT NULL,
-                task_date    TEXT,
+                current_date TEXT,
                 status       TEXT    NOT NULL DEFAULT 'active',
                 last_updated TEXT    NOT NULL,
                 archived     INTEGER NOT NULL DEFAULT 0
@@ -110,47 +90,11 @@ def init_db():
                 value TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS users (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                username   TEXT    NOT NULL UNIQUE,
-                pin        TEXT    NOT NULL UNIQUE,
-                role       TEXT    NOT NULL DEFAULT 'user',
-                created_at TEXT    NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS access_log (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                username     TEXT    NOT NULL,
-                logged_in_at TEXT    NOT NULL,
-                ip_address   TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_events_deal  ON events(deal_id);
-            CREATE INDEX IF NOT EXISTS idx_task_deal    ON task_state(deal_id);
-            CREATE INDEX IF NOT EXISTS idx_access_user  ON access_log(username);
+            CREATE INDEX IF NOT EXISTS idx_events_deal ON events(deal_id);
+            CREATE INDEX IF NOT EXISTS idx_task_deal   ON task_state(deal_id);
 
             INSERT OR IGNORE INTO settings (key, value) VALUES ('pin', '0000');
         """)
-    # Migrations for existing DBs
-    with get_db() as conn:
-        for migration in [
-            "ALTER TABLE events ADD COLUMN outcome TEXT",
-            "ALTER TABLE task_state ADD COLUMN task_date TEXT",
-        ]:
-            try:
-                conn.execute(migration)
-            except Exception:
-                pass
-        # Migrate legacy PIN from settings → admin user
-        row = conn.execute("SELECT value FROM settings WHERE key='pin'").fetchone()
-        if row:
-            try:
-                conn.execute(
-                    "INSERT OR IGNORE INTO users (username, pin, role, created_at) VALUES (?,?,?,?)",
-                    ("admin", row["value"], "admin", datetime.utcnow().isoformat())
-                )
-            except Exception:
-                pass
     logger.info(f"Database initialised at {DB_PATH}")
 
 def get_setting(key):
@@ -162,32 +106,26 @@ def set_setting(key, value):
     with get_db() as conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
-def delete_setting(key):
-    with get_db() as conn:
-        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
-
 def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload):
-    cur = conn.execute(
+    conn.execute(
         """INSERT INTO events (received_at, deal_id, task_id, event_type, task_type, raw_json)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (datetime.utcnow().isoformat(), deal_id, task_id, event_type, task_type,
          json.dumps(raw_payload))
     )
-    return cur.lastrowid
 
-def set_event_outcome(conn, event_id, outcome):
-    conn.execute("UPDATE events SET outcome=? WHERE id=?", (outcome, event_id))
+def get_task_state(conn, task_id):
+    return conn.execute("SELECT * FROM task_state WHERE task_id = ?", (task_id,)).fetchone()
 
-
-def upsert_task_state(conn, task_id, deal_id, task_type, task_date, status="active"):
+def upsert_task_state(conn, task_id, deal_id, task_type, current_date, status="active"):
     conn.execute(
-        """INSERT INTO task_state (task_id, deal_id, task_type, task_date, status, last_updated)
+        """INSERT INTO task_state (task_id, deal_id, task_type, current_date, status, last_updated)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(task_id) DO UPDATE SET
-               task_date    = excluded.task_date,
+               current_date = excluded.current_date,
                status       = excluded.status,
                last_updated = excluded.last_updated""",
-        (task_id, deal_id, task_type, task_date, status, datetime.utcnow().isoformat())
+        (task_id, deal_id, task_type, current_date, status, datetime.utcnow().isoformat())
     )
 
 def archive_deal(conn, deal_id):
@@ -200,6 +138,13 @@ def archive_deal(conn, deal_id):
 # ---------------------------------------------------------------------------
 PD_BASE = "https://api.pipedrive.com/v1"
 
+def pd_get_deal(deal_id):
+    r = requests.get(f"{PD_BASE}/deals/{deal_id}", params={"api_token": PIPEDRIVE_API_TOKEN})
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("success"):
+        raise Exception(f"Pipedrive get deal failed: {data}")
+    return data["data"]
 
 def pd_update_deal(deal_id, fields):
     r = requests.put(f"{PD_BASE}/deals/{deal_id}",
@@ -227,104 +172,82 @@ def parse_arrivy_date(date_str):
     except Exception:
         return None
 
+def dates_match(a, b):
+    da = parse_arrivy_date(a) if a else None
+    db = parse_arrivy_date(b) if b else None
+    return bool(da and db and da == db)
 
 # ---------------------------------------------------------------------------
 # TASK HANDLERS
 # ---------------------------------------------------------------------------
 def handle_measure(conn, event_type, deal_id, task_id, object_date):
-    task_date = parse_arrivy_date(object_date)
-    if event_type in ("TASK_CREATED", "TASK_UPDATED"):
-        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: task_date})
-        upsert_task_state(conn, task_id, deal_id, "measure", task_date)
-        return f"Set measure_date → {task_date}"
-    elif event_type == "TASK_CANCELLED":
-        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
-        upsert_task_state(conn, task_id, deal_id, "measure", task_date, status="cancelled")
-        return "Cleared measure_date"
-    elif event_type == "TASK_COMPLETED":
-        upsert_task_state(conn, task_id, deal_id, "measure", task_date, status="completed")
-        return "Marked completed"
-    return "No action"
+    date = parse_arrivy_date(object_date)
+    if ED":
+        upsert_task_state(conn, task_id, deal_id, "measure", date, status="completed")
 
 def handle_delivery(conn, event_type, deal_id, task_id, object_date):
-    task_date = parse_arrivy_date(object_date)
+    date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
-        pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: task_date})
-        upsert_task_state(conn, task_id, deal_id, "delivery", task_date)
-        return f"Set delivery_date → {task_date}"
+        pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: date})
+        upsert_task_state(conn, task_id, deal_id, "delivery", date)
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: None})
-        upsert_task_state(conn, task_id, deal_id, "delivery", task_date, status="cancelled")
-        return "Cleared delivery_date"
+        upsert_task_state(conn, task_id, deal_id, "delivery", date, status="cancelled")
     elif event_type == "TASK_COMPLETED":
-        upsert_task_state(conn, task_id, deal_id, "delivery", task_date, status="completed")
-        return "Marked completed"
-    return "No action"
+        upsert_task_state(conn, task_id, deal_id, "delivery", date, status="completed")
 
 def handle_install(conn, event_type, deal_id, task_id, object_date):
-    task_date = parse_arrivy_date(object_date)
-    if event_type in ("TASK_CREATED", "TASK_UPDATED"):
-        upsert_task_state(conn, task_id, deal_id, "install", task_date)
-        dates = recalc_install(conn, deal_id)
-        s = dates[0] if len(dates) > 0 else None
-        p = dates[1] if len(dates) > 1 else None
-        return f"Recalculated → install_start={s}, part2={p}"
+    date           = parse_arrivy_date(object_date)
+    previous_state = get_task_state(conn, task_id)
+    previous_date  = previous_state["current_date"] if previous_state else None
+    deal           = pd_get_deal(deal_id)
+    install_start  = deal.get(PD_FIELDS["install_start"])
+    install_part2  = deal.get(PD_FIELDS["install_part2"])
+
+    if event_type == "TASK_CREATED":
+        _install_slot_date(date, install_start, install_part2, deal_id)
+        upsert_task_state(conn, task_id, deal_id, "install", date)
+    elif event_type == "TASK_UPDATED":
+        if previous_date:
+            if dates_match(previous_date, install_start):
+                pd_update_deal(deal_id, {PD_FIELDS["install_start"]: None})
+                install_start = None
+            elif dates_match(previous_date, install_part2):
+                pd_update_deal(deal_id, {PD_FIELDS["install_part2"]: None})
+                install_part2 = None
+        _install_slot_date(date, install_start, install_part2, deal_id)
+        upsert_task_state(conn, task_id, deal_id, "install", date)
     elif event_type == "TASK_CANCELLED":
-        upsert_task_state(conn, task_id, deal_id, "install", task_date, status="cancelled")
-        dates = recalc_install(conn, deal_id)
-        s = dates[0] if len(dates) > 0 else None
-        p = dates[1] if len(dates) > 1 else None
-        return f"Cancelled. Recalculated → install_start={s}, part2={p}"
+        if dates_match(date, install_start):
+            pd_update_deal(deal_id, {
+                PD_FIELDS["install_start"]: install_part2,
+                PD_FIELDS["install_part2"]: None,
+            })
+        elif dates_match(date, install_part2):
+            pd_update_deal(deal_id, {PD_FIELDS["install_part2"]: None})
+        upsert_task_state(conn, task_id, deal_id, "install", date, status="cancelled")
     elif event_type == "TASK_COMPLETED":
-        upsert_task_state(conn, task_id, deal_id, "install", task_date, status="completed")
-        pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
-        return f"Completed {task_date} → moved to stage 12"
-    return "No action"
+        upsert_task_state(conn, task_id, deal_id, "install", date, status="completed")
+        if dates_match(date, install_start):
+            pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
 
-def recalc_measure(conn, deal_id):
-    rows = conn.execute(
-        "SELECT task_date FROM task_state WHERE deal_id=? AND task_type='measure' AND status='active' AND archived=0 ORDER BY task_date",
-        (deal_id,)
-    ).fetchall()
-    date = rows[0]["task_date"] if rows else None
-    pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
-
-def recalc_delivery(conn, deal_id):
-    rows = conn.execute(
-        "SELECT task_date FROM task_state WHERE deal_id=? AND task_type='delivery' AND status='active' AND archived=0 ORDER BY task_date",
-        (deal_id,)
-    ).fetchall()
-    date = rows[0]["task_date"] if rows else None
-    pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: date})
-
-def recalc_install(conn, deal_id):
-    rows = conn.execute(
-        "SELECT task_date FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY task_date",
-        (deal_id,)
-    ).fetchall()
-    dates = [r["task_date"] for r in rows]
-    pd_update_deal(deal_id, {
-        PD_FIELDS["install_start"]: dates[0] if len(dates) > 0 else None,
-        PD_FIELDS["install_part2"]: dates[1] if len(dates) > 1 else None,
-    })
-    return dates
-
-def handle_deleted(conn, task_id, deal_id, task_type):
-    conn.execute("DELETE FROM task_state WHERE task_id=?", (task_id,))
-    logger.info(f"Deleted task {task_id} (deal={deal_id}, type={task_type}) from task_state")
-    if task_type == "measure":
-        recalc_measure(conn, deal_id)
-        return "Deleted. Recalculated measure_date"
-    elif task_type == "delivery":
-        recalc_delivery(conn, deal_id)
-        return "Deleted. Recalculated delivery_date"
-    elif task_type == "install":
-        dates = recalc_install(conn, deal_id)
-        s = dates[0] if len(dates) > 0 else None
-        p = dates[1] if len(dates) > 1 else None
-        return f"Deleted. Recalculated → install_start={s}, part2={p}"
-    return "Deleted (unknown type — no Pipedrive action)"
-
+def _install_slot_date(date, install_start, install_part2, deal_id):
+    if not install_start:
+        pd_update_deal(deal_id, {PD_FIELDS["install_start"]: date})
+        return
+    try:
+        new_dt   = datetime.strptime(date, "%Y-%m-%d")
+        start_dt = datetime.strptime(install_start[:10], "%Y-%m-%d")
+    except Exception as e:
+        logger.error(f"Date parse error: {e}")
+        return
+    if new_dt < start_dt:
+        pd_update_deal(deal_id, {
+            PD_FIELDS["install_start"]: date,
+            PD_FIELDS["install_part2"]: install_start[:10],
+        })
+    else:
+        pd_update_deal(deal_id, {PD_FIELDS["install_part2"]: date})
 
 # ---------------------------------------------------------------------------
 # IP RESTRICTION
@@ -349,38 +272,18 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
-def admin_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not session.get("authenticated"):
-            return redirect(url_for("pin_page"))
-        if session.get("role") != "admin":
-            return redirect(url_for("dashboard"))
-        return f(*args, **kwargs)
-    return decorated
-
 @app.route("/pin", methods=["GET"])
 def pin_page():
     return render_template("pin.html")
 
 @app.route("/pin/verify", methods=["POST"])
 def verify_pin():
-    data    = request.get_json(force=True)
+    data = request.get_json(force=True)
     entered = data.get("pin", "")
-    with get_db() as conn:
-        user = conn.execute("SELECT * FROM users WHERE pin=?", (entered,)).fetchone()
-    if user:
+    stored  = get_setting("pin") or "0000"
+    if entered == stored:
         session["authenticated"] = True
-        session["username"]      = user["username"]
-        session["role"]          = user["role"]
-        ip = request.headers.get("X-Forwarded-For", request.remote_addr).split(",")[0].strip()
-        with get_db() as conn:
-            conn.execute(
-                "INSERT INTO access_log (username, logged_in_at, ip_address) VALUES (?,?,?)",
-                (user["username"], datetime.utcnow().isoformat(), ip)
-            )
-        logger.info(f"Login: {user['username']} ({user['role']}) from {ip}")
-        return jsonify({"status": "ok", "role": user["role"]}), 200
+        return jsonify({"status": "ok"}), 200
     return jsonify({"status": "error", "message": "Incorrect PIN"}), 401
 
 @app.route("/pin/change", methods=["POST"])
@@ -390,12 +293,7 @@ def change_pin():
     new_pin = data.get("pin", "")
     if not new_pin.isdigit() or len(new_pin) != 4:
         return jsonify({"status": "error", "message": "PIN must be 4 digits"}), 400
-    username = session.get("username", "admin")
-    with get_db() as conn:
-        existing = conn.execute("SELECT id FROM users WHERE pin=? AND username!=?", (new_pin, username)).fetchone()
-        if existing:
-            return jsonify({"status": "error", "message": "PIN already in use"}), 400
-        conn.execute("UPDATE users SET pin=? WHERE username=?", (new_pin, username))
+    set_setting("pin", new_pin)
     return jsonify({"status": "ok"}), 200
 
 @app.route("/logout")
@@ -428,22 +326,7 @@ def dashboard():
                            recent_events=recent_events,
                            event_counts=event_counts,
                            active_tasks=active_tasks,
-                           total_events=total_events,
-                           username=session.get("username", ""),
-                           is_admin=session.get("role") == "admin")
-
-@app.route("/api/clear-db", methods=["POST"])
-@login_required
-def clear_db():
-    try:
-        with get_db() as conn:
-            conn.execute("DELETE FROM events")
-            conn.execute("DELETE FROM task_state")
-        logger.warning("Database cleared via dashboard")
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        logger.exception(f"Clear DB failed: {e}")
-        return jsonify({"error": str(e)}), 500
+                           total_events=total_events)
 
 @app.route("/api/stats")
 @login_required
@@ -459,136 +342,6 @@ def api_stats():
         "active_tasks": active,
         "recent": [dict(r) for r in recent]
     })
-
-@app.route("/users")
-@admin_required
-def users():
-    return render_template("users.html", username=session.get("username", ""))
-
-@app.route("/api/users", methods=["GET", "POST"])
-@admin_required
-def api_users():
-    if request.method == "GET":
-        with get_db() as conn:
-            rows = conn.execute(
-                "SELECT id, username, role, created_at FROM users ORDER BY created_at"
-            ).fetchall()
-        return jsonify({"users": [dict(r) for r in rows]})
-
-    data     = request.get_json(force=True)
-    username = (data.get("username") or "").strip()
-    pin      = (data.get("pin") or "").strip()
-    role     = data.get("role", "user")
-
-    if not username or not pin.isdigit() or len(pin) != 4:
-        return jsonify({"error": "Username and 4-digit PIN required"}), 400
-    if role not in ("admin", "user"):
-        role = "user"
-
-    try:
-        with get_db() as conn:
-            conn.execute(
-                "INSERT INTO users (username, pin, role, created_at) VALUES (?,?,?,?)",
-                (username, pin, role, datetime.utcnow().isoformat())
-            )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-    logger.info(f"User created: {username} ({role})")
-    return jsonify({"status": "ok"}), 201
-
-@app.route("/api/users/<int:user_id>", methods=["DELETE"])
-@admin_required
-def api_user_delete(user_id):
-    with get_db() as conn:
-        user = conn.execute("SELECT username, role FROM users WHERE id=?", (user_id,)).fetchone()
-        if not user:
-            return jsonify({"error": "User not found"}), 404
-        if user["role"] == "admin":
-            return jsonify({"error": "Cannot delete admin users"}), 400
-        if user["username"] == session.get("username"):
-            return jsonify({"error": "Cannot delete your own account"}), 400
-        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
-    logger.info(f"User deleted: {user['username']}")
-    return jsonify({"status": "ok"}), 200
-
-@app.route("/api/access-log")
-@admin_required
-def api_access_log():
-    limit = min(int(request.args.get("limit", 100)), 1000)
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT username, logged_in_at, ip_address FROM access_log ORDER BY logged_in_at DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-    return jsonify({"logs": [dict(r) for r in rows]})
-
-@app.route("/settings")
-@admin_required
-def settings_page():
-    return render_template("settings.html")
-
-@app.route("/api/settings", methods=["GET", "POST"])
-@login_required
-def api_settings():
-    SETTING_KEYS = {"auto_lock_minutes", "screen_sleep_minutes"}
-    if request.method == "GET":
-        return jsonify({k: get_setting(k) or "0" for k in SETTING_KEYS})
-    data = request.get_json(force=True)
-    for key, val in data.items():
-        if key in SETTING_KEYS:
-            set_setting(key, str(val))
-    return jsonify({"status": "ok"})
-
-@app.route("/api/stream")
-@login_required
-def api_stream():
-    def generate():
-        q = queue.Queue(maxsize=10)
-        with _sse_clients_lock:
-            _sse_clients.add(q)
-        try:
-            yield "data: connected\n\n"
-            while True:
-                try:
-                    msg = q.get(timeout=25)
-                    yield f"data: {msg}\n\n"
-                except queue.Empty:
-                    yield "data: ping\n\n"  # keepalive
-        finally:
-            with _sse_clients_lock:
-                _sse_clients.discard(q)
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-@app.route("/logs")
-@login_required
-def logs():
-    return render_template("logs.html")
-
-@app.route("/api/logs")
-@login_required
-def api_logs():
-    limit = min(int(request.args.get("limit", 100)), 1000)
-    with get_db() as conn:
-        rows = conn.execute(
-            """SELECT id, received_at, deal_id, task_id, event_type, task_type, outcome, raw_json
-               FROM events WHERE archived=0 ORDER BY received_at DESC LIMIT ?""",
-            (limit,)
-        ).fetchall()
-    logs = []
-    for row in rows:
-        raw = json.loads(row["raw_json"])
-        logs.append({
-            "id":         row["id"],
-            "time":       row["received_at"][11:19] if row["received_at"] else "—",
-            "deal_id":    row["deal_id"],
-            "event_type": (row["event_type"] or "—").replace("TASK_", ""),
-            "task_type":  row["task_type"] or "unknown",
-            "task_date":  (raw.get("OBJECT_DATE") or "")[:10] or "—",
-            "title":      raw.get("TITLE") or "—",
-            "outcome":    row["outcome"] or "—",
-        })
-    return jsonify({"logs": logs})
 
 # ---------------------------------------------------------------------------
 # WEBHOOK ENDPOINTS
@@ -621,35 +374,29 @@ def arrivy_webhook():
         logger.info(f"Arrivy raw payload: {json.dumps(payload)}")
         logger.info(f"Arrivy: {event_type} (raw={raw_event_type}/{sub_type}) | template={template_id} | deal={external_id} | task={task_id}")
 
-        if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED"):
-            return jsonify({"status": "ok"}), 200
+        if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED"):
+            return jsonify({"status": "ignored"}), 200
 
         if not external_id:
-            return jsonify({"status": "ok"}), 200
+            return jsonify({"status": "ignored", "reason": "no external id"}), 200
 
         if str(external_id) != "29905":
-            return jsonify({"status": "ok"}), 200
+            return jsonify({"status": "ignored", "reason": "not test deal"}), 200
 
         deal_id   = int(external_id)
         task_type = TEMPLATE_MAP.get(template_id)
 
         with get_db() as conn:
-            event_id = store_event(conn, deal_id, task_id, event_type, task_type, payload)
-            if event_type == "TASK_DELETED":
-                outcome = handle_deleted(conn, task_id, deal_id, task_type)
-            elif not task_type:
-                outcome = "Stored — unknown template, no Pipedrive action"
-            elif task_type == "measure":
-                outcome = handle_measure(conn, event_type, deal_id, task_id, object_date)
+            store_event(conn, deal_id, task_id, event_type, task_type, payload)
+            if not task_type:
+                return jsonify({"status": "stored", "reason": "unknown template"}), 200
+            if task_type == "measure":
+                handle_measure(conn, event_type, deal_id, task_id, object_date)
             elif task_type == "delivery":
-                outcome = handle_delivery(conn, event_type, deal_id, task_id, object_date)
+                handle_delivery(conn, event_type, deal_id, task_id, object_date)
             elif task_type == "install":
-                outcome = handle_install(conn, event_type, deal_id, task_id, object_date)
-            else:
-                outcome = "No handler"
-            set_event_outcome(conn, event_id, outcome)
+                handle_install(conn, event_type, deal_id, task_id, object_date)
 
-        sse_notify()
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
@@ -657,27 +404,20 @@ def arrivy_webhook():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/pipedrive-webhook/", methods=["POST"])
 @app.route("/pipedrive-webhook", methods=["POST"])
 def pipedrive_webhook():
     try:
         payload = request.get_json(force=True)
         if not payload:
             return jsonify({"error": "empty payload"}), 400
-        event    = payload.get("event")
-        current  = payload.get("current", {})
-        status   = current.get("status")
-        deal_id  = current.get("id")
-        stage_id = current.get("stage_id")
-
-        if event == "updated.deal" and deal_id:
-            if status in ("won", "lost"):
-                with get_db() as conn:
-                    archive_deal(conn, deal_id)
-            elif stage_id == INSTALL_SCHEDULED_STAGE_ID:
-                with get_db() as conn:
-                    recalc_install(conn, deal_id)
-                logger.info(f"Stage 10 recalc ran for deal {deal_id}")
-
+        event   = payload.get("event")
+        current = payload.get("current", {})
+        status  = current.get("status")
+        deal_id = current.get("id")
+        if event == "updated.deal" and status in ("won", "lost") and deal_id:
+            with get_db() as conn:
+                archive_deal(conn, deal_id)
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         logger.exception(f"Pipedrive webhook error: {e}")
