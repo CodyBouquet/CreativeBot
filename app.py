@@ -49,8 +49,9 @@ PD_FIELDS = {
     "delivery_date":  "d0d424fcacbdf264297a050ff96a799823316d9f",
 }
 
-INSTALL_COMPLETE_STAGE_ID    = 12
-INSTALL_SCHEDULED_STAGE_ID   = 10
+INSTALL_COMPLETE_STAGE_ID      = 12
+INSTALL_SCHEDULED_STAGE_ID     = 10
+INSTALL_READY_TO_SCHEDULE_ID   = 9
 
 INSTALL_PHASE_OPTIONS = {
     "Final":   37,
@@ -254,9 +255,11 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
             phase_id = INSTALL_PHASE_OPTIONS.get(install_phase)
             if phase_id:
                 pd_update_deal(deal_id, {PD_FIELDS["install_phase"]: phase_id})
-    elif event_type == "TASK_CANCELLED":
+    elif event_type in ("TASK_CANCELLED", "TASK_DELETED"):
         upsert_task_state(conn, task_id, deal_id, "install", date, status="cancelled")
-        recalc_install(conn, deal_id)
+        dates = recalc_install(conn, deal_id)
+        if not dates:
+            pd_move_stage(deal_id, INSTALL_READY_TO_SCHEDULE_ID)
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "install", date, status="completed")
         pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
@@ -440,7 +443,7 @@ def arrivy_webhook():
         logger.info(f"Arrivy raw payload: {json.dumps(payload)}")
         logger.info(f"Arrivy: {event_type} (raw={raw_event_type}/{sub_type}) | template={template_id} | deal={external_id} | task={task_id}")
 
-        if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED"):
+        if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED"):
             return jsonify({"status": "ignored"}), 200
 
         if not external_id:
