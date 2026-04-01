@@ -440,11 +440,12 @@ def pipedrive_webhook():
         status   = current.get("status")
         deal_id  = current.get("id")
         stage_id = current.get("stage_id")
+        logger.info(f"Pipedrive webhook: event={event!r} deal_id={deal_id!r} stage_id={stage_id!r} ({type(stage_id).__name__}) status={status!r}")
         if event == "updated.deal" and deal_id:
             if status in ("won", "lost"):
                 with get_db() as conn:
                     archive_deal(conn, deal_id)
-            elif stage_id == INSTALL_SCHEDULED_STAGE_ID:
+            elif int(stage_id) == INSTALL_SCHEDULED_STAGE_ID if stage_id is not None else False:
                 with get_db() as conn:
                     recalc_install(conn, deal_id)
                 logger.info(f"Stage 10 recalc ran for deal {deal_id}")
