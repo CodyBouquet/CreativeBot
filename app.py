@@ -111,6 +111,13 @@ def init_db():
 
             INSERT OR IGNORE INTO settings (key, value) VALUES ('pin', '0000');
         """)
+        # Migrate: rename current_date → task_date if needed
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(task_state)").fetchall()]
+        if "current_date" in cols and "task_date" not in cols:
+            conn.execute("ALTER TABLE task_state ADD COLUMN task_date TEXT")
+            conn.execute("UPDATE task_state SET task_date = current_date")
+        elif "task_date" not in cols:
+            conn.execute("ALTER TABLE task_state ADD COLUMN task_date TEXT")
     logger.info(f"Database initialised at {DB_PATH}")
 
 def get_setting(key):
