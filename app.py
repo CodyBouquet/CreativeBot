@@ -214,10 +214,10 @@ def handle_delivery(conn, event_type, deal_id, task_id, object_date):
 
 def recalc_install(conn, deal_id):
     rows = conn.execute(
-        "SELECT task_date FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY task_date",
+        "SELECT current_date FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY current_date",
         (deal_id,)
     ).fetchall()
-    dates = [r["task_date"] for r in rows]
+    dates = [r["current_date"] for r in rows]
     pd_update_deal(deal_id, {
         PD_FIELDS["install_start"]: dates[0] if len(dates) > 0 else None,
         PD_FIELDS["install_part2"]: dates[1] if len(dates) > 1 else None,
