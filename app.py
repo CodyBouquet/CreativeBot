@@ -115,7 +115,7 @@ def init_db():
         cols = [r[1] for r in conn.execute("PRAGMA table_info(task_state)").fetchall()]
         if "current_date" in cols and "task_date" not in cols:
             conn.execute("ALTER TABLE task_state ADD COLUMN task_date TEXT")
-            conn.execute("UPDATE task_state SET task_date = current_date")
+            conn.execute('UPDATE task_state SET task_date = "current_date"')
         elif "task_date" not in cols:
             conn.execute("ALTER TABLE task_state ADD COLUMN task_date TEXT")
     logger.info(f"Database initialised at {DB_PATH}")
@@ -484,6 +484,7 @@ def health():
 # ---------------------------------------------------------------------------
 # STARTUP
 # ---------------------------------------------------------------------------
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=5001)
