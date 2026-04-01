@@ -261,8 +261,12 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
         if not dates:
             pd_move_stage(deal_id, INSTALL_READY_TO_SCHEDULE_ID)
     elif event_type == "TASK_COMPLETED":
+        current_dates = recalc_install(conn, deal_id)
+        is_part1 = bool(current_dates and current_dates[0] == date)
         upsert_task_state(conn, task_id, deal_id, "install", date, status="completed")
-        pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
+        recalc_install(conn, deal_id)
+        if is_part1:
+            pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
 
 # ---------------------------------------------------------------------------
 # IP RESTRICTION
@@ -409,6 +413,7 @@ def api_clear_db():
     with get_db() as conn:
         conn.execute("DELETE FROM events")
         conn.execute("DELETE FROM task_state")
+    sse_notify()
     return jsonify({"status": "ok"})
 
 # ---------------------------------------------------------------------------
@@ -456,6 +461,11 @@ def arrivy_webhook():
         task_type = TEMPLATE_MAP.get(template_id)
 
         with get_db() as conn:
+            # For delete events the template ID is often absent — fall back to DB
+            if not task_type and event_type == "TASK_DELETED":
+                row = get_task_state(conn, task_id)
+                if row:
+                    task_type = row["task_type"]
             store_event(conn, deal_id, task_id, event_type, task_type, payload)
             if not task_type:
                 return jsonify({"status": "stored", "reason": "unknown template"}), 200
