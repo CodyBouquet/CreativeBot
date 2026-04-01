@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template, session, redirect, url_for
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for, Response
 from dotenv import load_dotenv
 import requests
 import logging
@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from functools import wraps
 import threading
+import queue
 
 load_dotenv()
 
@@ -50,7 +51,21 @@ PD_FIELDS = {
 INSTALL_COMPLETE_STAGE_ID = 12
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats"}
+DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_stream"}
+
+# SSE client queues
+_sse_clients      = set()
+_sse_clients_lock = threading.Lock()
+
+def sse_notify():
+    with _sse_clients_lock:
+        dead = set()
+        for q in _sse_clients:
+            try:
+                q.put_nowait("refresh")
+            except queue.Full:
+                dead.add(q)
+        _sse_clients.difference_update(dead)
 
 # ---------------------------------------------------------------------------
 # DATABASE
@@ -343,6 +358,27 @@ def api_stats():
         "recent": [dict(r) for r in recent]
     })
 
+@app.route("/api/stream")
+@login_required
+def api_stream():
+    def generate():
+        q = queue.Queue(maxsize=10)
+        with _sse_clients_lock:
+            _sse_clients.add(q)
+        try:
+            yield "data: connected\n\n"
+            while True:
+                try:
+                    msg = q.get(timeout=25)
+                    yield f"data: {msg}\n\n"
+                except queue.Empty:
+                    yield "data: ping\n\n"  # keepalive
+        finally:
+            with _sse_clients_lock:
+                _sse_clients.discard(q)
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 # ---------------------------------------------------------------------------
 # WEBHOOK ENDPOINTS
 # ---------------------------------------------------------------------------
@@ -397,6 +433,7 @@ def arrivy_webhook():
             elif task_type == "install":
                 handle_install(conn, event_type, deal_id, task_id, object_date)
 
+        sse_notify()
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
