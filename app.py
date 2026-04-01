@@ -52,7 +52,7 @@ INSTALL_COMPLETE_STAGE_ID    = 12
 INSTALL_SCHEDULED_STAGE_ID   = 10
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_stream"}
+DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_stream", "api_clear_db"}
 
 # SSE client queues
 _sse_clients      = set()
@@ -95,7 +95,7 @@ def init_db():
                 task_id      INTEGER PRIMARY KEY,
                 deal_id      INTEGER NOT NULL,
                 task_type    TEXT    NOT NULL,
-                current_date TEXT,
+                task_date    TEXT,
                 status       TEXT    NOT NULL DEFAULT 'active',
                 last_updated TEXT    NOT NULL,
                 archived     INTEGER NOT NULL DEFAULT 0
@@ -133,15 +133,15 @@ def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload):
 def get_task_state(conn, task_id):
     return conn.execute("SELECT * FROM task_state WHERE task_id = ?", (task_id,)).fetchone()
 
-def upsert_task_state(conn, task_id, deal_id, task_type, current_date, status="active"):
+def upsert_task_state(conn, task_id, deal_id, task_type, task_date, status="active"):
     conn.execute(
-        """INSERT INTO task_state (task_id, deal_id, task_type, current_date, status, last_updated)
+        """INSERT INTO task_state (task_id, deal_id, task_type, task_date, status, last_updated)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(task_id) DO UPDATE SET
-               current_date = excluded.current_date,
+               task_date    = excluded.task_date,
                status       = excluded.status,
                last_updated = excluded.last_updated""",
-        (task_id, deal_id, task_type, current_date, status, datetime.utcnow().isoformat())
+        (task_id, deal_id, task_type, task_date, status, datetime.utcnow().isoformat())
     )
 
 def archive_deal(conn, deal_id):
@@ -214,10 +214,10 @@ def handle_delivery(conn, event_type, deal_id, task_id, object_date):
 
 def recalc_install(conn, deal_id):
     rows = conn.execute(
-        "SELECT current_date FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY current_date",
+        "SELECT task_date FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY task_date",
         (deal_id,)
     ).fetchall()
-    dates = [r["current_date"] for r in rows]
+    dates = [r["task_date"] for r in rows]
     pd_update_deal(deal_id, {
         PD_FIELDS["install_start"]: dates[0] if len(dates) > 0 else None,
         PD_FIELDS["install_part2"]: dates[1] if len(dates) > 1 else None,
@@ -350,6 +350,14 @@ def api_stream():
                 _sse_clients.discard(q)
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+@app.route("/api/clear-db", methods=["POST"])
+@login_required
+def api_clear_db():
+    with get_db() as conn:
+        conn.execute("DELETE FROM events")
+        conn.execute("DELETE FROM task_state")
+    return jsonify({"status": "ok"})
 
 # ---------------------------------------------------------------------------
 # WEBHOOK ENDPOINTS
