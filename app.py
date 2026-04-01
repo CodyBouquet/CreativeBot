@@ -44,6 +44,7 @@ TEMPLATE_MAP = {
 PD_FIELDS = {
     "install_start":  "197d71fa84fd5221fa4a875fbac9526c1d554139",
     "install_part2":  "7492f008b747af364836514d752961176f1f0307",
+    "install_phase":  "cdf1c74d66c5796284a2bbcfcef8080975d0f19e",
     "measure_date":   "e23dc895627529b276d3b1b0ec7c8acc75317b1c",
     "delivery_date":  "d0d424fcacbdf264297a050ff96a799823316d9f",
 }
@@ -51,8 +52,13 @@ PD_FIELDS = {
 INSTALL_COMPLETE_STAGE_ID    = 12
 INSTALL_SCHEDULED_STAGE_ID   = 10
 
+INSTALL_PHASE_OPTIONS = {
+    "Final":   37,
+    "Partial": 65,
+}
+
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_stream", "api_clear_db"}
+DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_stream", "api_clear_db", "api_logs"}
 
 # SSE client queues
 _sse_clients      = set()
@@ -231,11 +237,23 @@ def recalc_install(conn, deal_id):
     })
     return dates
 
-def handle_install(conn, event_type, deal_id, task_id, object_date):
+def get_extra_field(extra_fields, name):
+    """Return the value of a named field from OBJECT_TEMPLATE_EXTRA_FIELDS."""
+    for field in (extra_fields or []):
+        if field.get("name") == name:
+            return field.get("value")
+    return None
+
+def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields=None):
     date = parse_arrivy_date(object_date)
+    install_phase = get_extra_field(extra_fields, "Installation Phase")
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", date)
-        recalc_install(conn, deal_id)
+        dates = recalc_install(conn, deal_id)
+        if install_phase and dates and dates[0] == date:
+            phase_id = INSTALL_PHASE_OPTIONS.get(install_phase)
+            if phase_id:
+                pd_update_deal(deal_id, {PD_FIELDS["install_phase"]: phase_id})
     elif event_type == "TASK_CANCELLED":
         upsert_task_state(conn, task_id, deal_id, "install", date, status="cancelled")
         recalc_install(conn, deal_id)
@@ -358,6 +376,30 @@ def api_stream():
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+@app.route("/api/logs")
+@login_required
+def api_logs():
+    limit = min(int(request.args.get("limit", 100)), 1000)
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, received_at, deal_id, task_id, event_type, task_type, raw_json FROM events WHERE archived=0 ORDER BY received_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    logs = []
+    for row in rows:
+        raw = json.loads(row["raw_json"])
+        logs.append({
+            "id":         row["id"],
+            "time":       row["received_at"][11:19] if row["received_at"] else "—",
+            "deal_id":    row["deal_id"],
+            "event_type": (row["event_type"] or "—").replace("TASK_", ""),
+            "task_type":  row["task_type"] or "unknown",
+            "task_date":  (raw.get("OBJECT_DATE") or "")[:10] or "—",
+            "title":      raw.get("TITLE") or "—",
+            "outcome":    "—",
+        })
+    return jsonify({"logs": logs})
+
 @app.route("/api/clear-db", methods=["POST"])
 @login_required
 def api_clear_db():
@@ -382,6 +424,7 @@ def arrivy_webhook():
         object_date = payload.get("OBJECT_DATE")
         external_id = payload.get("OBJECT_EXTERNAL_ID")
         task_id     = payload.get("OBJECT_ID")
+        extra_fields = payload.get("OBJECT_TEMPLATE_EXTRA_FIELDS", [])
 
         # Map Arrivy's TASK_STATUS + subtype to internal event types
         STATUS_SUBTYPE_MAP = {
@@ -418,7 +461,7 @@ def arrivy_webhook():
             elif task_type == "delivery":
                 handle_delivery(conn, event_type, deal_id, task_id, object_date)
             elif task_type == "install":
-                handle_install(conn, event_type, deal_id, task_id, object_date)
+                handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
 
         sse_notify()
         return jsonify({"status": "ok"}), 200
