@@ -182,7 +182,7 @@ def dates_match(a, b):
 # ---------------------------------------------------------------------------
 def handle_measure(conn, event_type, deal_id, task_id, object_date):
     date = parse_arrivy_date(object_date)
-    if ED":
+    if event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "measure", date, status="completed")
 
 def handle_delivery(conn, event_type, deal_id, task_id, object_date):
