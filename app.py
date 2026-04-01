@@ -451,21 +451,23 @@ def arrivy_webhook():
         if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED"):
             return jsonify({"status": "ignored"}), 200
 
-        if not external_id:
-            return jsonify({"status": "ignored", "reason": "no external id"}), 200
-
-        if str(external_id) != "29905":
-            return jsonify({"status": "ignored", "reason": "not test deal"}), 200
-
-        deal_id   = int(external_id)
+        deal_id   = int(external_id) if external_id else None
         task_type = TEMPLATE_MAP.get(template_id)
 
         with get_db() as conn:
-            # For delete events the template ID is often absent — fall back to DB
-            if not task_type and event_type == "TASK_DELETED":
+            # Delete events arrive with no external_id or template_id — look up from DB
+            if event_type == "TASK_DELETED" and (not deal_id or not task_type):
                 row = get_task_state(conn, task_id)
                 if row:
-                    task_type = row["task_type"]
+                    deal_id   = deal_id or row["deal_id"]
+                    task_type = task_type or row["task_type"]
+
+            if not deal_id:
+                return jsonify({"status": "ignored", "reason": "no external id"}), 200
+
+            if deal_id != 29905:
+                return jsonify({"status": "ignored", "reason": "not test deal"}), 200
+
             store_event(conn, deal_id, task_id, event_type, task_type, payload)
             if not task_type:
                 return jsonify({"status": "stored", "reason": "unknown template"}), 200
