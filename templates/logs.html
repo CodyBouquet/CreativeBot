@@ -235,6 +235,11 @@
 </main>
 
 <script>
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
+
   let allLogs = [];
 
   async function loadLogs() {
@@ -273,16 +278,16 @@
     tbody.innerHTML = filtered.map(log => {
       const badge = BADGE[log.task_type] || 'unknown';
       return `<tr>
-        <td class="event-time">${log.time}</td>
-        <td class="deal-id">${log.deal_id ? '#' + log.deal_id : '—'}</td>
-        <td class="event-type">${log.event_type}</td>
-        <td><span class="badge ${badge}">${log.task_type}</span></td>
-        <td class="event-time">${log.task_date}</td>
+        <td class="event-time">${escapeHtml(log.time)}</td>
+        <td class="deal-id">${log.deal_id ? '#' + escapeHtml(log.deal_id) : '—'}</td>
+        <td class="event-type">${escapeHtml(log.event_type)}</td>
+        <td><span class="badge ${escapeHtml(badge)}">${escapeHtml(log.task_type)}</span></td>
+        <td class="event-time">${escapeHtml(log.task_date)}</td>
         <td>
-          <div class="task-title">${log.title}</div>
+          <div class="task-title">${escapeHtml(log.title)}</div>
         </td>
         <td>
-          <div class="outcome">${log.outcome}</div>
+          <div class="outcome">${escapeHtml(log.outcome)}</div>
         </td>
       </tr>`;
     }).join('');

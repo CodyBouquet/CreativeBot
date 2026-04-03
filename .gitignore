@@ -1,0 +1,28 @@
+# Environment variables / secrets
+.env
+*.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Backups
+backups/
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

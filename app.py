@@ -17,7 +17,12 @@ import queue
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-in-production")
+_secret = os.environ.get("FLASK_SECRET_KEY", "")
+if not _secret:
+    import secrets as _secrets
+    _secret = _secrets.token_hex(32)
+    logging.warning("FLASK_SECRET_KEY not set — sessions will not persist across restarts")
+app.secret_key = _secret
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
@@ -32,6 +37,16 @@ GITHUB_WEBHOOK_SECRET     = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 REPO_PATH                 = os.environ.get("REPO_PATH", "/home/admin/CreativeBot")
 SERVICE_NAME              = os.environ.get("SERVICE_NAME", "arrivy-sync")
 DB_PATH                   = os.environ.get("DB_PATH", "/home/admin/CreativeBot/data/sync.db")
+
+_REQUIRED_ENV = {
+    "PIPEDRIVE_API_TOKEN": PIPEDRIVE_API_TOKEN,
+    "ARRIVY_API_KEY":      ARRIVY_API_KEY,
+    "ARRIVY_AUTH_TOKEN":   ARRIVY_AUTH_TOKEN,
+    "GITHUB_WEBHOOK_SECRET": GITHUB_WEBHOOK_SECRET,
+}
+for _var, _val in _REQUIRED_ENV.items():
+    if not _val:
+        logging.warning(f"Environment variable {_var} is not set — related features will fail")
 
 # Arrivy template IDs → task type
 TEMPLATE_MAP = {
@@ -122,7 +137,7 @@ def init_db():
         cols = [r[1] for r in conn.execute("PRAGMA table_info(task_state)").fetchall()]
         if "current_date" in cols and "task_date" not in cols:
             conn.execute("ALTER TABLE task_state ADD COLUMN task_date TEXT")
-            conn.execute('UPDATE task_state SET task_date = "current_date"')
+            conn.execute('UPDATE task_state SET task_date = current_date')
         elif "task_date" not in cols:
             conn.execute("ALTER TABLE task_state ADD COLUMN task_date TEXT")
     logger.info(f"Database initialised at {DB_PATH}")
@@ -274,8 +289,7 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
 @app.before_request
 def restrict_dashboard_by_ip():
     if request.endpoint in DASHBOARD_ENDPOINTS:
-        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
-        client_ip = client_ip.split(",")[0].strip()
+        client_ip = request.remote_addr
         if client_ip != ALLOWED_DASHBOARD_IP:
             logger.warning(f"Blocked {client_ip} from {request.endpoint}")
             return redirect("https://www.creativecarpetinc.com")
