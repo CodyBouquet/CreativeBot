@@ -116,13 +116,14 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS task_state (
-                task_id      INTEGER PRIMARY KEY,
-                deal_id      INTEGER NOT NULL,
-                task_type    TEXT    NOT NULL,
-                task_date    TEXT,
-                status       TEXT    NOT NULL DEFAULT 'active',
-                last_updated TEXT    NOT NULL,
-                archived     INTEGER NOT NULL DEFAULT 0
+                task_id       INTEGER PRIMARY KEY,
+                deal_id       INTEGER NOT NULL,
+                task_type     TEXT    NOT NULL,
+                task_date     TEXT,
+                install_phase TEXT,
+                status        TEXT    NOT NULL DEFAULT 'active',
+                last_updated  TEXT    NOT NULL,
+                archived      INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -168,6 +169,8 @@ def init_db():
             conn.execute('UPDATE task_state SET task_date = current_date')
         elif "task_date" not in cols:
             conn.execute("ALTER TABLE task_state ADD COLUMN task_date TEXT")
+        if "install_phase" not in cols:
+            conn.execute("ALTER TABLE task_state ADD COLUMN install_phase TEXT")
     logger.info(f"Database initialised at {DB_PATH}")
 
 def get_setting(key):
@@ -190,15 +193,16 @@ def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload):
 def get_task_state(conn, task_id):
     return conn.execute("SELECT * FROM task_state WHERE task_id = ?", (task_id,)).fetchone()
 
-def upsert_task_state(conn, task_id, deal_id, task_type, task_date, status="active"):
+def upsert_task_state(conn, task_id, deal_id, task_type, task_date, status="active", install_phase=None):
     conn.execute(
-        """INSERT INTO task_state (task_id, deal_id, task_type, task_date, status, last_updated)
-           VALUES (?, ?, ?, ?, ?, ?)
+        """INSERT INTO task_state (task_id, deal_id, task_type, task_date, install_phase, status, last_updated)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(task_id) DO UPDATE SET
-               task_date    = excluded.task_date,
-               status       = excluded.status,
-               last_updated = excluded.last_updated""",
-        (task_id, deal_id, task_type, task_date, status, datetime.utcnow().isoformat())
+               task_date     = excluded.task_date,
+               install_phase = excluded.install_phase,
+               status        = excluded.status,
+               last_updated  = excluded.last_updated""",
+        (task_id, deal_id, task_type, task_date, install_phase, status, datetime.utcnow().isoformat())
     )
 
 def archive_deal(conn, deal_id):
@@ -271,13 +275,16 @@ def handle_delivery(conn, event_type, deal_id, task_id, object_date):
 
 def recalc_install(conn, deal_id):
     rows = conn.execute(
-        "SELECT task_date FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY task_date",
+        "SELECT task_date, install_phase FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY task_date",
         (deal_id,)
     ).fetchall()
-    dates = [r["task_date"] for r in rows]
+    dates  = [r["task_date"]     for r in rows]
+    phase  = rows[0]["install_phase"] if rows else None
+    phase_id = INSTALL_PHASE_OPTIONS.get(phase) if phase else None
     pd_update_deal(deal_id, {
-        PD_FIELDS["install_start"]: dates[0] if len(dates) > 0 else None,
-        PD_FIELDS["install_part2"]: dates[1] if len(dates) > 1 else None,
+        PD_FIELDS["install_start"]: dates[0]  if len(dates) > 0 else None,
+        PD_FIELDS["install_part2"]: dates[1]  if len(dates) > 1 else None,
+        PD_FIELDS["install_phase"]: phase_id,
     })
     return dates
 
@@ -289,15 +296,10 @@ def get_extra_field(extra_fields, name):
     return None
 
 def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields=None):
-    date = parse_arrivy_date(object_date)
+    date          = parse_arrivy_date(object_date)
     install_phase = get_extra_field(extra_fields, "Installation Phase")
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
-        upsert_task_state(conn, task_id, deal_id, "install", date)
-        dates = recalc_install(conn, deal_id)
-        if install_phase and dates and dates[0] == date:
-            phase_id = INSTALL_PHASE_OPTIONS.get(install_phase)
-            if phase_id:
-                pd_update_deal(deal_id, {PD_FIELDS["install_phase"]: phase_id})
+        upsert_task_state(conn, task_id, deal_id, "install", date, install_phase=install_phase)
     elif event_type in ("TASK_CANCELLED", "TASK_DELETED"):
         upsert_task_state(conn, task_id, deal_id, "install", date, status="cancelled")
         dates = recalc_install(conn, deal_id)
@@ -307,7 +309,6 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
         current_dates = recalc_install(conn, deal_id)
         is_part1 = bool(current_dates and current_dates[0] == date)
         upsert_task_state(conn, task_id, deal_id, "install", date, status="completed")
-        recalc_install(conn, deal_id)
         if is_part1:
             pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
 
