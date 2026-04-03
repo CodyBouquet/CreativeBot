@@ -74,7 +74,7 @@ INSTALL_PHASE_OPTIONS = {
 }
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_stream", "api_clear_db", "api_logs", "settings_page", "api_settings"}
+DASHBOARD_ENDPOINTS  = {"dashboard", "logs", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_stream", "api_clear_db", "api_logs", "settings_page", "api_settings"}
 
 # SSE client queues
 _sse_clients      = set()
@@ -429,6 +429,11 @@ def api_clear_db():
         conn.execute("DELETE FROM task_state")
     sse_notify()
     return jsonify({"status": "ok"})
+
+@app.route("/logs")
+@login_required
+def logs():
+    return render_template("logs.html")
 
 @app.route("/settings")
 @login_required
