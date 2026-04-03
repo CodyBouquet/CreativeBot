@@ -532,20 +532,15 @@
   <div>
     <div class="section-title">Actions</div>
     <div class="actions-grid">
-      <div class="action-card" onclick="showToast('Coming soon', 'success')">
+      <div class="action-card" onclick="runSync(this)">
         <div class="action-icon">🔄</div>
         <div class="action-name">Manual Sync</div>
-        <div class="action-desc">Force sync a deal by ID</div>
+        <div class="action-desc">Recalc all active tasks to Pipedrive</div>
       </div>
       <div class="action-card" onclick="window.location.href='/logs'">
         <div class="action-icon">📋</div>
         <div class="action-name">View Logs</div>
         <div class="action-desc">Full event history</div>
-      </div>
-      <div class="action-card" onclick="showToast('Coming soon', 'success')">
-        <div class="action-icon">🗓️</div>
-        <div class="action-name">Clear Date</div>
-        <div class="action-desc">Reset a date field on a deal</div>
       </div>
       <div class="action-card" onclick="window.location.href='/settings'">
         <div class="action-icon">⚙️</div>
@@ -751,6 +746,28 @@
       pmSetStatus('ERROR', 'error');
       pmPin = ''; pmUpdateDots();
     }
+  }
+
+  // Manual Sync
+  async function runSync(card) {
+    card.style.pointerEvents = 'none';
+    card.querySelector('.action-desc').textContent = 'Syncing...';
+    try {
+      const res  = await fetch('/api/sync-all', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        const msg = data.errors.length
+          ? `Synced ${data.synced}, ${data.errors.length} error(s)`
+          : `Synced ${data.synced} deal${data.synced !== 1 ? 's' : ''}`;
+        showToast(msg, data.errors.length ? 'error' : 'success');
+      } else {
+        showToast('Sync failed', 'error');
+      }
+    } catch (e) {
+      showToast('Connection error', 'error');
+    }
+    card.querySelector('.action-desc').textContent = 'Recalc all active tasks to Pipedrive';
+    card.style.pointerEvents = '';
   }
 
   // Clear DB

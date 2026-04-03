@@ -74,7 +74,7 @@ INSTALL_PHASE_OPTIONS = {
 }
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "logs", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_stream", "api_clear_db", "api_logs", "settings_page", "api_settings"}
+DASHBOARD_ENDPOINTS  = {"dashboard", "logs", "pin_page", "verify_pin", "change_pin", "logout", "api_stats", "api_stream", "api_clear_db", "api_logs", "settings_page", "api_settings", "api_sync_all"}
 
 # SSE client queues
 _sse_clients      = set()
@@ -434,6 +434,34 @@ def api_clear_db():
 @login_required
 def logs():
     return render_template("logs.html")
+
+@app.route("/api/sync-all", methods=["POST"])
+@login_required
+def api_sync_all():
+    synced = []
+    errors = []
+    with get_db() as conn:
+        deal_ids = [r[0] for r in conn.execute(
+            "SELECT DISTINCT deal_id FROM task_state WHERE archived=0"
+        ).fetchall()]
+        for deal_id in deal_ids:
+            try:
+                recalc_install(conn, deal_id)
+                active = conn.execute(
+                    "SELECT task_type, task_date FROM task_state WHERE deal_id=? AND status='active' AND archived=0",
+                    (deal_id,)
+                ).fetchall()
+                for row in active:
+                    if row["task_type"] == "measure":
+                        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: row["task_date"]})
+                    elif row["task_type"] == "delivery":
+                        pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: row["task_date"]})
+                synced.append(deal_id)
+            except Exception as e:
+                logger.exception(f"Sync failed for deal {deal_id}: {e}")
+                errors.append({"deal_id": deal_id, "error": str(e)})
+    logger.info(f"Manual sync complete: {len(synced)} deals synced, {len(errors)} errors")
+    return jsonify({"synced": len(synced), "errors": errors})
 
 @app.route("/settings")
 @login_required
