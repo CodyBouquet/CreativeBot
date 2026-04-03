@@ -628,9 +628,6 @@ def arrivy_webhook():
         logger.info(f"Arrivy raw payload: {json.dumps(payload)}")
         logger.info(f"Arrivy: {event_type} (raw={raw_event_type}/{sub_type}) | template={template_id} | deal={external_id} | task={task_id}")
 
-        if event_type not in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED"):
-            return jsonify({"status": "ignored"}), 200
-
         deal_id   = int(external_id) if external_id else None
         task_type = TEMPLATE_MAP.get(template_id)
 
@@ -646,15 +643,16 @@ def arrivy_webhook():
                 return jsonify({"status": "ignored", "reason": "no external id"}), 200
 
             store_event(conn, deal_id, task_id, event_type, task_type, payload)
-            if not task_type:
-                return jsonify({"status": "stored", "reason": "unknown template"}), 200
+
             if deal_id == 29905:
-                if task_type == "measure":
-                    handle_measure(conn, event_type, deal_id, task_id, object_date)
-                elif task_type == "delivery":
-                    handle_delivery(conn, event_type, deal_id, task_id, object_date)
-                elif task_type == "install":
-                    handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
+                if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED") and task_type:
+                    if task_type == "measure":
+                        handle_measure(conn, event_type, deal_id, task_id, object_date)
+                    elif task_type == "delivery":
+                        handle_delivery(conn, event_type, deal_id, task_id, object_date)
+                    elif task_type == "install":
+                        handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
+                recalc_install(conn, deal_id)
 
         sse_notify()
         return jsonify({"status": "ok"}), 200
