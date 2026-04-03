@@ -259,14 +259,22 @@ def dates_match(a, b):
 # ---------------------------------------------------------------------------
 def handle_measure(conn, event_type, deal_id, task_id, object_date):
     date = parse_arrivy_date(object_date)
-    if event_type == "TASK_COMPLETED":
+    if event_type == "TASK_DELETED":
+        delete_task_state(conn, task_id)
+    elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "measure", date, status="completed")
+
+def delete_task_state(conn, task_id):
+    conn.execute("DELETE FROM task_state WHERE task_id=?", (task_id,))
 
 def handle_delivery(conn, event_type, deal_id, task_id, object_date):
     date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: date})
         upsert_task_state(conn, task_id, deal_id, "delivery", date)
+    elif event_type == "TASK_DELETED":
+        delete_task_state(conn, task_id)
+        pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: None})
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "delivery", date, status="cancelled")
@@ -300,7 +308,12 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
     install_phase = get_extra_field(extra_fields, "Installation Phase")
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", date, install_phase=install_phase)
-    elif event_type in ("TASK_CANCELLED", "TASK_DELETED"):
+    elif event_type == "TASK_DELETED":
+        delete_task_state(conn, task_id)
+        dates = recalc_install(conn, deal_id)
+        if not dates:
+            pd_move_stage(deal_id, INSTALL_READY_TO_SCHEDULE_ID)
+    elif event_type == "TASK_CANCELLED":
         upsert_task_state(conn, task_id, deal_id, "install", date, status="cancelled")
         dates = recalc_install(conn, deal_id)
         if not dates:
