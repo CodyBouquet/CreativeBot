@@ -69,8 +69,8 @@ INSTALL_SCHEDULED_STAGE_ID     = 10
 INSTALL_READY_TO_SCHEDULE_ID   = 9
 
 INSTALL_PHASE_OPTIONS = {
-    "Final":   37,
-    "Partial": 65,
+    "final":   37,
+    "partial": 65,
 }
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
@@ -288,7 +288,7 @@ def recalc_install(conn, deal_id):
     ).fetchall()
     dates  = [r["task_date"]     for r in rows]
     phase  = rows[0]["install_phase"] if rows else None
-    phase_id = INSTALL_PHASE_OPTIONS.get(phase) if phase else None
+    phase_id = INSTALL_PHASE_OPTIONS.get(phase.lower()) if phase else None
     logger.info(f"recalc_install: deal={deal_id} dates={dates} phase={phase!r} phase_id={phase_id}")
     pd_update_deal(deal_id, {
         PD_FIELDS["install_start"]: dates[0]  if len(dates) > 0 else None,
