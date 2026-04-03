@@ -645,18 +645,16 @@ def arrivy_webhook():
             if not deal_id:
                 return jsonify({"status": "ignored", "reason": "no external id"}), 200
 
-            if deal_id != 29905:
-                return jsonify({"status": "ignored", "reason": "not test deal"}), 200
-
             store_event(conn, deal_id, task_id, event_type, task_type, payload)
             if not task_type:
                 return jsonify({"status": "stored", "reason": "unknown template"}), 200
-            if task_type == "measure":
-                handle_measure(conn, event_type, deal_id, task_id, object_date)
-            elif task_type == "delivery":
-                handle_delivery(conn, event_type, deal_id, task_id, object_date)
-            elif task_type == "install":
-                handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
+            if deal_id == 29905:
+                if task_type == "measure":
+                    handle_measure(conn, event_type, deal_id, task_id, object_date)
+                elif task_type == "delivery":
+                    handle_delivery(conn, event_type, deal_id, task_id, object_date)
+                elif task_type == "install":
+                    handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
 
         sse_notify()
         return jsonify({"status": "ok"}), 200
