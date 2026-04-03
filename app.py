@@ -199,7 +199,7 @@ def upsert_task_state(conn, task_id, deal_id, task_type, task_date, status="acti
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(task_id) DO UPDATE SET
                task_date     = excluded.task_date,
-               install_phase = excluded.install_phase,
+               install_phase = COALESCE(excluded.install_phase, task_state.install_phase),
                status        = excluded.status,
                last_updated  = excluded.last_updated""",
         (task_id, deal_id, task_type, task_date, install_phase, status, datetime.utcnow().isoformat())
@@ -289,6 +289,7 @@ def recalc_install(conn, deal_id):
     dates  = [r["task_date"]     for r in rows]
     phase  = rows[0]["install_phase"] if rows else None
     phase_id = INSTALL_PHASE_OPTIONS.get(phase) if phase else None
+    logger.info(f"recalc_install: deal={deal_id} dates={dates} phase={phase!r} phase_id={phase_id}")
     pd_update_deal(deal_id, {
         PD_FIELDS["install_start"]: dates[0]  if len(dates) > 0 else None,
         PD_FIELDS["install_part2"]: dates[1]  if len(dates) > 1 else None,
@@ -306,6 +307,7 @@ def get_extra_field(extra_fields, name):
 def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields=None):
     date          = parse_arrivy_date(object_date)
     install_phase = get_extra_field(extra_fields, "Installation Phase")
+    logger.info(f"handle_install: event={event_type} task={task_id} date={date} phase={install_phase!r}")
     if event_type in ("TASK_CREATED", "TASK_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", date, install_phase=install_phase)
     elif event_type == "TASK_DELETED":
