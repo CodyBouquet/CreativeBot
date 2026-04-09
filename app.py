@@ -8,6 +8,7 @@ import json
 import hmac
 import hashlib
 import subprocess
+import shutil
 from datetime import datetime
 from pathlib import Path
 from functools import wraps
@@ -490,10 +491,22 @@ def api_stats():
         recent = conn.execute(
             "SELECT event_type, task_type, deal_id, received_at FROM events WHERE archived=0 ORDER BY received_at DESC LIMIT 5"
         ).fetchall()
+    try:
+        du = shutil.disk_usage(os.path.dirname(DB_PATH) or "/")
+        disk = {
+            "total_bytes": du.total,
+            "used_bytes":  du.used,
+            "free_bytes":  du.free,
+            "percent_used": round(du.used / du.total * 100, 1) if du.total else 0,
+        }
+    except Exception as e:
+        logger.warning(f"disk_usage failed: {e}")
+        disk = None
     return jsonify({
         "total_events": total,
         "active_tasks": active,
-        "recent": [dict(r) for r in recent]
+        "recent": [dict(r) for r in recent],
+        "disk": disk,
     })
 
 @app.route("/api/stream")

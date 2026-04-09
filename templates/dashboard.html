@@ -128,7 +128,7 @@
   /* STAT CARDS */
   .stats-row {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr);
     gap: 12px;
   }
 
@@ -475,6 +475,10 @@
       <div class="stat-value" id="uptime">--</div>
       <div class="stat-label">Service</div>
     </div>
+    <div class="stat-card">
+      <div class="stat-value" id="diskUsage">--</div>
+      <div class="stat-label" id="diskLabel">Storage</div>
+    </div>
   </div>
 
   <!-- Service Status -->
@@ -661,6 +665,11 @@
       document.getElementById('totalEvents').textContent = data.total_events;
       document.getElementById('activeTasks').textContent = data.active_tasks;
       document.getElementById('uptime').textContent = '✓';
+      if (data.disk) {
+        const gb = b => (b / 1073741824).toFixed(1);
+        document.getElementById('diskUsage').textContent = data.disk.percent_used + '%';
+        document.getElementById('diskLabel').textContent = gb(data.disk.used_bytes) + ' / ' + gb(data.disk.total_bytes) + ' GB';
+      }
     } catch (e) {
       document.getElementById('uptime').textContent = '✗';
     }
