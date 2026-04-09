@@ -37,9 +37,9 @@ GITHUB_WEBHOOK_SECRET     = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 REPO_PATH                 = os.environ.get("REPO_PATH", "/home/admin/CreativeBot")
 SERVICE_NAME              = os.environ.get("SERVICE_NAME", "arrivy-sync")
 DB_PATH                   = os.environ.get("DB_PATH", "/home/admin/CreativeBot/data/sync.db")
-# Only Arrivy webhooks for deals with id > MIN_DEAL_ID will be acted on. Historical
-# deals are still logged but never touched in Pipedrive. Bump this if we ever need
-# to roll back the rollout cutoff.
+# Only webhooks (Arrivy + Pipedrive) for deals with id > MIN_DEAL_ID will be acted
+# on. Historical deals are still logged but never touched in Pipedrive. Bump this
+# if we ever need to roll back the rollout cutoff.
 MIN_DEAL_ID               = 30243
 
 _REQUIRED_ENV = {
@@ -621,7 +621,8 @@ def api_sync_all():
     errors = []
     with get_db() as conn:
         deal_ids = [r[0] for r in conn.execute(
-            "SELECT DISTINCT deal_id FROM task_state WHERE archived=0"
+            "SELECT DISTINCT deal_id FROM task_state WHERE archived=0 AND deal_id > ?",
+            (MIN_DEAL_ID,)
         ).fetchall()]
         for deal_id in deal_ids:
             try:
@@ -740,6 +741,9 @@ def pipedrive_webhook():
         stage_id = current.get("stage_id")
         logger.info(f"Pipedrive webhook: event={event!r} deal_id={deal_id!r} stage_id={stage_id!r} ({type(stage_id).__name__}) status={status!r}")
         if event == "updated.deal" and deal_id:
+            if int(deal_id) <= MIN_DEAL_ID:
+                logger.info(f"Pipedrive webhook ignored for historical deal {deal_id} (<= MIN_DEAL_ID {MIN_DEAL_ID})")
+                return jsonify({"status": "ignored", "reason": "historical deal"}), 200
             if status in ("won", "lost"):
                 with get_db() as conn:
                     archive_deal(conn, deal_id)
