@@ -49,10 +49,16 @@ for _var, _val in _REQUIRED_ENV.items():
         logging.warning(f"Environment variable {_var} is not set — related features will fail")
 
 # Arrivy template IDs → task type
+# Note: repair is treated as install (shares Pipedrive install fields & stages).
+# Pickup and customer pickup are treated as delivery (share delivery_date field).
 TEMPLATE_MAP = {
     5395407346073600: "install",
     5627485400596480: "measure",
     5278551184506880: "delivery",
+    5546469558321152: "inspection",
+    4649593254445056: "install",      # repair — same process as install
+    6631019675910144: "delivery",     # pickup
+    538634486456320:  "delivery",     # customer pickup
 }
 
 # Pipedrive custom field keys
@@ -67,6 +73,9 @@ PD_FIELDS = {
 INSTALL_COMPLETE_STAGE_ID      = 12
 INSTALL_SCHEDULED_STAGE_ID     = 10
 INSTALL_READY_TO_SCHEDULE_ID   = 9
+MEASURE_COMPLETE_STAGE_ID      = 5
+INSPECTION_SCHEDULED_STAGE_ID  = 36
+INSPECTION_COMPLETE_STAGE_ID   = 37
 
 INSTALL_PHASE_OPTIONS = {
     "final":   37,
@@ -263,13 +272,30 @@ def handle_measure(conn, event_type, deal_id, task_id, object_date):
         delete_task_state(conn, task_id)
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "measure", date, status="completed")
+        pd_move_stage(deal_id, MEASURE_COMPLETE_STAGE_ID)
+
+def handle_inspection(conn, event_type, deal_id, task_id, object_date):
+    date = parse_arrivy_date(object_date)
+    if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED"):
+        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
+        upsert_task_state(conn, task_id, deal_id, "inspection", date)
+        pd_move_stage(deal_id, INSPECTION_SCHEDULED_STAGE_ID)
+    elif event_type == "TASK_DELETED":
+        delete_task_state(conn, task_id)
+        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
+    elif event_type == "TASK_CANCELLED":
+        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
+        upsert_task_state(conn, task_id, deal_id, "inspection", date, status="cancelled")
+    elif event_type == "TASK_COMPLETED":
+        upsert_task_state(conn, task_id, deal_id, "inspection", date, status="completed")
+        pd_move_stage(deal_id, INSPECTION_COMPLETE_STAGE_ID)
 
 def delete_task_state(conn, task_id):
     conn.execute("DELETE FROM task_state WHERE task_id=?", (task_id,))
 
 def handle_delivery(conn, event_type, deal_id, task_id, object_date):
     date = parse_arrivy_date(object_date)
-    if event_type in ("TASK_CREATED", "TASK_UPDATED"):
+    if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED"):
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: date})
         upsert_task_state(conn, task_id, deal_id, "delivery", date)
     elif event_type == "TASK_DELETED":
@@ -308,7 +334,7 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
     date          = parse_arrivy_date(object_date)
     install_phase = get_extra_field(extra_fields, "Installation Phase")
     logger.info(f"handle_install: event={event_type} task={task_id} date={date} phase={install_phase!r}")
-    if event_type in ("TASK_CREATED", "TASK_UPDATED"):
+    if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", date, install_phase=install_phase)
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
@@ -661,13 +687,15 @@ def arrivy_webhook():
             store_event(conn, deal_id, task_id, event_type, task_type, payload)
 
             if deal_id == 29905:
-                if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED") and task_type:
+                if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED") and task_type:
                     if task_type == "measure":
                         handle_measure(conn, event_type, deal_id, task_id, object_date)
                     elif task_type == "delivery":
                         handle_delivery(conn, event_type, deal_id, task_id, object_date)
                     elif task_type == "install":
                         handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
+                    elif task_type == "inspection":
+                        handle_inspection(conn, event_type, deal_id, task_id, object_date)
                 recalc_install(conn, deal_id)
 
         sse_notify()
