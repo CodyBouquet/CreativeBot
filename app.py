@@ -37,6 +37,10 @@ GITHUB_WEBHOOK_SECRET     = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 REPO_PATH                 = os.environ.get("REPO_PATH", "/home/admin/CreativeBot")
 SERVICE_NAME              = os.environ.get("SERVICE_NAME", "arrivy-sync")
 DB_PATH                   = os.environ.get("DB_PATH", "/home/admin/CreativeBot/data/sync.db")
+# Only Arrivy webhooks for deals with id > MIN_DEAL_ID will be acted on. Historical
+# deals are still logged but never touched in Pipedrive. Bump this if we ever need
+# to roll back the rollout cutoff.
+MIN_DEAL_ID               = 30243
 
 _REQUIRED_ENV = {
     "PIPEDRIVE_API_TOKEN": PIPEDRIVE_API_TOKEN,
@@ -352,6 +356,7 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
     logger.info(f"handle_install: event={event_type} task={task_id} date={date} phase={install_phase!r}")
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", date, install_phase=install_phase)
+        recalc_install(conn, deal_id)
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
         dates = recalc_install(conn, deal_id)
@@ -702,7 +707,7 @@ def arrivy_webhook():
 
             store_event(conn, deal_id, task_id, event_type, task_type, payload)
 
-            if deal_id == 29905:
+            if deal_id > MIN_DEAL_ID:
                 if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED") and task_type:
                     if task_type == "measure":
                         handle_measure(conn, event_type, deal_id, task_id, object_date)
@@ -712,7 +717,6 @@ def arrivy_webhook():
                         handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
                     elif task_type == "inspection":
                         handle_inspection(conn, event_type, deal_id, task_id, object_date)
-                recalc_install(conn, deal_id)
 
         sse_notify()
         return jsonify({"status": "ok"}), 200
