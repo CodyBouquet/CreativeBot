@@ -63,19 +63,23 @@ TEMPLATE_MAP = {
 
 # Pipedrive custom field keys
 PD_FIELDS = {
-    "install_start":  "197d71fa84fd5221fa4a875fbac9526c1d554139",
-    "install_part2":  "7492f008b747af364836514d752961176f1f0307",
-    "install_phase":  "cdf1c74d66c5796284a2bbcfcef8080975d0f19e",
-    "measure_date":   "e23dc895627529b276d3b1b0ec7c8acc75317b1c",
-    "delivery_date":  "d0d424fcacbdf264297a050ff96a799823316d9f",
+    "install_start":   "197d71fa84fd5221fa4a875fbac9526c1d554139",
+    "install_part2":   "7492f008b747af364836514d752961176f1f0307",
+    "install_phase":   "cdf1c74d66c5796284a2bbcfcef8080975d0f19e",
+    "measure_date":    "e23dc895627529b276d3b1b0ec7c8acc75317b1c",
+    "delivery_date":   "d0d424fcacbdf264297a050ff96a799823316d9f",
+    "delivery_status": "adacf74cda1c48bfc6fa4df2c064a1b257f3b284",
 }
 
 INSTALL_COMPLETE_STAGE_ID      = 12
 INSTALL_SCHEDULED_STAGE_ID     = 10
 INSTALL_READY_TO_SCHEDULE_ID   = 9
 MEASURE_COMPLETE_STAGE_ID      = 5
+MEASURE_ROLLBACK_STAGE_ID      = 70   # "in store contact" — when measure is cancelled/deleted
 INSPECTION_SCHEDULED_STAGE_ID  = 36
 INSPECTION_COMPLETE_STAGE_ID   = 37
+INSPECTION_ROLLBACK_STAGE_ID   = 50   # "Customer Contacted/Attempted" — when inspection is cancelled/deleted
+DELIVERY_STATUS_COMPLETE_ID    = 114  # option ID for "Complete" in the delivery_status dropdown
 
 INSTALL_PHASE_OPTIONS = {
     "final":   37,
@@ -268,8 +272,17 @@ def dates_match(a, b):
 # ---------------------------------------------------------------------------
 def handle_measure(conn, event_type, deal_id, task_id, object_date):
     date = parse_arrivy_date(object_date)
-    if event_type == "TASK_DELETED":
+    if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED"):
+        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
+        upsert_task_state(conn, task_id, deal_id, "measure", date)
+    elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
+        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
+        pd_move_stage(deal_id, MEASURE_ROLLBACK_STAGE_ID)
+    elif event_type == "TASK_CANCELLED":
+        pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
+        upsert_task_state(conn, task_id, deal_id, "measure", date, status="cancelled")
+        pd_move_stage(deal_id, MEASURE_ROLLBACK_STAGE_ID)
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "measure", date, status="completed")
         pd_move_stage(deal_id, MEASURE_COMPLETE_STAGE_ID)
@@ -283,9 +296,11 @@ def handle_inspection(conn, event_type, deal_id, task_id, object_date):
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
+        pd_move_stage(deal_id, INSPECTION_ROLLBACK_STAGE_ID)
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "inspection", date, status="cancelled")
+        pd_move_stage(deal_id, INSPECTION_ROLLBACK_STAGE_ID)
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "inspection", date, status="completed")
         pd_move_stage(deal_id, INSPECTION_COMPLETE_STAGE_ID)
@@ -305,6 +320,7 @@ def handle_delivery(conn, event_type, deal_id, task_id, object_date):
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "delivery", date, status="cancelled")
     elif event_type == "TASK_COMPLETED":
+        pd_update_deal(deal_id, {PD_FIELDS["delivery_status"]: DELIVERY_STATUS_COMPLETE_ID})
         upsert_task_state(conn, task_id, deal_id, "delivery", date, status="completed")
 
 def recalc_install(conn, deal_id):
