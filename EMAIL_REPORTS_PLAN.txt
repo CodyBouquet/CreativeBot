@@ -1,0 +1,160 @@
+================================================================
+EMAIL REPORTS & NOTIFICATIONS — PLANNING DOC
+Created: 2026-04-09
+Status: Not started. Waiting on decisions + Azure/Rollmaster info.
+================================================================
+
+GOAL
+----
+Add a second tool to the Pi alongside the existing Pipedrive/Arrivy
+sync. This one pulls data from the Rollmaster API and emails scheduled
+reports to Entra (Azure AD) group members via Microsoft Graph.
+
+On sign-in the user should see a landing page with two action cards:
+  - "Pipedrive / Arrivy Sync"  (the existing tool, moves to /sync)
+  - "Email Reports"            (the new tool, lives at /reports)
+
+
+REPORTS WANTED (initial list, more to come)
+-------------------------------------------
+- Low inventory notification
+- Daily sales report    (overall, by salesperson, by branch)
+- Weekly sales report   (overall, by salesperson, by branch)
+- Monthly sales report  (overall, by salesperson, by branch)
+
+Each report needs:
+  - A configurable frequency (daily/weekly/monthly)
+  - A configurable send time
+  - A target Entra group (recipients resolved at send time)
+
+
+ARCHITECTURE DECISIONS
+----------------------
+1. ONE Flask app, TWO tools as blueprints.
+   - New file: email_reports.py, registered as a Flask blueprint
+   - Shares the existing PIN login
+   - "Completely separate" in code, DB tables, and UI — but not a
+     separate service. One deploy, one login.
+
+2. Landing page at /
+   - Two action cards
+   - Current dashboard moves from / to /sync
+
+3. Separate SQLite DB for the new tool: data/reports.db
+   - Tables: report_subscriptions, send_history, settings
+   - Keeps the two tools isolated — can't corrupt each other
+
+4. Email via Microsoft Graph API (NOT SMTP)
+   - Graph is the modern M365 path
+   - Same Azure app registration handles mail send + group lookup
+   - SMTP would be simpler but can't list group members
+
+5. Recipients = Entra groups, NOT stored email addresses
+   - User picks a group in the UI per report
+   - At send time: Graph resolves "who's in this group?" and emails each
+   - Adding/removing people happens in Entra, Pi picks up automatically
+   - No recipient management code in the Pi at all
+
+6. Sender = a shared mailbox (recommended: noreply@creativecarpetinc.com)
+   - M365 shared mailboxes are free (no license needed)
+   - Create once in Exchange admin center
+   - Graph Mail.Send can send as it
+
+
+WHAT YOU HAVE TO DO IN AZURE (I CAN'T)
+--------------------------------------
+1. Register an application in Entra ID → App registrations
+   - Get me: tenant_id, client_id, client_secret
+   - Secret goes into an env var, never committed to git
+
+2. Grant API permissions (APPLICATION type, not delegated)
+   - Must be admin-consented:
+     - Mail.Send              (to send emails)
+     - GroupMember.Read.All   (to resolve group members)
+     - Group.Read.All         (to list available groups in UI dropdown)
+
+3. Create the shared mailbox noreply@creativecarpetinc.com
+   - Done in Exchange admin center
+   - No license needed for shared mailboxes
+
+4. (RECOMMENDED) Scope Mail.Send to only the noreply mailbox
+   - Via an Application Access Policy (PowerShell)
+   - Prevents the app from accidentally sending as any other user
+   - I can provide the PowerShell snippet when ready
+
+
+WHAT I STILL NEED FROM YOU (beyond Azure)
+-----------------------------------------
+1. Rollmaster API details
+   - Base URL
+   - Auth method (key in header? query param? Bearer token?)
+   - Sample request + response for:
+     a) Inventory listing (all fields, how "low" is defined)
+     b) Sales data (salesperson, branch, date, amount, etc.)
+   - OpenAPI/Swagger docs if they exist
+
+2. Low inventory rules
+   - Single global threshold? Per-SKU threshold? A flag Rollmaster
+     already sets?
+   - Scheduled (e.g. check every morning) or event-driven
+     (poll every hour, only email when something crosses the line)?
+
+3. Branch list
+   - Is "branch" a field on sales records from Rollmaster?
+   - Or do I need a hardcoded list of branch names/IDs?
+
+4. Report output format
+   - HTML tables in the email body? (my default)
+   - PDF attachment?
+   - CSV attachment? (good for sales data)
+   - Plain text?
+   - My recommendation: HTML tables in the body + CSV attached for
+     sales reports
+
+
+PHASED BUILD PLAN
+-----------------
+PHASE 1 — Foundation (UNBLOCKED, can start anytime)
+  - Landing page with two tool cards
+  - Move current dashboard from / to /sync
+  - Scaffold the Reports blueprint at /reports
+  - Empty "no reports configured yet" page
+  - Create data/reports.db with initial schema
+  - Zero external dependencies, doesn't touch the sync tool
+  - Gets the architecture in place so you can see direction
+
+PHASE 2 — Microsoft Graph integration (BLOCKED on Azure work above)
+  - Graph client: send test email, list Entra groups, resolve members
+  - Settings page to configure tenant_id/client_id/secret (env vars)
+  - "Test Send" button in the UI to prove end-to-end before building
+    any real reports
+
+PHASE 3 — First report + scheduler (BLOCKED on Rollmaster details)
+  - Rollmaster API client
+  - First report: overall daily sales (simplest to start with)
+  - Scheduler: APScheduler in-process
+  - UI to create/edit report subscriptions (pick report type,
+    frequency, time, target Entra group)
+
+PHASE 4 — Remaining reports (AFTER phase 3 is proven working)
+  - Sales by salesperson
+  - Sales by branch
+  - Weekly and monthly rollups
+  - Low inventory notification
+
+
+OPEN QUESTIONS TO ANSWER BEFORE RESUMING
+----------------------------------------
+- Are you happy with the blueprint-in-same-app architecture, or would
+  you rather have two truly separate services on different ports?
+- Is noreply@creativecarpetinc.com the right sender address, or do you
+  want a dedicated account?
+- Should I go ahead and start Phase 1 on my own while you work on Azure
+  + Rollmaster info gathering? Phase 1 is safe and reversible.
+
+
+NEXT STEP WHEN YOU COME BACK
+----------------------------
+Either:
+  a) Tell me to start Phase 1 (safe, no external deps needed), OR
+  b) Answer the open questions first if you want to redesign anything

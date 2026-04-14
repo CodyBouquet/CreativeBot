@@ -17,6 +17,8 @@ import queue
 
 load_dotenv()
 
+from email_reports import bp as reports_bp, init_reports_db
+
 app = Flask(__name__)
 _secret = os.environ.get("FLASK_SECRET_KEY", "")
 if not _secret:
@@ -92,9 +94,10 @@ INSTALL_PHASE_OPTIONS = {
 }
 
 ALLOWED_DASHBOARD_IP = "127.0.0.1"
-DASHBOARD_ENDPOINTS  = {"dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout",
+DASHBOARD_ENDPOINTS  = {"landing", "sync_dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout",
                         "api_stats", "api_stream", "api_clear_db", "api_logs", "settings_page",
-                        "api_settings", "api_sync_all", "api_users", "api_user_delete", "api_access_log"}
+                        "api_settings", "api_sync_all", "api_users", "api_user_delete", "api_access_log",
+                        "reports.reports_home"}
 
 # SSE client queues
 _sse_clients      = set()
@@ -403,7 +406,7 @@ def admin_required(f):
         if not session.get("authenticated"):
             return redirect(url_for("pin_page"))
         if session.get("role") != "admin":
-            return redirect(url_for("dashboard"))
+            return redirect(url_for("landing"))
         return f(*args, **kwargs)
     return decorated
 
@@ -458,7 +461,12 @@ def logout():
 # ---------------------------------------------------------------------------
 @app.route("/")
 @login_required
-def dashboard():
+def landing():
+    return render_template("landing.html", username=session.get("username", ""))
+
+@app.route("/sync")
+@login_required
+def sync_dashboard():
     with get_db() as conn:
         recent_events = conn.execute(
             """SELECT * FROM events WHERE archived = 0
@@ -801,6 +809,8 @@ def health():
 # STARTUP
 # ---------------------------------------------------------------------------
 init_db()
+app.register_blueprint(reports_bp)
+init_reports_db()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001)
