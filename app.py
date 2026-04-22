@@ -93,7 +93,7 @@ INSTALL_PHASE_OPTIONS = {
     "partial": 65,
 }
 
-ALLOWED_DASHBOARD_IP = "127.0.0.1"
+ALLOWED_DASHBOARD_IPS = {"127.0.0.1", "::1", "10.54.10.135"}
 DASHBOARD_ENDPOINTS  = {"landing", "sync_dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout",
                         "api_stats", "api_stream", "api_clear_db", "api_logs", "settings_page",
                         "api_settings", "api_sync_all", "api_users", "api_user_delete", "api_access_log",
@@ -254,6 +254,13 @@ def pd_get_deal(deal_id):
     return data["data"]
 
 def pd_update_deal(deal_id, fields):
+    if int(deal_id) <= MIN_DEAL_ID:
+        logger.warning(f"BLOCKED Pipedrive update on historical deal {deal_id} (<= {MIN_DEAL_ID}): {fields}")
+        with get_db() as conn:
+            store_event(conn, deal_id, None, "BLOCKED", None, {"fields": {k: v for k, v in fields.items()}},
+                        action=f"BLOCKED — historical deal ({deal_id} <= {MIN_DEAL_ID})")
+        sse_notify()
+        return None
     r = requests.put(f"{PD_BASE}/deals/{deal_id}",
                      params={"api_token": PIPEDRIVE_API_TOKEN}, json=fields)
     r.raise_for_status()
@@ -407,13 +414,13 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
         return "Marked install task completed"
 
 # ---------------------------------------------------------------------------
-# IP RESTRICTION
+# IP RESTRICTION — only accessible from the Pi itself
 # ---------------------------------------------------------------------------
 @app.before_request
 def restrict_dashboard_by_ip():
     if request.endpoint in DASHBOARD_ENDPOINTS:
         client_ip = request.remote_addr
-        if client_ip != ALLOWED_DASHBOARD_IP:
+        if client_ip not in ALLOWED_DASHBOARD_IPS:
             logger.warning(f"Blocked {client_ip} from {request.endpoint}")
             return redirect("https://www.creativecarpetinc.com")
 
@@ -569,11 +576,21 @@ def api_stream():
 @app.route("/api/logs")
 @login_required
 def api_logs():
-    limit = min(int(request.args.get("limit", 100)), 1000)
+    date_from = request.args.get("from", "")   # YYYY-MM-DD
+    date_to   = request.args.get("to", "")     # YYYY-MM-DD
+    clauses = []
+    params  = []
+    if date_from:
+        clauses.append("received_at >= ?")
+        params.append(date_from + "T00:00:00")
+    if date_to:
+        clauses.append("received_at < ?")
+        params.append(date_to + "T23:59:59.999999")
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id, received_at, deal_id, task_id, event_type, task_type, raw_json, action FROM events WHERE archived=0 ORDER BY received_at DESC LIMIT ?",
-            (limit,)
+            f"SELECT id, received_at, deal_id, task_id, event_type, task_type, raw_json, action FROM events {where} ORDER BY received_at DESC",
+            params
         ).fetchall()
     logs = []
     for row in rows:

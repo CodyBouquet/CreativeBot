@@ -80,6 +80,8 @@
 
   .btn:active { background: var(--border); transform: scale(0.97); }
   .btn.accent { border-color: var(--accent); color: var(--accent); }
+  .btn.danger { border-color: var(--danger); color: var(--danger); }
+  .btn.small { padding: 4px 8px; font-size: 10px; }
 
   .filter-bar {
     display: flex;
@@ -91,6 +93,7 @@
     flex-shrink: 0;
     position: relative;
     z-index: 9;
+    flex-wrap: wrap;
   }
 
   .filter-input {
@@ -111,6 +114,87 @@
   .filter-label { font-size: 10px; letter-spacing: 1px; color: var(--muted); text-transform: uppercase; }
 
   .count-label { font-size: 11px; color: var(--muted); margin-left: auto; font-family: 'Share Tech Mono', monospace; }
+
+  .filter-group { display: flex; align-items: center; gap: 6px; }
+
+  /* Deal # input with keypad trigger */
+  .deal-input-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .deal-input-wrap .filter-input { width: 100px; }
+  .keypad-btn {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--muted);
+    font-size: 14px;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .keypad-btn:active { background: var(--border); }
+
+  /* Numeric keypad overlay */
+  .keypad-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .keypad-overlay.open { display: flex; }
+
+  .keypad-modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    width: 260px;
+  }
+  .keypad-display {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--accent);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 22px;
+    text-align: right;
+    padding: 10px 14px;
+    margin-bottom: 12px;
+    min-height: 44px;
+    letter-spacing: 2px;
+  }
+  .keypad-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+  .keypad-key {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-family: 'Barlow', sans-serif;
+    font-size: 18px;
+    font-weight: 600;
+    padding: 14px;
+    text-align: center;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: background 0.1s;
+  }
+  .keypad-key:active { background: var(--border); transform: scale(0.96); }
+  .keypad-key.accent { background: rgba(0,200,255,0.1); border-color: var(--accent); color: var(--accent); }
+  .keypad-key.danger { background: rgba(255,64,96,0.1); border-color: var(--danger); color: var(--danger); }
 
   main {
     flex: 1;
@@ -175,6 +259,12 @@
 
   .empty-row td { text-align: center; color: var(--muted); padding: 40px; }
 
+  /* Date input styling */
+  input[type="date"].filter-input {
+    width: 140px;
+    color-scheme: dark;
+  }
+
   main::-webkit-scrollbar { width: 4px; }
   main::-webkit-scrollbar-track { background: transparent; }
   main::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
@@ -196,12 +286,27 @@
 
 <div class="filter-bar">
   <span class="filter-label">Filter</span>
-  <input class="filter-input" id="filterDeal" placeholder="Deal #" type="number" oninput="applyFilters()">
+
+  <div class="filter-group">
+    <span class="filter-label">From</span>
+    <input class="filter-input" id="filterFrom" type="date" onchange="loadLogs()">
+  </div>
+  <div class="filter-group">
+    <span class="filter-label">To</span>
+    <input class="filter-input" id="filterTo" type="date" onchange="loadLogs()">
+  </div>
+
+  <div class="deal-input-wrap">
+    <input class="filter-input" id="filterDeal" placeholder="Deal #" type="text" inputmode="none" oninput="applyFilters()" readonly>
+    <div class="keypad-btn" onclick="openKeypad()">&#9000;</div>
+  </div>
+
   <select class="filter-input" id="filterType" onchange="applyFilters()" style="width:110px">
     <option value="">All types</option>
     <option value="install">Install</option>
     <option value="measure">Measure</option>
     <option value="delivery">Delivery</option>
+    <option value="inspection">Inspection</option>
     <option value="unknown">Unknown</option>
   </select>
   <select class="filter-input" id="filterEvent" onchange="applyFilters()" style="width:130px">
@@ -211,8 +316,30 @@
     <option value="CANCELLED">Cancelled</option>
     <option value="COMPLETED">Completed</option>
     <option value="DELETED">Deleted</option>
+    <option value="BLOCKED">Blocked</option>
   </select>
   <span class="count-label" id="countLabel">—</span>
+</div>
+
+<!-- Numeric Keypad Overlay -->
+<div class="keypad-overlay" id="keypadOverlay">
+  <div class="keypad-modal">
+    <div class="keypad-display" id="keypadDisplay">&nbsp;</div>
+    <div class="keypad-grid">
+      <div class="keypad-key" onclick="keypadPress('1')">1</div>
+      <div class="keypad-key" onclick="keypadPress('2')">2</div>
+      <div class="keypad-key" onclick="keypadPress('3')">3</div>
+      <div class="keypad-key" onclick="keypadPress('4')">4</div>
+      <div class="keypad-key" onclick="keypadPress('5')">5</div>
+      <div class="keypad-key" onclick="keypadPress('6')">6</div>
+      <div class="keypad-key" onclick="keypadPress('7')">7</div>
+      <div class="keypad-key" onclick="keypadPress('8')">8</div>
+      <div class="keypad-key" onclick="keypadPress('9')">9</div>
+      <div class="keypad-key danger" onclick="keypadClear()">CLR</div>
+      <div class="keypad-key" onclick="keypadPress('0')">0</div>
+      <div class="keypad-key accent" onclick="keypadDone()">OK</div>
+    </div>
+  </div>
 </div>
 
 <main>
@@ -244,7 +371,18 @@
 
   async function loadLogs() {
     try {
-      const res  = await fetch('/api/logs?limit=1000');
+      const from = document.getElementById('filterFrom').value;
+      const to   = document.getElementById('filterTo').value;
+      let url = '/api/logs';
+      const params = [];
+      if (from) params.push('from=' + from);
+      if (to)   params.push('to=' + to);
+      if (params.length) url += '?' + params.join('&');
+
+      document.getElementById('logBody').innerHTML =
+        '<tr class="empty-row"><td colspan="7">Loading...</td></tr>';
+
+      const res  = await fetch(url);
       const data = await res.json();
       allLogs = data.logs || [];
       applyFilters();
@@ -274,7 +412,7 @@
       return;
     }
 
-    const BADGE = { install: 'install', measure: 'measure', delivery: 'delivery' };
+    const BADGE = { install: 'install', measure: 'measure', delivery: 'delivery', inspection: 'install' };
     tbody.innerHTML = filtered.map(log => {
       const badge = BADGE[log.task_type] || 'unknown';
       return `<tr>
@@ -293,6 +431,41 @@
     }).join('');
   }
 
+  // --- Numeric Keypad ---
+  let keypadValue = '';
+
+  function openKeypad() {
+    keypadValue = document.getElementById('filterDeal').value;
+    document.getElementById('keypadDisplay').textContent = keypadValue || '\u00A0';
+    document.getElementById('keypadOverlay').classList.add('open');
+  }
+
+  function keypadPress(digit) {
+    if (keypadValue.length < 8) {
+      keypadValue += digit;
+      document.getElementById('keypadDisplay').textContent = keypadValue;
+    }
+  }
+
+  function keypadClear() {
+    keypadValue = '';
+    document.getElementById('keypadDisplay').textContent = '\u00A0';
+  }
+
+  function keypadDone() {
+    document.getElementById('filterDeal').value = keypadValue;
+    document.getElementById('keypadOverlay').classList.remove('open');
+    applyFilters();
+  }
+
+  // Close keypad on overlay tap (outside modal)
+  document.getElementById('keypadOverlay').addEventListener('pointerdown', function(e) {
+    if (e.target === this) {
+      keypadDone();
+    }
+  });
+
+  // --- Init ---
   loadLogs();
   setInterval(loadLogs, 60000);
 
