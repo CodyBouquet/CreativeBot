@@ -419,7 +419,8 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
 @app.before_request
 def restrict_dashboard_by_ip():
     if request.endpoint in DASHBOARD_ENDPOINTS:
-        client_ip = request.remote_addr
+        # Use X-Forwarded-For if behind a reverse proxy (e.g. nginx), otherwise remote_addr
+        client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr
         if client_ip not in ALLOWED_DASHBOARD_IPS:
             logger.warning(f"Blocked {client_ip} from {request.endpoint}")
             return redirect("https://www.creativecarpetinc.com")
