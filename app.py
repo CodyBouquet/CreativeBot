@@ -95,7 +95,7 @@ INSTALL_PHASE_OPTIONS = {
 
 ALLOWED_DASHBOARD_IPS = {"127.0.0.1", "::1", "10.54.10.135"}
 DASHBOARD_ENDPOINTS  = {"landing", "sync_dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout",
-                        "api_stats", "api_stream", "api_clear_db", "api_logs", "settings_page",
+                        "api_stats", "api_stream", "api_logs", "settings_page",
                         "api_settings", "api_sync_all", "api_users", "api_user_delete", "api_access_log",
                         "reports.reports_home"}
 
@@ -586,12 +586,14 @@ def api_logs():
     if date_to:
         clauses.append("received_at < ?")
         params.append(date_to + "T23:59:59.999999")
+    limit = request.args.get("limit", "")
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    sql = f"SELECT id, received_at, deal_id, task_id, event_type, task_type, raw_json, action FROM events {where} ORDER BY received_at DESC"
+    if limit:
+        sql += " LIMIT ?"
+        params.append(int(limit))
     with get_db() as conn:
-        rows = conn.execute(
-            f"SELECT id, received_at, deal_id, task_id, event_type, task_type, raw_json, action FROM events {where} ORDER BY received_at DESC",
-            params
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     logs = []
     for row in rows:
         raw = json.loads(row["raw_json"])
@@ -609,14 +611,14 @@ def api_logs():
         })
     return jsonify({"logs": logs})
 
-@app.route("/api/clear-db", methods=["POST"])
-@login_required
-def api_clear_db():
-    with get_db() as conn:
-        conn.execute("DELETE FROM events")
-        conn.execute("DELETE FROM task_state")
-    sse_notify()
-    return jsonify({"status": "ok"})
+# @app.route("/api/clear-db", methods=["POST"])
+# @login_required
+# def api_clear_db():
+#     with get_db() as conn:
+#         conn.execute("DELETE FROM events")
+#         conn.execute("DELETE FROM task_state")
+#     sse_notify()
+#     return jsonify({"status": "ok"})
 
 @app.route("/logs")
 @login_required
