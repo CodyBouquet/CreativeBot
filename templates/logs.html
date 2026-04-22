@@ -152,7 +152,7 @@
   .log-table tbody tr:hover { background: rgba(255,255,255,0.02); }
 
   .deal-id { font-family: 'Share Tech Mono', monospace; color: var(--accent); }
-  .event-time { color: var(--muted); font-size: 10px; font-family: 'Share Tech Mono', monospace; }
+  .event-time { color: var(--muted); font-size: 10px; font-family: 'Share Tech Mono', monospace; white-space: nowrap; }
   .event-type { color: var(--muted); font-size: 10px; }
 
   .badge {
@@ -219,13 +219,13 @@
   <table class="log-table" id="logTable">
     <thead>
       <tr>
-        <th>Time</th>
+        <th>Received</th>
         <th>Deal</th>
         <th>Event</th>
         <th>Type</th>
         <th>Task Date</th>
         <th>Task Title</th>
-        <th>Outcome</th>
+        <th>Action Taken</th>
       </tr>
     </thead>
     <tbody id="logBody">
@@ -278,7 +278,7 @@
     tbody.innerHTML = filtered.map(log => {
       const badge = BADGE[log.task_type] || 'unknown';
       return `<tr>
-        <td class="event-time">${escapeHtml(log.time)}</td>
+        <td class="event-time">${escapeHtml(log.date)} ${escapeHtml(log.time)}</td>
         <td class="deal-id">${log.deal_id ? '#' + escapeHtml(log.deal_id) : '—'}</td>
         <td class="event-type">${escapeHtml(log.event_type)}</td>
         <td><span class="badge ${escapeHtml(badge)}">${escapeHtml(log.task_type)}</span></td>
@@ -287,7 +287,7 @@
           <div class="task-title">${escapeHtml(log.title)}</div>
         </td>
         <td>
-          <div class="outcome">${escapeHtml(log.outcome)}</div>
+          <div class="outcome">${escapeHtml(log.action)}</div>
         </td>
       </tr>`;
     }).join('');

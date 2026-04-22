@@ -133,6 +133,7 @@ def init_db():
                 event_type  TEXT,
                 task_type   TEXT,
                 raw_json    TEXT    NOT NULL,
+                action      TEXT,
                 archived    INTEGER NOT NULL DEFAULT 0
             );
 
@@ -192,6 +193,10 @@ def init_db():
             conn.execute("ALTER TABLE task_state ADD COLUMN task_date TEXT")
         if "install_phase" not in cols:
             conn.execute("ALTER TABLE task_state ADD COLUMN install_phase TEXT")
+        # Migrate: add action column to events if needed
+        ev_cols = [r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()]
+        if "action" not in ev_cols:
+            conn.execute("ALTER TABLE events ADD COLUMN action TEXT")
     logger.info(f"Database initialised at {DB_PATH}")
 
 def get_setting(key):
@@ -203,13 +208,17 @@ def set_setting(key, value):
     with get_db() as conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
-def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload):
-    conn.execute(
-        """INSERT INTO events (received_at, deal_id, task_id, event_type, task_type, raw_json)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload, action=None):
+    cur = conn.execute(
+        """INSERT INTO events (received_at, deal_id, task_id, event_type, task_type, raw_json, action)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (datetime.utcnow().isoformat(), deal_id, task_id, event_type, task_type,
-         json.dumps(raw_payload))
+         json.dumps(raw_payload), action)
     )
+    return cur.lastrowid
+
+def update_event_action(conn, event_id, action):
+    conn.execute("UPDATE events SET action=? WHERE id=?", (action, event_id))
 
 def get_task_state(conn, task_id):
     return conn.execute("SELECT * FROM task_state WHERE task_id = ?", (task_id,)).fetchone()
@@ -283,17 +292,21 @@ def handle_measure(conn, event_type, deal_id, task_id, object_date):
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED"):
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
         upsert_task_state(conn, task_id, deal_id, "measure", date)
+        return f"Set measure date → {date}"
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
         pd_move_stage(deal_id, MEASURE_ROLLBACK_STAGE_ID)
+        return "Cleared measure date, rolled back stage"
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "measure", date, status="cancelled")
         pd_move_stage(deal_id, MEASURE_ROLLBACK_STAGE_ID)
+        return "Cleared measure date, rolled back stage"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "measure", date, status="completed")
         pd_move_stage(deal_id, MEASURE_COMPLETE_STAGE_ID)
+        return "Moved to Measure Complete"
 
 def handle_inspection(conn, event_type, deal_id, task_id, object_date):
     date = parse_arrivy_date(object_date)
@@ -301,17 +314,21 @@ def handle_inspection(conn, event_type, deal_id, task_id, object_date):
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
         upsert_task_state(conn, task_id, deal_id, "inspection", date)
         pd_move_stage(deal_id, INSPECTION_SCHEDULED_STAGE_ID)
+        return f"Set inspection date → {date}, moved to Scheduled"
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
         pd_move_stage(deal_id, INSPECTION_ROLLBACK_STAGE_ID)
+        return "Cleared inspection date, rolled back stage"
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "inspection", date, status="cancelled")
         pd_move_stage(deal_id, INSPECTION_ROLLBACK_STAGE_ID)
+        return "Cleared inspection date, rolled back stage"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "inspection", date, status="completed")
         pd_move_stage(deal_id, INSPECTION_COMPLETE_STAGE_ID)
+        return "Moved to Inspection Complete"
 
 def delete_task_state(conn, task_id):
     conn.execute("DELETE FROM task_state WHERE task_id=?", (task_id,))
@@ -321,15 +338,19 @@ def handle_delivery(conn, event_type, deal_id, task_id, object_date):
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED"):
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: date})
         upsert_task_state(conn, task_id, deal_id, "delivery", date)
+        return f"Set delivery date → {date}"
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: None})
+        return "Cleared delivery date"
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "delivery", date, status="cancelled")
+        return "Cleared delivery date"
     elif event_type == "TASK_COMPLETED":
         pd_update_deal(deal_id, {PD_FIELDS["delivery_status"]: DELIVERY_STATUS_COMPLETE_ID})
         upsert_task_state(conn, task_id, deal_id, "delivery", date, status="completed")
+        return "Marked delivery complete"
 
 def recalc_install(conn, deal_id):
     rows = conn.execute(
@@ -361,22 +382,29 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", date, install_phase=install_phase)
         recalc_install(conn, deal_id)
+        return f"Recalculated install dates (phase: {install_phase or '—'})"
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
         dates = recalc_install(conn, deal_id)
         if not dates:
             pd_move_stage(deal_id, INSTALL_READY_TO_SCHEDULE_ID)
+            return "Removed task, moved to Ready to Schedule"
+        return "Removed task, recalculated install dates"
     elif event_type == "TASK_CANCELLED":
         upsert_task_state(conn, task_id, deal_id, "install", date, status="cancelled")
         dates = recalc_install(conn, deal_id)
         if not dates:
             pd_move_stage(deal_id, INSTALL_READY_TO_SCHEDULE_ID)
+            return "Cancelled task, moved to Ready to Schedule"
+        return "Cancelled task, recalculated install dates"
     elif event_type == "TASK_COMPLETED":
         current_dates = recalc_install(conn, deal_id)
         is_part1 = bool(current_dates and current_dates[0] == date)
         upsert_task_state(conn, task_id, deal_id, "install", date, status="completed")
         if is_part1:
             pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
+            return "Moved to Install Complete"
+        return "Marked install task completed"
 
 # ---------------------------------------------------------------------------
 # IP RESTRICTION
@@ -544,21 +572,23 @@ def api_logs():
     limit = min(int(request.args.get("limit", 100)), 1000)
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT id, received_at, deal_id, task_id, event_type, task_type, raw_json FROM events WHERE archived=0 ORDER BY received_at DESC LIMIT ?",
+            "SELECT id, received_at, deal_id, task_id, event_type, task_type, raw_json, action FROM events WHERE archived=0 ORDER BY received_at DESC LIMIT ?",
             (limit,)
         ).fetchall()
     logs = []
     for row in rows:
         raw = json.loads(row["raw_json"])
+        received = row["received_at"] or ""
         logs.append({
             "id":         row["id"],
-            "time":       row["received_at"][11:19] if row["received_at"] else "—",
+            "time":       received[11:19] if received else "—",
+            "date":       received[:10] if received else "—",
             "deal_id":    row["deal_id"],
             "event_type": (row["event_type"] or "—").replace("TASK_", ""),
             "task_type":  row["task_type"] or "unknown",
             "task_date":  (raw.get("OBJECT_DATE") or "")[:10] or "—",
             "title":      raw.get("TITLE") or "—",
-            "outcome":    "—",
+            "action":     row["action"] or "—",
         })
     return jsonify({"logs": logs})
 
@@ -727,18 +757,23 @@ def arrivy_webhook():
             if not deal_id:
                 return jsonify({"status": "ignored", "reason": "no external id"}), 200
 
-            store_event(conn, deal_id, task_id, event_type, task_type, payload)
-
+            action = None
             if deal_id > MIN_DEAL_ID:
                 if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED") and task_type:
                     if task_type == "measure":
-                        handle_measure(conn, event_type, deal_id, task_id, object_date)
+                        action = handle_measure(conn, event_type, deal_id, task_id, object_date)
                     elif task_type == "delivery":
-                        handle_delivery(conn, event_type, deal_id, task_id, object_date)
+                        action = handle_delivery(conn, event_type, deal_id, task_id, object_date)
                     elif task_type == "install":
-                        handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
+                        action = handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
                     elif task_type == "inspection":
-                        handle_inspection(conn, event_type, deal_id, task_id, object_date)
+                        action = handle_inspection(conn, event_type, deal_id, task_id, object_date)
+                else:
+                    action = "Logged (no action needed)"
+            else:
+                action = "Logged only (below threshold)"
+
+            store_event(conn, deal_id, task_id, event_type, task_type, payload, action)
 
         sse_notify()
         return jsonify({"status": "ok"}), 200
