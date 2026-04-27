@@ -364,7 +364,10 @@ def recalc_install(conn, deal_id):
         "SELECT task_date, install_phase FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY task_date",
         (deal_id,)
     ).fetchall()
-    dates  = [r["task_date"]     for r in rows]
+    # Drop rows whose task_date was cleared so dates[0]/[1] stay accurate when a
+    # TASK_UPDATED webhook clears one of several scheduled installs.
+    rows = [r for r in rows if r["task_date"]]
+    dates  = [r["task_date"] for r in rows]
     phase  = rows[0]["install_phase"] if rows else None
     phase_id = INSTALL_PHASE_OPTIONS.get(phase.lower()) if phase else None
     logger.info(f"recalc_install: deal={deal_id} dates={dates} phase={phase!r} phase_id={phase_id}")
@@ -388,7 +391,12 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
     logger.info(f"handle_install: event={event_type} task={task_id} date={date} phase={install_phase!r}")
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", date, install_phase=install_phase)
-        recalc_install(conn, deal_id)
+        dates = recalc_install(conn, deal_id)
+        # If this update cleared the last remaining install date for the deal,
+        # roll the stage back to "Ready to Schedule" — same as cancel/delete.
+        if not dates:
+            pd_move_stage(deal_id, INSTALL_READY_TO_SCHEDULE_ID)
+            return "Cleared install dates, moved to Ready to Schedule"
         return f"Recalculated install dates (phase: {install_phase or '—'})"
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
