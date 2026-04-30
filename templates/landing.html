@@ -168,6 +168,12 @@
     color: var(--success);
   }
 
+  .tool-icon.users {
+    background: rgba(255, 170, 0, 0.1);
+    border: 1px solid rgba(255, 170, 0, 0.2);
+    color: var(--warn);
+  }
+
   .tool-name {
     font-family: 'Share Tech Mono', monospace;
     font-size: 15px;
@@ -234,6 +240,21 @@
       <div class="tool-name">REPORTS</div>
       <div class="tool-desc">Scheduled email reports from Rollmaster &mdash; sales, inventory, and more</div>
     </a>
+
+    {% if is_admin %}
+    <a href="/users" class="tool-card">
+      <div class="tool-icon users">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+          <circle cx="9" cy="7" r="4"/>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+          <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+        </svg>
+      </div>
+      <div class="tool-name">USERS</div>
+      <div class="tool-desc">Manage user accounts, roles, and PINs</div>
+    </a>
+    {% endif %}
 
   </div>
 </main>

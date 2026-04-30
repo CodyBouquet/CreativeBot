@@ -506,7 +506,11 @@ def logout():
 @app.route("/")
 @login_required
 def landing():
-    return render_template("landing.html", username=session.get("username", ""))
+    return render_template(
+        "landing.html",
+        username=session.get("username", ""),
+        is_admin=session.get("role") == "admin",
+    )
 
 @app.route("/sync")
 @login_required
