@@ -38,7 +38,10 @@ import requests
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-import inventory_email_config as cfg
+try:
+    from . import inventory_email_config as cfg  # imported as email_reports.inventory.inventory_email
+except ImportError:
+    import inventory_email_config as cfg  # run directly: python email_reports/inventory/inventory_email.py
 
 load_dotenv()
 
