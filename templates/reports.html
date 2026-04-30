@@ -23,18 +23,14 @@
     --warn:    #ffaa00;
   }
 
-  html, body {
-    height: 100%;
-    overflow: hidden;
-  }
-
+  html, body { min-height: 100%; }
   body {
     background: var(--bg);
     color: var(--text);
     font-family: 'Barlow', sans-serif;
     display: flex;
     flex-direction: column;
-    user-select: none;
+    min-height: 100vh;
   }
 
   body::before {
@@ -56,16 +52,10 @@
     padding: 12px 20px;
     border-bottom: 1px solid var(--border);
     background: var(--surface);
-    position: relative;
-    z-index: 10;
-    flex-shrink: 0;
+    position: sticky; top: 0; z-index: 10;
   }
 
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
+  .header-left { display: flex; align-items: center; gap: 12px; }
 
   .brand {
     font-family: 'Share Tech Mono', monospace;
@@ -75,11 +65,7 @@
     text-decoration: none;
   }
 
-  .brand-sep {
-    color: var(--border);
-    font-size: 18px;
-  }
-
+  .brand-sep { color: var(--border); font-size: 18px; }
   .brand-sub {
     font-family: 'Share Tech Mono', monospace;
     font-size: 13px;
@@ -87,17 +73,8 @@
     color: var(--success);
   }
 
-  .header-right {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-
-  .user-badge {
-    font-size: 12px;
-    color: var(--muted);
-    letter-spacing: 1px;
-  }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .user-badge { font-size: 12px; color: var(--muted); letter-spacing: 1px; }
 
   .btn-sm {
     background: var(--card);
@@ -112,71 +89,112 @@
     text-decoration: none;
     transition: border-color 0.2s;
   }
+  .btn-sm:hover { border-color: var(--accent); }
 
-  .btn-sm:hover {
-    border-color: var(--accent);
-  }
-
-  /* MAIN CONTENT */
   main {
     flex: 1;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    padding: 32px 24px;
+    max-width: 1100px;
+    width: 100%;
+    margin: 0 auto;
     position: relative;
     z-index: 1;
+  }
+
+  .section-title {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 3px;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 16px;
+  }
+
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
     padding: 20px;
+    cursor: pointer;
+    transition: border-color 0.2s, transform 0.1s;
+    text-decoration: none;
+    color: inherit;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    position: relative;
   }
 
-  .empty-state {
-    text-align: center;
-    max-width: 420px;
+  .card:hover { border-color: var(--accent); }
+  .card:active { transform: scale(0.99); }
+
+  .card-icon {
+    font-size: 30px;
+    line-height: 1;
+    margin-bottom: 6px;
   }
 
-  .empty-icon {
-    width: 72px;
-    height: 72px;
-    border-radius: 16px;
-    background: rgba(0, 232, 144, 0.08);
-    border: 1px solid rgba(0, 232, 144, 0.15);
-    color: var(--success);
+  .card-title {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+
+  .card-desc {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+    flex: 1;
+  }
+
+  .card-meta {
     display: flex;
     align-items: center;
-    justify-content: center;
-    margin: 0 auto 24px;
-  }
-
-  .empty-title {
+    justify-content: space-between;
+    margin-top: 6px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
     font-family: 'Share Tech Mono', monospace;
-    font-size: 16px;
-    letter-spacing: 2px;
-    color: var(--text);
-    margin-bottom: 12px;
+    font-size: 11px;
+    letter-spacing: 1px;
   }
 
-  .empty-desc {
-    font-size: 14px;
-    color: var(--muted);
-    line-height: 1.6;
+  .badge {
+    color: var(--accent);
+  }
+  .badge.zero { color: var(--muted); }
+
+  .stub-badge {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: rgba(255, 170, 0, 0.1);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 1.5px;
+    padding: 2px 6px;
+    border-radius: 3px;
   }
 
-  .empty-desc strong {
-    color: var(--text);
-    font-weight: 600;
+  .card.settings-card {
+    background: linear-gradient(145deg, var(--card), var(--surface));
   }
 
-  /* SCANLINE OVERLAY */
   body::after {
     content: '';
     position: fixed;
     inset: 0;
     background: repeating-linear-gradient(
-      0deg,
-      transparent,
-      transparent 2px,
-      rgba(0, 0, 0, 0.03) 2px,
-      rgba(0, 0, 0, 0.03) 4px
-    );
+      0deg, transparent, transparent 2px,
+      rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px);
     pointer-events: none;
     z-index: 999;
   }
@@ -198,19 +216,32 @@
 </header>
 
 <main>
-  <div class="empty-state">
-    <div class="empty-icon">
-      <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
-        <polyline points="22,6 12,13 2,6"/>
-      </svg>
-    </div>
-    <div class="empty-title">NO REPORTS CONFIGURED</div>
-    <div class="empty-desc">
-      Email reports will appear here once <strong>Microsoft Graph</strong> is connected
-      and <strong>Rollmaster</strong> API access is configured.<br><br>
-      Available reports: daily/weekly/monthly sales, low inventory alerts, and more.
-    </div>
+  <div class="section-title">Reports</div>
+  <div class="grid">
+    {% for c in cards %}
+    <a class="card" href="/reports/{{ c.key }}">
+      {% if not c.implemented %}<span class="stub-badge">STUB</span>{% endif %}
+      <div class="card-icon">{{ c.icon }}</div>
+      <div class="card-title">{{ c.label }}</div>
+      <div class="card-desc">{{ c.description }}</div>
+      <div class="card-meta">
+        <span class="badge {% if c.recipient_count == 0 %}zero{% endif %}">
+          {{ c.recipient_count }} recipient{{ '' if c.recipient_count == 1 else 's' }}
+        </span>
+        <span style="color: var(--muted);">▸</span>
+      </div>
+    </a>
+    {% endfor %}
+
+    <a class="card settings-card" href="/reports/settings">
+      <div class="card-icon">⚙️</div>
+      <div class="card-title">Settings</div>
+      <div class="card-desc">Schedule + RM Sales IDs</div>
+      <div class="card-meta">
+        <span style="color: var(--muted);">Global</span>
+        <span style="color: var(--muted);">▸</span>
+      </div>
+    </a>
   </div>
 </main>
 

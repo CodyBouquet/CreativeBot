@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>CreativeBot — {{ report.label }}</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;600;700&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:      #0a0e13;
+    --surface: #111820;
+    --card:    #141d27;
+    --border:  #1e2d3d;
+    --accent:  #00c8ff;
+    --accent2: #0077aa;
+    --text:    #c8d8e8;
+    --muted:   #4a6070;
+    --danger:  #ff4060;
+    --success: #00e890;
+    --warn:    #ffaa00;
+  }
+
+  html, body { min-height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Barlow', sans-serif;
+    display: flex; flex-direction: column;
+    min-height: 100vh;
+  }
+
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(var(--border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size: 40px 40px;
+    opacity: 0.15;
+    pointer-events: none;
+  }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    position: sticky; top: 0; z-index: 10;
+  }
+
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .brand {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 16px; letter-spacing: 4px;
+    color: var(--accent); text-decoration: none;
+  }
+  .brand-sep { color: var(--border); font-size: 18px; }
+  .brand-sub {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px; letter-spacing: 2px;
+    color: var(--success); text-decoration: none;
+  }
+  .brand-sub.current { color: var(--accent); }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .user-badge { font-size: 12px; color: var(--muted); letter-spacing: 1px; }
+
+  .btn-sm {
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: 'Barlow', sans-serif;
+    font-size: 12px; letter-spacing: 1px;
+    text-decoration: none;
+    transition: border-color 0.2s, color 0.2s, background 0.2s;
+  }
+  .btn-sm:hover { border-color: var(--accent); }
+  .btn-primary { background: rgba(0,200,255,0.1); border-color: var(--accent); color: var(--accent); }
+  .btn-primary:hover { background: rgba(0,200,255,0.2); }
+  .btn-warn { border-color: var(--warn); color: var(--warn); }
+  .btn-warn:hover { background: rgba(255,170,0,0.1); }
+  .btn-warn[disabled] { opacity: 0.5; cursor: wait; }
+
+  main {
+    flex: 1; padding: 32px 24px;
+    max-width: 1100px; width: 100%;
+    margin: 0 auto;
+    position: relative; z-index: 1;
+  }
+
+  .report-header {
+    display: flex; align-items: center; gap: 16px;
+    margin-bottom: 32px;
+  }
+  .report-icon { font-size: 48px; line-height: 1; }
+  .report-title { font-size: 22px; font-weight: 600; letter-spacing: 0.5px; }
+  .report-desc { font-size: 13px; color: var(--muted); margin-top: 4px; }
+
+  .stub-banner {
+    background: rgba(255,170,0,0.06);
+    border: 1px solid var(--warn);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 24px;
+    color: var(--warn);
+    font-size: 13px;
+  }
+
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+  }
+
+  .panel-title {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px; letter-spacing: 2px;
+    color: var(--muted); text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+
+  .recipients-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 6px 18px;
+  }
+
+  .user-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .user-row label { display: flex; align-items: center; gap: 12px; cursor: pointer; flex: 1; }
+  .user-row input[type="checkbox"] {
+    width: 18px; height: 18px;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .user-name { font-weight: 600; font-size: 14px; }
+  .user-email { color: var(--muted); font-size: 11px; font-family: 'Share Tech Mono', monospace; }
+  .user-info { display: flex; flex-direction: column; }
+
+  .runs-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .runs-table th, .runs-table td {
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .runs-table th {
+    color: var(--muted);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px; letter-spacing: 1.5px;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+  .status-ok { color: var(--success); }
+  .status-fail { color: var(--danger); }
+  .empty-row td { color: var(--muted); padding: 16px; text-align: center; }
+
+  .actions-row {
+    display: flex; gap: 8px; justify-content: flex-end;
+    margin-top: 16px;
+  }
+
+  .toast {
+    position: fixed; bottom: 24px; left: 50%;
+    transform: translateX(-50%);
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 18px;
+    border-radius: 6px;
+    font-size: 13px; letter-spacing: 1px;
+    z-index: 100;
+    opacity: 0; transition: opacity 0.2s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .toast.error { border-color: var(--danger); color: var(--danger); }
+  .toast.ok { border-color: var(--success); color: var(--success); }
+
+  body::after {
+    content: '';
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(
+      0deg, transparent, transparent 2px,
+      rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px);
+    pointer-events: none;
+    z-index: 999;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <a href="/" class="brand">CREATIVEBOT</a>
+    <span class="brand-sep">/</span>
+    <a href="/reports" class="brand-sub">REPORTS</a>
+    <span class="brand-sep">/</span>
+    <span class="brand-sub current">{{ report.label.upper() }}</span>
+  </div>
+  <div class="header-right">
+    <span class="user-badge">{{ username }}</span>
+    <a href="/reports" class="btn-sm">Back</a>
+    <a href="/logout" class="btn-sm">Lock</a>
+  </div>
+</header>
+
+<main>
+  <div class="report-header">
+    <div class="report-icon">{{ report.icon }}</div>
+    <div>
+      <div class="report-title">{{ report.label }}</div>
+      <div class="report-desc">{{ report.description }}</div>
+    </div>
+  </div>
+
+  {% if not report.implemented %}
+  <div class="stub-banner">
+    This report is not yet wired up — recipients can be selected, but no data
+    will be sent until the module is implemented.
+  </div>
+  {% endif %}
+
+  <form method="POST" action="/reports/{{ report.key }}">
+    <div class="panel">
+      <div class="panel-title">Recipients ({{ selected|length }} of {{ users|length }})</div>
+      <div class="recipients-grid">
+        {% for u in users %}
+        <div class="user-row">
+          <label>
+            <input type="checkbox" name="sub:{{ u.email }}"
+                   {% if u.email in selected %}checked{% endif %}>
+            <span class="user-info">
+              <span class="user-name">{{ u.display_name }}</span>
+              <span class="user-email">{{ u.email }}</span>
+            </span>
+          </label>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="actions-row">
+        <button type="submit" class="btn-sm btn-primary">Save Recipients</button>
+      </div>
+    </div>
+  </form>
+
+  <!-- RUN-NOW PANEL — comment out this whole <div class="panel"> when no longer needed for testing. -->
+  <div class="panel">
+    <div class="panel-title">Manual Run (Testing)</div>
+    <p style="font-size:12px; color: var(--muted); line-height:1.6;">
+      Sends this report immediately to its current subscribers. Useful for
+      verifying schedule changes; remove this panel once the cron schedule
+      is trusted.
+    </p>
+    <div class="actions-row">
+      <button type="button" class="btn-sm btn-warn" id="runNowBtn">Run Now</button>
+    </div>
+  </div>
+  <!-- END RUN-NOW PANEL -->
+
+  <div class="panel">
+    <div class="panel-title">Last 5 Runs</div>
+    <table class="runs-table">
+      <thead>
+        <tr><th>When</th><th>Recipients</th><th>Status</th><th>Note</th></tr>
+      </thead>
+      <tbody>
+        {% if runs %}
+          {% for r in runs %}
+          <tr>
+            <td>{{ r.ran_at }}</td>
+            <td>{{ r.recipient_count }}</td>
+            <td class="{{ 'status-ok' if r.status == 'ok' else 'status-fail' }}">{{ r.status }}</td>
+            <td style="color: var(--muted);">{{ r.error or '' }}</td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr class="empty-row"><td colspan="4">No runs yet.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  const toast = (msg, kind) => {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast show ' + (kind || '');
+    setTimeout(() => t.classList.remove('show'), 2400);
+  };
+
+  // RUN-NOW handler — comment out alongside the panel above when no longer needed.
+  const runBtn = document.getElementById('runNowBtn');
+  if (runBtn) {
+    runBtn.addEventListener('click', async () => {
+      if (!confirm('Send this report to all current subscribers right now?')) return;
+      runBtn.disabled = true;
+      runBtn.textContent = 'Sending…';
+      try {
+        const r = await fetch('/reports/{{ report.key }}/run', { method: 'POST' });
+        const data = await r.json();
+        if (data.ok) {
+          toast(`Sent to ${data.recipient_count || 0} recipient(s)`, 'ok');
+          setTimeout(() => location.reload(), 800);
+        } else {
+          toast('Send failed: ' + (data.error || 'unknown'), 'error');
+        }
+      } catch (err) {
+        toast('Send failed: ' + err, 'error');
+      } finally {
+        runBtn.disabled = false;
+        runBtn.textContent = 'Run Now';
+      }
+    });
+  }
+</script>
+
+</body>
+</html>

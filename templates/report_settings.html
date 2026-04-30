@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>CreativeBot — Report Settings</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;600;700&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:      #0a0e13;
+    --surface: #111820;
+    --card:    #141d27;
+    --border:  #1e2d3d;
+    --accent:  #00c8ff;
+    --accent2: #0077aa;
+    --text:    #c8d8e8;
+    --muted:   #4a6070;
+    --danger:  #ff4060;
+    --success: #00e890;
+    --warn:    #ffaa00;
+  }
+
+  html, body { min-height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Barlow', sans-serif;
+    display: flex; flex-direction: column;
+    min-height: 100vh;
+  }
+
+  body::before {
+    content: ''; position: fixed; inset: 0;
+    background-image:
+      linear-gradient(var(--border) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border) 1px, transparent 1px);
+    background-size: 40px 40px;
+    opacity: 0.15;
+    pointer-events: none;
+  }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .brand {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 16px; letter-spacing: 4px;
+    color: var(--accent); text-decoration: none;
+  }
+  .brand-sep { color: var(--border); font-size: 18px; }
+  .brand-sub {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 13px; letter-spacing: 2px;
+    color: var(--success); text-decoration: none;
+  }
+  .brand-sub.current { color: var(--accent); }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .user-badge { font-size: 12px; color: var(--muted); letter-spacing: 1px; }
+
+  .btn-sm {
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: 'Barlow', sans-serif;
+    font-size: 12px; letter-spacing: 1px;
+    text-decoration: none;
+    transition: border-color 0.2s;
+  }
+  .btn-sm:hover { border-color: var(--accent); }
+  .btn-primary { background: rgba(0,200,255,0.1); border-color: var(--accent); color: var(--accent); }
+  .btn-primary:hover { background: rgba(0,200,255,0.2); }
+
+  main {
+    flex: 1; padding: 32px 24px;
+    max-width: 900px; width: 100%;
+    margin: 0 auto;
+    position: relative; z-index: 1;
+  }
+
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+  }
+  .panel-title {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px; letter-spacing: 2px;
+    color: var(--muted); text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+  .panel-help {
+    font-size: 12px; color: var(--muted);
+    margin-bottom: 16px; line-height: 1.6;
+  }
+
+  .form-row {
+    display: flex; align-items: center; gap: 16px;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+  .form-row label.lbl {
+    color: var(--muted);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    min-width: 70px;
+  }
+
+  input[type="number"], input[type="text"], select {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 14px;
+    transition: border-color 0.2s;
+  }
+  input[type="number"] { width: 80px; }
+  input[type="text"]   { width: 160px; }
+  select               { width: 200px; }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+
+  .day-toggles { display: flex; gap: 6px; }
+  .day-toggle {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 1px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .day-toggle.on { border-color: var(--accent); color: var(--accent); background: rgba(0,200,255,0.08); }
+
+  .users-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  .users-table th, .users-table td {
+    padding: 10px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .users-table th {
+    color: var(--muted);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px; letter-spacing: 1.5px;
+    text-transform: uppercase;
+  }
+  .user-name { font-weight: 600; }
+  .user-email { color: var(--muted); font-size: 11px; font-family: 'Share Tech Mono', monospace; }
+  .users-table input[type="text"] { width: 140px; padding: 6px 10px; font-size: 13px; }
+
+  .actions-row {
+    display: flex; gap: 8px; justify-content: flex-end;
+    margin-top: 16px;
+  }
+
+  .toast {
+    position: fixed; bottom: 24px; left: 50%;
+    transform: translateX(-50%);
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px 18px;
+    border-radius: 6px;
+    font-size: 13px; letter-spacing: 1px;
+    z-index: 100;
+    opacity: 0; transition: opacity 0.2s;
+    pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .toast.error { border-color: var(--danger); color: var(--danger); }
+  .toast.ok { border-color: var(--success); color: var(--success); }
+
+  body::after {
+    content: ''; position: fixed; inset: 0;
+    background: repeating-linear-gradient(0deg, transparent, transparent 2px,
+      rgba(0,0,0,0.03) 2px, rgba(0,0,0,0.03) 4px);
+    pointer-events: none; z-index: 999;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <a href="/" class="brand">CREATIVEBOT</a>
+    <span class="brand-sep">/</span>
+    <a href="/reports" class="brand-sub">REPORTS</a>
+    <span class="brand-sep">/</span>
+    <span class="brand-sub current">SETTINGS</span>
+  </div>
+  <div class="header-right">
+    <span class="user-badge">{{ username }}</span>
+    <a href="/reports" class="btn-sm">Back</a>
+    <a href="/logout" class="btn-sm">Lock</a>
+  </div>
+</header>
+
+<main>
+  <form method="POST" action="/reports/settings">
+
+    <div class="panel">
+      <div class="panel-title">Schedule</div>
+      <div class="panel-help">
+        One digest is sent per recipient at the time below — only the report
+        sections they're subscribed to are included. Empty subscriptions = no email.
+      </div>
+
+      <div class="form-row">
+        <label class="lbl">Time</label>
+        <input type="number" name="schedule_hour"   min="0" max="23" value="{{ schedule.hour }}">
+        <span style="color: var(--muted);">:</span>
+        <input type="number" name="schedule_minute" min="0" max="59" value="{{ schedule.minute }}">
+        <select name="schedule_tz">
+          {% set tzs = ['America/Chicago','America/New_York','America/Denver','America/Los_Angeles','UTC'] %}
+          {% for tz in tzs %}
+            <option value="{{ tz }}" {% if schedule.tz == tz %}selected{% endif %}>{{ tz }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="form-row">
+        <label class="lbl">Days</label>
+        {% set days = [('mon','Mon'),('tue','Tue'),('wed','Wed'),('thu','Thu'),('fri','Fri'),('sat','Sat'),('sun','Sun')] %}
+        {% set selected_days = schedule.days.split(',') %}
+        <div class="day-toggles">
+          {% for code, label in days %}
+            <span class="day-toggle {% if code in selected_days %}on{% endif %}" data-code="{{ code }}">{{ label }}</span>
+          {% endfor %}
+        </div>
+        <input type="hidden" name="schedule_days" id="scheduleDays" value="{{ schedule.days }}">
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">RM Sales IDs</div>
+      <div class="panel-help">
+        Required for sales-report rows to be filtered to a specific
+        salesperson. Leave blank for users who don't appear in Rollmaster
+        sales data.
+      </div>
+
+      <table class="users-table">
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>RM Sales ID</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for u in users %}
+          <tr>
+            <td>
+              <div class="user-name">{{ u.display_name }}</div>
+              <div class="user-email">{{ u.email }}</div>
+            </td>
+            <td>
+              <input type="text" name="rm_sales_id:{{ u.email }}"
+                     value="{{ u.rm_sales_id or '' }}" placeholder="—">
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="actions-row">
+      <button type="button" class="btn-sm" id="syncBtn">Sync Users from M365</button>
+      <button type="submit" class="btn-sm btn-primary">Save Settings</button>
+    </div>
+
+  </form>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  const toast = (msg, kind) => {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'toast show ' + (kind || '');
+    setTimeout(() => t.classList.remove('show'), 2400);
+  };
+
+  // Day-toggle UI: clicking a chip flips it on/off, sync hidden input
+  const daysInput = document.getElementById('scheduleDays');
+  document.querySelectorAll('.day-toggle').forEach(chip => {
+    chip.addEventListener('click', () => {
+      chip.classList.toggle('on');
+      const on = Array.from(document.querySelectorAll('.day-toggle.on')).map(c => c.dataset.code);
+      daysInput.value = on.join(',');
+    });
+  });
+
+  // Sync from M365 (re-pulls group members)
+  document.getElementById('syncBtn').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = 'Syncing…';
+    try {
+      const r = await fetch('/reports/sync_users', { method: 'POST' });
+      const data = await r.json();
+      if (data.ok) {
+        toast(`Synced — ${data.total_active} active, ${data.added} new`, 'ok');
+        setTimeout(() => location.reload(), 800);
+      } else {
+        toast('Sync failed: ' + (data.error || 'unknown'), 'error');
+      }
+    } catch (err) {
+      toast('Sync failed: ' + err, 'error');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Sync Users from M365';
+    }
+  });
+</script>
+
+</body>
+</html>

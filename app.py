@@ -17,7 +17,7 @@ import queue
 
 load_dotenv()
 
-from email_reports import bp as reports_bp, init_reports_db
+from email_reports import bp as reports_bp
 
 app = Flask(__name__)
 _secret = os.environ.get("FLASK_SECRET_KEY", "")
@@ -873,7 +873,6 @@ def health():
 # ---------------------------------------------------------------------------
 init_db()
 app.register_blueprint(reports_bp)
-init_reports_db()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001)
