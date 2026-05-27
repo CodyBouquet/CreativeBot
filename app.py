@@ -413,9 +413,10 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
             return "Cancelled task, moved to Ready to Schedule"
         return "Cancelled task, recalculated install dates"
     elif event_type == "TASK_COMPLETED":
-        current_dates = recalc_install(conn, deal_id)
-        is_part1 = bool(current_dates and current_dates[0] == date)
+        pre_dates = recalc_install(conn, deal_id)
+        is_part1 = bool(pre_dates and pre_dates[0] == date)
         upsert_task_state(conn, task_id, deal_id, "install", date, status="completed")
+        recalc_install(conn, deal_id)
         if is_part1:
             pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
             return "Moved to Install Complete"
