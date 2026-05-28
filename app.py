@@ -58,12 +58,13 @@ for _var, _val in _REQUIRED_ENV.items():
 # Arrivy template IDs → task type
 # Note: repair is treated as install (shares Pipedrive install fields & stages).
 # Pickup and customer pickup are treated as delivery (share delivery_date field).
+REPAIR_TEMPLATE_ID = 4649593254445056
 TEMPLATE_MAP = {
     5395407346073600: "install",
     5627485400596480: "measure",
     5278551184506880: "delivery",
     5546469558321152: "inspection",
-    4649593254445056: "install",      # repair — same process as install
+    REPAIR_TEMPLATE_ID: "install",    # repair — same process as install
     6631019675910144: "delivery",     # pickup
     538634486456320:  "delivery",     # customer pickup
 }
@@ -371,11 +372,14 @@ def recalc_install(conn, deal_id):
     phase  = rows[0]["install_phase"] if rows else None
     phase_id = INSTALL_PHASE_OPTIONS.get(phase.lower()) if phase else None
     logger.info(f"recalc_install: deal={deal_id} dates={dates} phase={phase!r} phase_id={phase_id}")
-    pd_update_deal(deal_id, {
+    update = {
         PD_FIELDS["install_start"]: dates[0]  if len(dates) > 0 else None,
         PD_FIELDS["install_part2"]: dates[1]  if len(dates) > 1 else None,
-        PD_FIELDS["install_phase"]: phase_id,
-    })
+    }
+    # Never clear install_phase — only write it when we have a known phase.
+    if phase_id is not None:
+        update[PD_FIELDS["install_phase"]] = phase_id
+    pd_update_deal(deal_id, update)
     return dates
 
 def get_extra_field(extra_fields, name):
@@ -385,9 +389,13 @@ def get_extra_field(extra_fields, name):
             return field.get("value")
     return None
 
-def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields=None):
+def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields=None, template_id=None):
     date          = parse_arrivy_date(object_date)
-    install_phase = get_extra_field(extra_fields, "Installation Phase")
+    # Repair tasks have no phase option in Arrivy — always treat as "final".
+    if template_id == REPAIR_TEMPLATE_ID:
+        install_phase = "final"
+    else:
+        install_phase = get_extra_field(extra_fields, "Installation Phase")
     logger.info(f"handle_install: event={event_type} task={task_id} date={date} phase={install_phase!r}")
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", date, install_phase=install_phase)
@@ -798,7 +806,7 @@ def arrivy_webhook():
                     elif task_type == "delivery":
                         action = handle_delivery(conn, event_type, deal_id, task_id, object_date)
                     elif task_type == "install":
-                        action = handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
+                        action = handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields, template_id)
                     elif task_type == "inspection":
                         action = handle_inspection(conn, event_type, deal_id, task_id, object_date)
                 else:
