@@ -59,12 +59,15 @@ AVAILABLE_REPORTS: list[dict] = [
 
 
 def report_by_key(key: str) -> dict | None:
+    """Look up a report's catalog entry by its key, or None if unknown."""
     return next((r for r in AVAILABLE_REPORTS if r["key"] == key), None)
 
 
 def login_required(f):
+    """Route decorator: redirect to the PIN page unless the session is authenticated."""
     @wraps(f)
     def decorated(*args, **kwargs):
+        """Wrapper: enforce authentication before calling the wrapped view."""
         if not session.get("authenticated"):
             return redirect(url_for("pin_page"))
         return f(*args, **kwargs)
@@ -72,9 +75,11 @@ def login_required(f):
 
 
 def admin_required(f):
+    """Route decorator: require an authenticated admin session (403 otherwise)."""
     @wraps(f)
     @login_required
     def decorated(*args, **kwargs):
+        """Wrapper: require the admin role (login is enforced by the stacked @login_required)."""
         if session.get("role") != "admin":
             return ("Forbidden", 403)
         return f(*args, **kwargs)
@@ -101,6 +106,7 @@ def reports_home():
 @bp.route("/reports/<report_key>", methods=["GET"])
 @admin_required
 def report_detail(report_key: str):
+    """Admin page for one report: subscriber checkboxes (pre-checked from current subs) plus recent run history."""
     report = report_by_key(report_key)
     if not report:
         return ("Unknown report", 404)
@@ -120,6 +126,7 @@ def report_detail(report_key: str):
 @bp.route("/reports/<report_key>", methods=["POST"])
 @admin_required
 def report_save(report_key: str):
+    """Persist the subscriber set for one report from the checkbox form, then redirect back to its detail page."""
     if not report_by_key(report_key):
         return ("Unknown report", 404)
     chosen = [
@@ -152,6 +159,7 @@ def report_run_now(report_key: str):
 @bp.route("/reports/settings", methods=["GET"])
 @admin_required
 def settings_page():
+    """Render the global report settings page: dispatch schedule plus per-user RM Sales ID inputs."""
     users = m365_directory.list_active_users()
     schedule = {
         "hour":   m365_directory.get_setting("reports.schedule.hour", "6"),
@@ -170,6 +178,7 @@ def settings_page():
 @bp.route("/reports/settings", methods=["POST"])
 @admin_required
 def settings_save():
+    """Persist the dispatch schedule and per-user RM Sales IDs from the settings form."""
     # Schedule
     if "schedule_hour" in request.form:
         m365_directory.set_setting("reports.schedule.hour",   request.form.get("schedule_hour", "6"))
@@ -190,6 +199,7 @@ def settings_save():
 @bp.route("/reports/sync_users", methods=["POST"])
 @admin_required
 def sync_users_now():
+    """Manual trigger: re-sync the M365 group membership into the local user table; returns the sync summary as JSON."""
     try:
         result = m365_directory.sync_users()
         logger.info("M365 group sync: %s", result)

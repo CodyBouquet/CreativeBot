@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 
 
 def build_section(user, ctx: ReportContext) -> str | None:
+    """Return the low-stock HTML table (same for every recipient), reusing the cached row pull; None if there are no low-stock items."""
     rows = ctx.get_or_compute("inventory.lowstock_rows", _pull_rows)
     if not rows:
         return None

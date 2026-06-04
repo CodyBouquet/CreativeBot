@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 
 
 class GraphMailError(RuntimeError):
+    """Raised on any Graph mail failure: token acquisition, missing recipient, or a non-2xx sendMail response."""
     pass
 
 
@@ -73,6 +74,7 @@ def get_access_token() -> str:
 
 
 def _as_list(x: str | Iterable[str] | None) -> list[str]:
+    """Normalize a recipient arg (None / single string / iterable) into a list of addresses."""
     if not x:
         return []
     if isinstance(x, str):
@@ -129,6 +131,7 @@ def send_mail(
 
 
 def _cli():
+    """Command-line sanity check: send a test email through Graph using the configured sender."""
     p = argparse.ArgumentParser(description="Send a test mail via Microsoft Graph.")
     p.add_argument("--to", required=True, help="Recipient (comma-separated for many)")
     p.add_argument("--subject", default="CreativeBot Graph mail test")

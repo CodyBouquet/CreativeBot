@@ -46,6 +46,7 @@ _DAY_CODES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 # ---- Schedule gate --------------------------------------------------------
 
 def _read_schedule() -> dict:
+    """Load the dispatch schedule (hour, minute, tz, enabled day codes) from the settings table."""
     return {
         "hour":   int(m365_directory.get_setting("reports.schedule.hour", "6")),
         "minute": int(m365_directory.get_setting("reports.schedule.minute", "0")),
@@ -55,6 +56,7 @@ def _read_schedule() -> dict:
 
 
 def _should_dispatch(now: datetime, schedule: dict) -> tuple[bool, str]:
+    """Decide whether this cron tick should send: gates on enabled day, time-of-day, and the once-per-day already-dispatched marker. Returns (should_dispatch, reason)."""
     today_code = _DAY_CODES[now.weekday()]
     if today_code not in schedule["days"]:
         return False, f"day {today_code} not enabled"

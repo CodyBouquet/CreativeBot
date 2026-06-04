@@ -72,6 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_key_at      ON report_runs(report_key, ran_a
 
 
 def _conn():
+    """Open a sqlite connection to DB_PATH (creating the parent dir) with Row access by column name."""
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
@@ -79,6 +80,7 @@ def _conn():
 
 
 def init_schema():
+    """Create the m365 tables/indexes if absent and add the rm_sales_id column to legacy tables. Idempotent; called at the top of every public function here."""
     with _conn() as c:
         c.executescript(SCHEMA)
         # Add rm_sales_id to existing m365_users tables (no-op if already there).
@@ -180,6 +182,7 @@ def sync_users(group_id: str | None = None) -> dict:
 # ---- Queries --------------------------------------------------------------
 
 def list_active_users() -> list[sqlite3.Row]:
+    """Return all currently-active users (id, email, display_name, rm_sales_id), ordered by display name."""
     init_schema()
     with _conn() as c:
         return c.execute(
@@ -264,6 +267,7 @@ def record_run(report_key: str, recipient_count: int, status: str, error: str | 
 
 
 def recent_runs(report_key: str, limit: int = 5) -> list[sqlite3.Row]:
+    """Return the most recent report_runs rows for a report key (newest first)."""
     init_schema()
     with _conn() as c:
         return c.execute(
@@ -276,6 +280,7 @@ def recent_runs(report_key: str, limit: int = 5) -> list[sqlite3.Row]:
 # ---- Settings (piggybacks on app.py's settings table in sync.db) ----------
 
 def get_setting(key: str, default: str | None = None) -> str | None:
+    """Read a value from the shared settings table (same table app.py uses), or return default."""
     init_schema()
     with _conn() as c:
         c.execute(
@@ -286,6 +291,7 @@ def get_setting(key: str, default: str | None = None) -> str | None:
 
 
 def set_setting(key: str, value: str) -> None:
+    """Insert or update a value in the shared settings table."""
     init_schema()
     with _conn() as c:
         c.execute(
@@ -301,6 +307,7 @@ def set_setting(key: str, value: str) -> None:
 # ---- CLI ------------------------------------------------------------------
 
 def _cli():
+    """Command-line interface: `sync` group members, `list` active users, or show `subs` for a report key."""
     import argparse, json
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)

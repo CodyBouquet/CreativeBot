@@ -56,6 +56,7 @@ COMPANY  = cfg.BMS_COMPANY
 # ---- Helpers ---------------------------------------------------------------
 
 def _f(x):
+    """Coerce a possibly-messy BMS value to float; blank/None/unparseable becomes 0.0."""
     try:
         return float(str(x).strip() or 0)
     except (TypeError, ValueError):
@@ -63,6 +64,7 @@ def _f(x):
 
 
 def _parse_date(s):
+    """Parse an 8-digit BMS date, trying both YYYYMMDD and MMDDYYYY and keeping whichever gives a plausible year. Returns a datetime or None."""
     s = (s or "").strip()
     if len(s) != 8 or not s.isdigit() or s == "00000000":
         return None
@@ -78,6 +80,7 @@ def _parse_date(s):
 
 
 def _iso_week(dt):
+    """Return the ISO year-week label (e.g. '2025-W07') used to bucket weekly demand."""
     return dt.strftime("%G-W%V")
 
 
@@ -90,6 +93,7 @@ def _ceil_to_box(value, box_qty):
 
 
 def authenticate():
+    """Exchange BMS credentials for an API token; raises if no TOKEN comes back."""
     r = requests.post(
         f"{BASE_URL}/{ALIAS}/token",
         headers={
@@ -108,6 +112,7 @@ def authenticate():
 
 
 def make_session(token):
+    """Build a requests.Session pre-loaded with the BMS auth headers for reuse across calls."""
     s = requests.Session()
     s.headers.update(
         {"Accept": "application/json", "x-api-key": API_KEY, "token": token}
@@ -116,16 +121,19 @@ def make_session(token):
 
 
 def _get(session, path, params, timeout=180):
+    """Thin GET wrapper that prefixes the BMS base URL + company alias onto a path."""
     return session.get(f"{BASE_URL}/{ALIAS}/{path}", params=params, timeout=timeout)
 
 
 # ---- Data pulls -----------------------------------------------------------
 
 def pull_lowstock(S):
+    """Fetch the BMS low-stock list — the set of items currently below their safety-stock threshold."""
     return _get(S, "lowstock", {"company": COMPANY}).json()
 
 
 def pull_orders(S, open_only=True, end=None):
+    """Fetch order headers from ORDER_HISTORY_FLOOR through `end`; open_only=False adds active-status orders."""
     params = {"company": COMPANY, "startdate": cfg.ORDER_HISTORY_FLOOR, "enddate": end}
     if not open_only:
         params["ordstatus"] = "A"
@@ -133,11 +141,13 @@ def pull_orders(S, open_only=True, end=None):
 
 
 def pull_productstock(S, seq):
+    """Fetch current roll-level stock records for one catalog sequence; [] on non-200."""
     r = _get(S, "productstock", {"company": COMPANY, "catseq": seq}, timeout=30)
     return r.json() if r.status_code == 200 else []
 
 
 def pull_orderline_bulk(S, branch, end):
+    """Fetch all order lines for one branch over the history window (used for UNASSIGN and PEAK_WK); [] on non-200."""
     r = _get(
         S,
         "orderline",
@@ -148,6 +158,7 @@ def pull_orderline_bulk(S, branch, end):
 
 
 def pull_purchaseorderlines(S):
+    """Fetch PO lines — source of the per-seq vendor map and open-PO (ON_PO) quantities."""
     return _get(S, "purchaseorderlines", {"company": COMPANY, "pagelimit": "1000"}).json()
 
 
@@ -205,6 +216,7 @@ def pull_box_quantities(S, target_seqs, batch=16):
     # or pagination ends. Early-stop keeps this from walking the whole catalog
     # when the targets are concentrated.
     def fetch_page(p):
+        """Fetch one page of /catalogitems; [] on non-200."""
         r = _get(
             S,
             "catalogitems",
@@ -275,6 +287,7 @@ def walk_invoice_lines(S, invno_dates, target_seqs, batch=16):
     page = 1
 
     def fetch_page(p):
+        """Fetch one page of /invoicelines; [] on non-200."""
         r = _get(
             S,
             "invoicelines",
@@ -319,6 +332,7 @@ def walk_invoice_lines(S, invno_dates, target_seqs, batch=16):
 # ---- Report build ---------------------------------------------------------
 
 def build_report():
+    """Orchestrate the full low-stock analysis: pull lowstock/orders/PO/stock/invoice data (largely in parallel), compute demand stats per seq, and derive recommended safety stock, reorder point, and order qty. Returns a list of per-item dicts."""
     t0 = time.time()
     today = datetime.now()
     end_yyyymmdd = today.strftime("%Y%m%d")
@@ -380,6 +394,7 @@ def build_report():
 
     # --- Current stock per seq (parallel)
     def stock_one(seq):
+        """Pull one seq's stock and return it paired with the seq (for the threaded map)."""
         return seq, pull_productstock(S, seq)
 
     with ThreadPoolExecutor(max_workers=16) as ex:
@@ -517,6 +532,7 @@ def build_report():
 
 
 def write_report(rows, path):
+    """Write the report rows to a fixed-width text file, sorted by current safety stock (desc) then seq, with a header summarizing the algorithm parameters."""
     rows = sorted(rows, key=lambda r: (-r["safety_cur"], r["seq"]))
     ms = max((len(r["style"])  for r in rows), default=5)
     mc = max((len(r["color"])  for r in rows), default=5)
@@ -547,6 +563,7 @@ def write_report(rows, path):
 
 
 def main():
+    """CLI entry point: build the report and write it to cfg.OUTPUT_PATH."""
     rows = build_report()
     write_report(rows, cfg.OUTPUT_PATH)
     print(f"wrote {cfg.OUTPUT_PATH}", file=sys.stderr)

@@ -24,6 +24,7 @@ PASSWORD = os.environ["BMS_PASSWORD"]
 
 
 def authenticate():
+    """Exchange BMS credentials for an API token; returns the TOKEN string."""
     r = requests.post(
         f"{BASE_URL}/{ALIAS}/token",
         headers={
@@ -39,11 +40,13 @@ def authenticate():
 
 
 def get(session, path, params):
+    """GET a BMS endpoint (base URL + alias prepended) and return the raw response."""
     r = session.get(f"{BASE_URL}/{ALIAS}/{path}", params=params, timeout=60)
     return r
 
 
 def show(label, r):
+    """Pretty-print a response for probing: status plus a truncated JSON/text snippet (first 3 records if a list)."""
     print(f"\n=== {label}  ({r.request.url}) ===")
     print(f"status: {r.status_code}")
     try:
@@ -57,6 +60,7 @@ def show(label, r):
 
 
 def main():
+    """Probe BMS for a given order number: try several order/customer/AR endpoint shapes and print each raw response to map the field layout."""
     if len(sys.argv) < 2:
         print("usage: lookup_job.py <ordno>")
         sys.exit(2)

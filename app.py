@@ -105,6 +105,7 @@ _sse_clients      = set()
 _sse_clients_lock = threading.Lock()
 
 def sse_notify():
+    """Push a 'refresh' event to every connected dashboard SSE client; drop any whose queue is full."""
     with _sse_clients_lock:
         dead = set()
         for q in _sse_clients:
@@ -118,12 +119,14 @@ def sse_notify():
 # DATABASE
 # ---------------------------------------------------------------------------
 def get_db():
+    """Open a sqlite connection to DB_PATH (creating the parent dir), with Row access by column name."""
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
+    """Create all tables/indexes if absent and run in-place migrations (legacy PIN → users, current_date → task_date, new columns). Idempotent; called at startup."""
     with get_db() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS events (
@@ -201,15 +204,18 @@ def init_db():
     logger.info(f"Database initialised at {DB_PATH}")
 
 def get_setting(key):
+    """Return the value for a settings key, or None if unset."""
     with get_db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
 def set_setting(key, value):
+    """Insert or overwrite a single settings key/value pair."""
     with get_db() as conn:
         conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
 def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload, action=None):
+    """Append a row to the events audit log (raw payload stored as JSON); returns the new event id."""
     cur = conn.execute(
         """INSERT INTO events (received_at, deal_id, task_id, event_type, task_type, raw_json, action)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -219,16 +225,20 @@ def store_event(conn, deal_id, task_id, event_type, task_type, raw_payload, acti
     return cur.lastrowid
 
 def update_event_action(conn, event_id, action):
+    """Set the human-readable action summary on an already-stored event."""
     conn.execute("UPDATE events SET action=? WHERE id=?", (action, event_id))
 
 def get_task_state(conn, task_id):
+    """Return the task_state row for a task id, or None."""
     return conn.execute("SELECT * FROM task_state WHERE task_id = ?", (task_id,)).fetchone()
 
 def upsert_task_state(conn, task_id, deal_id, task_type, task_date, status="active", install_phase=None):
+    """Insert or update a task's tracked state. task_type follows the incoming event so a task whose template was corrected in Arrivy (e.g. measure → install) is re-filed correctly. install_phase is preserved (COALESCE) when the new value is None so it's never accidentally cleared."""
     conn.execute(
         """INSERT INTO task_state (task_id, deal_id, task_type, task_date, install_phase, status, last_updated)
            VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(task_id) DO UPDATE SET
+               task_type     = excluded.task_type,
                task_date     = excluded.task_date,
                install_phase = COALESCE(excluded.install_phase, task_state.install_phase),
                status        = excluded.status,
@@ -237,6 +247,7 @@ def upsert_task_state(conn, task_id, deal_id, task_type, task_date, status="acti
     )
 
 def archive_deal(conn, deal_id):
+    """Mark all events and task_state rows for a deal as archived (hidden from dashboard/sync), e.g. when the deal is won or lost."""
     conn.execute("UPDATE events     SET archived = 1 WHERE deal_id = ?", (deal_id,))
     conn.execute("UPDATE task_state SET archived = 1 WHERE deal_id = ?", (deal_id,))
     logger.info(f"Archived deal {deal_id}")
@@ -247,6 +258,7 @@ def archive_deal(conn, deal_id):
 PD_BASE = "https://api.pipedrive.com/v1"
 
 def pd_get_deal(deal_id):
+    """Fetch a single deal from the Pipedrive API; raises if the request or API response fails."""
     r = requests.get(f"{PD_BASE}/deals/{deal_id}", params={"api_token": PIPEDRIVE_API_TOKEN})
     r.raise_for_status()
     data = r.json()
@@ -255,6 +267,7 @@ def pd_get_deal(deal_id):
     return data["data"]
 
 def pd_update_deal(deal_id, fields):
+    """Update fields on a Pipedrive deal. Historical deals (id <= MIN_DEAL_ID) are blocked and only logged, never written. Returns the updated deal data, or None if blocked."""
     if int(deal_id) <= MIN_DEAL_ID:
         logger.warning(f"BLOCKED Pipedrive update on historical deal {deal_id} (<= {MIN_DEAL_ID}): {fields}")
         with get_db() as conn:
@@ -272,12 +285,14 @@ def pd_update_deal(deal_id, fields):
     return data["data"]
 
 def pd_move_stage(deal_id, stage_id):
+    """Move a deal to a different pipeline stage (subject to the same MIN_DEAL_ID gating as pd_update_deal)."""
     pd_update_deal(deal_id, {"stage_id": stage_id})
 
 # ---------------------------------------------------------------------------
 # DATE HELPERS
 # ---------------------------------------------------------------------------
 def parse_arrivy_date(date_str):
+    """Normalize an Arrivy ISO datetime string to a 'YYYY-MM-DD' date (timezone stripped for Python <3.11). Returns None on empty/unparseable input."""
     if not date_str:
         return None
     try:
@@ -288,6 +303,7 @@ def parse_arrivy_date(date_str):
         return None
 
 def dates_match(a, b):
+    """True if two Arrivy datetime strings resolve to the same calendar day (both must be non-empty and parseable)."""
     da = parse_arrivy_date(a) if a else None
     db = parse_arrivy_date(b) if b else None
     return bool(da and db and da == db)
@@ -296,6 +312,7 @@ def dates_match(a, b):
 # TASK HANDLERS
 # ---------------------------------------------------------------------------
 def handle_measure(conn, event_type, deal_id, task_id, object_date):
+    """Apply an Arrivy measure-task event to the deal: set/clear the measure_date field and advance/roll back the stage by event type. Returns a short action summary string."""
     date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED"):
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
@@ -317,6 +334,7 @@ def handle_measure(conn, event_type, deal_id, task_id, object_date):
         return "Moved to Measure Complete"
 
 def handle_inspection(conn, event_type, deal_id, task_id, object_date):
+    """Apply an Arrivy inspection-task event to the deal: set/clear the date (reuses the measure_date field) and move between scheduled/complete/rollback stages. Returns an action summary string."""
     date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED"):
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
@@ -339,9 +357,11 @@ def handle_inspection(conn, event_type, deal_id, task_id, object_date):
         return "Moved to Inspection Complete"
 
 def delete_task_state(conn, task_id):
+    """Hard-delete a task's tracked state row (used on TASK_DELETED)."""
     conn.execute("DELETE FROM task_state WHERE task_id=?", (task_id,))
 
 def handle_delivery(conn, event_type, deal_id, task_id, object_date):
+    """Apply an Arrivy delivery/pickup-task event to the deal: set/clear delivery_date or mark delivery_status complete. Returns an action summary string."""
     date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED"):
         pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: date})
@@ -361,6 +381,7 @@ def handle_delivery(conn, event_type, deal_id, task_id, object_date):
         return "Marked delivery complete"
 
 def recalc_install(conn, deal_id):
+    """Recompute a deal's two install date fields (and install_phase) from its active install tasks, earliest first. Rows with a cleared date are dropped; install_phase is only written, never cleared. Returns the ordered list of install dates."""
     rows = conn.execute(
         "SELECT task_date, install_phase FROM task_state WHERE deal_id=? AND task_type='install' AND status='active' AND archived=0 ORDER BY task_date",
         (deal_id,)
@@ -382,6 +403,47 @@ def recalc_install(conn, deal_id):
     pd_update_deal(deal_id, update)
     return dates
 
+# recalc_measure / recalc_delivery exist for one situation: a scheduler picks the
+# wrong Arrivy template, saves it, then corrects it and saves again. The first save
+# files the task under the wrong type (e.g. "measure") and pushes that type's date to
+# Pipedrive. When the corrected event re-files the task to its real type, the old
+# type's date field is now stale. Rather than blanking it, we recompute it from the
+# deal's OTHER tasks of that type that we already tracked from earlier webhooks —
+# restoring the legitimate date (or None if no such task remains).
+def recalc_measure(conn, deal_id):
+    """Recompute a deal's measure_date from its tracked measure tasks, choosing the most
+    recent non-cancelled one (latest task_date; completed tasks count). Returns that date,
+    or None if no measure task remains — used when a task's template is corrected away
+    from measure so the field reflects the real measure instead of the abandoned one."""
+    row = conn.execute(
+        "SELECT task_date FROM task_state "
+        "WHERE deal_id=? AND task_type='measure' AND status!='cancelled' "
+        "AND archived=0 AND task_date IS NOT NULL "
+        "ORDER BY task_date DESC LIMIT 1",
+        (deal_id,)
+    ).fetchone()
+    date = row["task_date"] if row else None
+    logger.info(f"recalc_measure: deal={deal_id} measure_date={date}")
+    pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
+    return date
+
+def recalc_delivery(conn, deal_id):
+    """Recompute a deal's delivery_date from its tracked delivery tasks, choosing the most
+    recent non-cancelled one (latest task_date; completed tasks count). Returns that date,
+    or None if no delivery task remains — the delivery-side mirror of recalc_measure, used
+    when a task's template is corrected away from delivery."""
+    row = conn.execute(
+        "SELECT task_date FROM task_state "
+        "WHERE deal_id=? AND task_type='delivery' AND status!='cancelled' "
+        "AND archived=0 AND task_date IS NOT NULL "
+        "ORDER BY task_date DESC LIMIT 1",
+        (deal_id,)
+    ).fetchone()
+    date = row["task_date"] if row else None
+    logger.info(f"recalc_delivery: deal={deal_id} delivery_date={date}")
+    pd_update_deal(deal_id, {PD_FIELDS["delivery_date"]: date})
+    return date
+
 def get_extra_field(extra_fields, name):
     """Return the value of a named field from OBJECT_TEMPLATE_EXTRA_FIELDS."""
     for field in (extra_fields or []):
@@ -390,6 +452,7 @@ def get_extra_field(extra_fields, name):
     return None
 
 def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields=None, template_id=None):
+    """Apply an Arrivy install/repair-task event to the deal: update task state, recalc install dates, and move to Install Complete or back to Ready to Schedule as appropriate. Repair tasks are always phase 'final'. Returns an action summary string."""
     date          = parse_arrivy_date(object_date)
     # Repair tasks have no phase option in Arrivy — always treat as "final".
     if template_id == REPAIR_TEMPLATE_ID:
@@ -435,6 +498,7 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
 # ---------------------------------------------------------------------------
 @app.before_request
 def restrict_dashboard_by_ip():
+    """before_request guard: redirect any non-allowlisted client IP away from dashboard endpoints (webhooks stay public)."""
     if request.endpoint in DASHBOARD_ENDPOINTS:
         # Use X-Forwarded-For if behind a reverse proxy (e.g. nginx), otherwise remote_addr
         client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip() or request.remote_addr
@@ -446,16 +510,20 @@ def restrict_dashboard_by_ip():
 # PIN AUTH
 # ---------------------------------------------------------------------------
 def login_required(f):
+    """Route decorator: redirect to the PIN page unless the session is authenticated."""
     @wraps(f)
     def decorated(*args, **kwargs):
+        """Wrapper: enforce authentication before calling the wrapped view."""
         if not session.get("authenticated"):
             return redirect(url_for("pin_page"))
         return f(*args, **kwargs)
     return decorated
 
 def admin_required(f):
+    """Route decorator: require an authenticated session with the 'admin' role (else redirect to PIN page or landing)."""
     @wraps(f)
     def decorated(*args, **kwargs):
+        """Wrapper: enforce authentication and the admin role before calling the wrapped view."""
         if not session.get("authenticated"):
             return redirect(url_for("pin_page"))
         if session.get("role") != "admin":
@@ -465,10 +533,12 @@ def admin_required(f):
 
 @app.route("/pin", methods=["GET"])
 def pin_page():
+    """Render the PIN entry screen."""
     return render_template("pin.html")
 
 @app.route("/pin/verify", methods=["POST"])
 def verify_pin():
+    """Validate a submitted PIN against the users table; on success set the session, log the access, and return the user's role."""
     data    = request.get_json(force=True)
     entered = data.get("pin", "")
     with get_db() as conn:
@@ -490,6 +560,7 @@ def verify_pin():
 @app.route("/pin/change", methods=["POST"])
 @login_required
 def change_pin():
+    """Change the logged-in user's PIN (must be 4 digits and not already in use by another user)."""
     data    = request.get_json(force=True)
     new_pin = data.get("pin", "")
     if not new_pin.isdigit() or len(new_pin) != 4:
@@ -506,6 +577,7 @@ def change_pin():
 
 @app.route("/logout")
 def logout():
+    """Clear the session and return to the PIN page."""
     session.clear()
     return redirect(url_for("pin_page"))
 
@@ -515,6 +587,7 @@ def logout():
 @app.route("/")
 @login_required
 def landing():
+    """Render the home/landing page with the user's name and admin flag."""
     return render_template(
         "landing.html",
         username=session.get("username", ""),
@@ -524,6 +597,7 @@ def landing():
 @app.route("/sync")
 @login_required
 def sync_dashboard():
+    """Render the sync dashboard with recent events, per-type counts, and active-task/total-event tallies."""
     with get_db() as conn:
         recent_events = conn.execute(
             """SELECT * FROM events WHERE archived = 0
@@ -550,6 +624,7 @@ def sync_dashboard():
 @app.route("/api/stats")
 @login_required
 def api_stats():
+    """JSON endpoint: total events, active task count, the 5 most recent events, and DB-disk usage for the dashboard widgets."""
     with get_db() as conn:
         total  = conn.execute("SELECT COUNT(*) as c FROM events WHERE archived=0").fetchone()["c"]
         active = conn.execute("SELECT COUNT(*) as c FROM task_state WHERE status='active' AND archived=0").fetchone()["c"]
@@ -577,7 +652,9 @@ def api_stats():
 @app.route("/api/stream")
 @login_required
 def api_stream():
+    """Server-Sent Events stream that pushes a 'refresh' to the dashboard whenever sse_notify() fires; sends a keepalive ping every 25s."""
     def generate():
+        """SSE generator: register a per-client queue and yield messages (or pings) until the client disconnects."""
         q = queue.Queue(maxsize=10)
         with _sse_clients_lock:
             _sse_clients.add(q)
@@ -598,6 +675,7 @@ def api_stream():
 @app.route("/api/logs")
 @login_required
 def api_logs():
+    """JSON endpoint: events filtered by optional from/to date range and limit, flattened into display-friendly rows for the logs page."""
     date_from = request.args.get("from", "")   # YYYY-MM-DD
     date_to   = request.args.get("to", "")     # YYYY-MM-DD
     clauses = []
@@ -645,16 +723,19 @@ def api_logs():
 @app.route("/logs")
 @login_required
 def logs():
+    """Render the event-logs page (data loaded client-side from /api/logs)."""
     return render_template("logs.html")
 
 @app.route("/users")
 @admin_required
 def users():
+    """Render the admin-only user management page."""
     return render_template("users.html", username=session.get("username", ""))
 
 @app.route("/api/users", methods=["GET", "POST"])
 @admin_required
 def api_users():
+    """Admin JSON endpoint: GET lists users; POST creates a user (requires username + unique 4-digit PIN, role admin/user)."""
     if request.method == "GET":
         with get_db() as conn:
             rows = conn.execute(
@@ -683,6 +764,7 @@ def api_users():
 @app.route("/api/users/<int:user_id>", methods=["DELETE"])
 @admin_required
 def api_user_delete(user_id):
+    """Admin JSON endpoint: delete a user. Refuses to delete admin accounts or the caller's own account."""
     with get_db() as conn:
         user = conn.execute("SELECT username, role FROM users WHERE id=?", (user_id,)).fetchone()
         if not user:
@@ -698,6 +780,7 @@ def api_user_delete(user_id):
 @app.route("/api/access-log")
 @admin_required
 def api_access_log():
+    """Admin JSON endpoint: most recent login records (capped at 1000)."""
     limit = min(int(request.args.get("limit", 100)), 1000)
     with get_db() as conn:
         rows = conn.execute(
@@ -709,6 +792,7 @@ def api_access_log():
 @app.route("/api/sync-all", methods=["POST"])
 @login_required
 def api_sync_all():
+    """Manual full resync: for every non-archived deal above MIN_DEAL_ID, push install/measure/delivery dates from local task_state back into Pipedrive. Returns synced count + per-deal errors."""
     synced = []
     errors = []
     with get_db() as conn:
@@ -738,11 +822,13 @@ def api_sync_all():
 @app.route("/settings")
 @login_required
 def settings_page():
+    """Render the device/kiosk settings page (auto-lock, screen sleep)."""
     return render_template("settings.html")
 
 @app.route("/api/settings", methods=["GET", "POST"])
 @login_required
 def api_settings():
+    """JSON endpoint: GET returns the kiosk settings (defaulting to '0'); POST persists any of the known SETTING_KEYS."""
     SETTING_KEYS = {"auto_lock_minutes", "screen_sleep_minutes"}
     if request.method == "GET":
         return jsonify({k: get_setting(k) or "0" for k in SETTING_KEYS})
@@ -757,6 +843,7 @@ def api_settings():
 # ---------------------------------------------------------------------------
 @app.route("/arrivy-webhook", methods=["POST"])
 def arrivy_webhook():
+    """Arrivy webhook entry point: normalize the event, map the template to a task type, dispatch to the matching handle_* function (only for deals above MIN_DEAL_ID), and log the event. Always returns 200 unless it errors."""
     try:
         payload = request.get_json(force=True)
         if not payload:
@@ -801,6 +888,9 @@ def arrivy_webhook():
             action = None
             if deal_id > MIN_DEAL_ID:
                 if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED") and task_type:
+                    # Capture what type this task was BEFORE the handler re-files it, so
+                    # we can detect a template correction (e.g. measure → install) below.
+                    prev = get_task_state(conn, task_id)
                     if task_type == "measure":
                         action = handle_measure(conn, event_type, deal_id, task_id, object_date)
                     elif task_type == "delivery":
@@ -809,6 +899,17 @@ def arrivy_webhook():
                         action = handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields, template_id)
                     elif task_type == "inspection":
                         action = handle_inspection(conn, event_type, deal_id, task_id, object_date)
+                    # Template was corrected in Arrivy: the task's type changed, so the
+                    # field its OLD type owned is now stale. Recompute it from the deal's
+                    # other tasks of that type (measure & inspection share measure_date).
+                    if prev and prev["task_type"] != task_type:
+                        old = prev["task_type"]
+                        if old in ("measure", "inspection"):
+                            recalc_measure(conn, deal_id)
+                        elif old == "delivery":
+                            recalc_delivery(conn, deal_id)
+                        elif old == "install":
+                            recalc_install(conn, deal_id)
                 else:
                     action = "Logged (no action needed)"
             else:
@@ -827,6 +928,7 @@ def arrivy_webhook():
 @app.route("/pipedrive-webhook/", methods=["POST"])
 @app.route("/pipedrive-webhook", methods=["POST"])
 def pipedrive_webhook():
+    """Pipedrive deal-update webhook: archive the deal when won/lost, or recalc install dates when it lands in the Install Scheduled stage. Ignores historical deals (id <= MIN_DEAL_ID)."""
     try:
         payload = request.get_json(force=True)
         if not payload:
@@ -856,6 +958,7 @@ def pipedrive_webhook():
 
 @app.route("/deploy", methods=["POST"])
 def deploy():
+    """GitHub push webhook: verify the HMAC-SHA256 signature, then git-pull and restart the service in a background thread."""
     try:
         secret    = GITHUB_WEBHOOK_SECRET.encode()
         signature = request.headers.get("X-Hub-Signature-256", "")
@@ -865,6 +968,7 @@ def deploy():
             return jsonify({"error": "unauthorized"}), 401
 
         def _restart():
+            """Pull the latest code and restart the systemd service (runs off-thread so the webhook can return immediately)."""
             subprocess.run(["git", "-C", REPO_PATH, "pull"], check=True)
             logger.info("Auto-deploy: pulled latest code, restarting service")
             subprocess.run(["sudo", "systemctl", "restart", SERVICE_NAME], check=True)
@@ -878,6 +982,7 @@ def deploy():
 
 @app.route("/health", methods=["GET"])
 def health():
+    """Liveness probe — always returns {"status": "ok"}."""
     return jsonify({"status": "ok"}), 200
 
 

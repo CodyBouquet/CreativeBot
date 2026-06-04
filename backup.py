@@ -21,6 +21,7 @@ BACKUP_DIR = os.environ.get("BACKUP_DIR", "/home/admin/CreativeBot/backups")
 KEEP_DAYS  = 30
 
 def run_backup():
+    """Copy sync.db to a dated file in BACKUP_DIR and prune backups older than KEEP_DAYS (30)."""
     db_path    = Path(DB_PATH)
     backup_dir = Path(BACKUP_DIR)
     backup_dir.mkdir(parents=True, exist_ok=True)

@@ -14,9 +14,11 @@ class ReportContext:
     `'data'` — to avoid collisions across modules.
     """
     def __init__(self):
+        """Start with an empty per-send-window cache."""
         self._cache: dict[str, Any] = {}
 
     def get_or_compute(self, key: str, fn: Callable[[], Any]) -> Any:
+        """Return the cached value for key, computing it via fn() and caching it on first access."""
         if key not in self._cache:
             self._cache[key] = fn()
         return self._cache[key]
