@@ -15,11 +15,17 @@ log = logging.getLogger(__name__)
 
 
 def build_section(user, ctx: ReportContext) -> str | None:
-    """Return the low-stock HTML table (same for every recipient), reusing the cached row pull; None if there are no low-stock items."""
+    """Return the reorder HTML table (same for every recipient), reusing the cached row pull; None when nothing needs ordering.
+
+    The pull evaluates every stocked SKU, but the email is action-focused: it
+    shows only SKUs at or below their reorder point (ORDER NOW). The full
+    stocked-universe audit lives in the .txt report, not the email.
+    """
     rows = ctx.get_or_compute("inventory.lowstock_rows", _pull_rows)
-    if not rows:
+    order_rows = [r for r in rows if r.get("order_now")]
+    if not order_rows:
         return None
-    return _render_html(rows)
+    return _render_html(order_rows)
 
 
 def _pull_rows() -> list[dict]:
@@ -38,8 +44,13 @@ def _pull_rows() -> list[dict]:
     except Exception:
         log.exception("inventory_email.build_report() failed")
         return []
-    # Match the .txt file's sort order: largest current safety stock first.
-    rows.sort(key=lambda r: (-r.get("safety_cur", 0), r.get("seq", "")))
+    # Match the .txt file's sort order: ORDER NOW first, then deepest below the
+    # reorder point, then by sequence.
+    rows.sort(key=lambda r: (
+        not r.get("order_now"),
+        r.get("inv_pos", 0) - r.get("rec_rop", 0),
+        r.get("seq", ""),
+    ))
     return rows
 
 
@@ -53,16 +64,16 @@ def _render_html(rows: list[dict]) -> str:
 
     head = (
         f'<p style="font-size:13px; color:#555; margin: 4px 0 12px;">'
-        f'{len(rows)} item(s) below safety stock.</p>'
+        f'{len(rows)} stocked SKU(s) at or below reorder point — order now.</p>'
         f'<table style="border-collapse:collapse; width:100%; font-size:13px;">'
         f'<thead><tr>'
         f'<th style="{th_style}">Style / Color</th>'
         f'<th style="{th_style}">Vendor</th>'
         f'<th style="{thr_style}">LT</th>'
         f'<th style="{thr_style}">On Hand</th>'
-        f'<th style="{thr_style}">Avail</th>'
+        f'<th style="{thr_style}">Inv Pos</th>'
         f'<th style="{thr_style}">Safety (Cur → Rec)</th>'
-        f'<th style="{thr_style}">Reorder Qty</th>'
+        f'<th style="{thr_style}">Order Qty</th>'
         f'</tr></thead><tbody>'
     )
 
@@ -79,7 +90,7 @@ def _render_html(rows: list[dict]) -> str:
             f'<td style="{td_style}">{r.get("vendor", "") or "—"}</td>'
             f'<td style="{tdr_style}">{int(r.get("lead_time", 0))}</td>'
             f'<td style="{tdr_style}">{r.get("on_hand", 0):.0f}</td>'
-            f'<td style="{tdr_style}">{r.get("avail", 0):.0f}</td>'
+            f'<td style="{tdr_style}">{r.get("inv_pos", 0):.0f}</td>'
             f'<td style="{tdr_style}">{r.get("safety_cur", 0):.0f} → '
             f'<strong>{r.get("rec_safety", 0):.0f}</strong></td>'
             f'<td style="{tdr_style}"><strong>{r.get("rec_qty", 0):.0f}</strong></td>'
