@@ -506,6 +506,7 @@ def build_report():
             "sold_1yr":     0.0,
             "busy_month":   0.0,                                       # policy anchor
             "box_qty":      _f(u.get("box")) or 1.0,                   # CAT_UNIT_PER_BOX
+            "prodcode":     str(u.get("prodcode", "")).strip(),        # product type (PAD = "18")
             "style":        str(u.get("style", "")).strip(),
             "color":        str(u.get("color", "")).strip(),
         }
@@ -549,6 +550,11 @@ def build_report():
                     items[seq]["style"] = st
                 if co:
                     items[seq]["color"] = co
+                # Live product type — fallback when the cache predates the
+                # CAT_PRODCODE field (used to flag PAD items for a tighter cap).
+                pc = (data[0].get("PRODCODE") or "").strip()
+                if pc:
+                    items[seq]["prodcode"] = pc
 
     # --- ON_PO from open /purchaseorderlines records
     for p in po_lines:
@@ -646,11 +652,15 @@ def build_report():
         r["daily_demand"] = r["sold_1yr"] / float(cfg.DEMAND_WINDOW_DAYS)
         box = r["box_qty"]
 
-        # Effective busy month: the raw peak, but capped at SAFETY_CAP_MONTHS of
-        # average demand so a single one-off project month can't inflate the
-        # numbers. (We can restock in ~1–2 weeks, so hoarding a freak peak isn't
-        # warranted.) This capped value drives safety, reorder and order-up-to.
-        cap = r["sold_1yr"] * (cfg.SAFETY_CAP_MONTHS / 12.0)
+        # Effective busy month: the raw peak, but capped at N months of average
+        # demand so a single one-off project month can't inflate the numbers.
+        # (We can restock in ~1–2 weeks, so hoarding a freak peak isn't warranted.)
+        # PAD items get a tighter cap because they eat warehouse space. This capped
+        # value drives safety, reorder and order-up-to.
+        cap_months = (cfg.PAD_SAFETY_CAP_MONTHS
+                      if r["prodcode"] == cfg.PAD_PRODCODE
+                      else cfg.SAFETY_CAP_MONTHS)
+        cap = r["sold_1yr"] * (cap_months / 12.0)
         busy_eff = min(r["busy_month"], cap) if cap > 0 else r["busy_month"]
         r["busy_eff"] = busy_eff
 
@@ -708,7 +718,8 @@ def write_report(rows, path):
             "demand (SOLD_1YR/12) to damp one-off spikes; safety = capped busy_month; "
             f"reorder = +daily_demand×lead_time (assumes {cfg.ASSUMED_LEAD_TIME_DAYS}d, 7–14d window); "
             "order-up-to = 2×capped; ORDER NOW when on_hand+on_po−backorder ≤ reorder; "
-            "recs rounded up to BOX multiples\n"
+            f"PAD items (prodcode {cfg.PAD_PRODCODE}) use a tighter {cfg.PAD_SAFETY_CAP_MONTHS:g}-month cap "
+            "(big footprint); recs rounded up to BOX multiples\n"
         )
         w.write("=" * len(hdr) + "\n" + hdr + "\n" + "-" * len(hdr) + "\n")
         for r in rows:

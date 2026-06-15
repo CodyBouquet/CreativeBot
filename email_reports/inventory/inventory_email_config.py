@@ -31,6 +31,13 @@ DEMAND_WINDOW_DAYS = 365
 # ability — no need to hoard a freak peak you can replenish quickly.
 SAFETY_CAP_MONTHS = 1.0
 
+# PAD items (carpet padding/cushion, BMS PRODCODE "18") take a large warehouse
+# footprint, so they get a TIGHTER cap than everything else — hold less, lean
+# harder on the ~1–2 week restock. Identified by product code from the catalog
+# cache (CAT_PRODCODE) with /productstock PRODCODE as a live fallback.
+PAD_PRODCODE = "18"
+PAD_SAFETY_CAP_MONTHS = 0.5
+
 # Lower bound on order history we pull for UNASSIGN / PEAK_WK / bulk orderline
 ORDER_HISTORY_FLOOR = "20240101"
 

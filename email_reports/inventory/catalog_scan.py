@@ -102,8 +102,9 @@ def _extract_stocked(rows, items):
         items[seq] = {
             "safety":  ie._f(it.get("CAT_SAFTYSTK")),    # current safety threshold
             "reorder": ie._f(it.get("CAT_REORDER")),     # current reorder point
-            "vendor":  str(it.get("CAT_VENDORID", "")).strip(),
-            "box":     ie._f(it.get("CAT_UNIT_PER_BOX")) or 1.0,
+            "vendor":   str(it.get("CAT_VENDORID", "")).strip(),
+            "prodcode": str(it.get("CAT_PRODCODE", "")).strip(),  # product type (PAD = "18")
+            "box":      ie._f(it.get("CAT_UNIT_PER_BOX")) or 1.0,
             "style":   str(it.get("CAT_STYLE", "")).strip(),
             "stynum":  str(it.get("CAT_STYNUM", "")).strip(),   # vendor style number
             "color":   str(it.get("CAT_COLOR", "")).strip(),
