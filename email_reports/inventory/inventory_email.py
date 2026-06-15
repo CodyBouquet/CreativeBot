@@ -647,28 +647,32 @@ def build_report():
     #     suggested qty = top back up to order-up-to, rounded up to a full box
     # All stock figures are rounded UP to multiples of CAT_UNIT_PER_BOX.
     for r in items.values():
-        # Flat lead-time assumption (7–14 day window, midpoint) for every SKU.
-        lt_days = cfg.ASSUMED_LEAD_TIME_DAYS
         r["daily_demand"] = r["sold_1yr"] / float(cfg.DEMAND_WINDOW_DAYS)
         box = r["box_qty"]
 
-        # Effective busy month: the raw peak, but capped at N months of average
-        # demand so a single one-off project month can't inflate the numbers.
-        # (We can restock in ~1–2 weeks, so hoarding a freak peak isn't warranted.)
-        # PAD items get a tighter cap because they eat warehouse space. This capped
-        # value drives safety, reorder and order-up-to.
-        cap_months = (cfg.PAD_SAFETY_CAP_MONTHS
-                      if r["prodcode"] == cfg.PAD_PRODCODE
-                      else cfg.SAFETY_CAP_MONTHS)
-        cap = r["sold_1yr"] * (cap_months / 12.0)
-        busy_eff = min(r["busy_month"], cap) if cap > 0 else r["busy_month"]
-        r["busy_eff"] = busy_eff
-
-        # Safety is one (capped) busy month; the reorder point adds the demand we
-        # expect to ship while a replenishment PO is in transit; order-up-to is two.
-        r["rec_safety"]  = _ceil_to_box(busy_eff, box)
-        r["rec_rop"]     = _ceil_to_box(busy_eff + r["daily_demand"] * lt_days, box)
-        r["order_up_to"] = _ceil_to_box(2.0 * busy_eff, box)
+        if r["prodcode"] == cfg.PAD_PRODCODE:
+            # PAD: bulky and delivered on a ~weekly truck, so size to a flat
+            # days-of-supply target tied to that cadence rather than the busy
+            # month. Footprint is the binding constraint; we restock weekly.
+            dd = r["daily_demand"]
+            r["busy_eff"]    = 0.0  # busy-month basis not used for pad
+            r["rec_safety"]  = _ceil_to_box(dd * cfg.PAD_SAFETY_DAYS, box)
+            r["rec_rop"]     = _ceil_to_box(dd * cfg.PAD_REORDER_DAYS, box)
+            r["order_up_to"] = _ceil_to_box(dd * cfg.PAD_ORDER_UP_TO_DAYS, box)
+        else:
+            # Everything else: effective busy month = the raw peak capped at N
+            # months of average demand so a single one-off project month can't
+            # inflate the numbers. (We can restock in ~1–2 weeks, so hoarding a
+            # freak peak isn't warranted.) Drives safety/reorder/order-up-to.
+            lt_days = cfg.ASSUMED_LEAD_TIME_DAYS  # flat 7–14d window, midpoint
+            cap = r["sold_1yr"] * (cfg.SAFETY_CAP_MONTHS / 12.0)
+            busy_eff = min(r["busy_month"], cap) if cap > 0 else r["busy_month"]
+            r["busy_eff"]    = busy_eff
+            # Safety is one (capped) busy month; reorder adds lead-time demand;
+            # order-up-to is two busy months.
+            r["rec_safety"]  = _ceil_to_box(busy_eff, box)
+            r["rec_rop"]     = _ceil_to_box(busy_eff + r["daily_demand"] * lt_days, box)
+            r["order_up_to"] = _ceil_to_box(2.0 * busy_eff, box)
 
         # Inventory position nets incoming POs in and unfilled backorders out, so
         # the trigger reflects our true committed position — not just on-hand.
@@ -718,8 +722,10 @@ def write_report(rows, path):
             "demand (SOLD_1YR/12) to damp one-off spikes; safety = capped busy_month; "
             f"reorder = +daily_demand×lead_time (assumes {cfg.ASSUMED_LEAD_TIME_DAYS}d, 7–14d window); "
             "order-up-to = 2×capped; ORDER NOW when on_hand+on_po−backorder ≤ reorder; "
-            f"PAD items (prodcode {cfg.PAD_PRODCODE}) use a tighter {cfg.PAD_SAFETY_CAP_MONTHS:g}-month cap "
-            "(big footprint); recs rounded up to BOX multiples\n"
+            f"PAD items (prodcode {cfg.PAD_PRODCODE}) sized to days-of-supply instead "
+            f"(safety {cfg.PAD_SAFETY_DAYS}d / reorder {cfg.PAD_REORDER_DAYS}d / "
+            f"up-to {cfg.PAD_ORDER_UP_TO_DAYS}d of avg demand — big footprint, weekly truck); "
+            "recs rounded up to BOX multiples\n"
         )
         w.write("=" * len(hdr) + "\n" + hdr + "\n" + "-" * len(hdr) + "\n")
         for r in rows:

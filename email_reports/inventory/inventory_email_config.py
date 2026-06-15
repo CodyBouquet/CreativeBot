@@ -32,11 +32,16 @@ DEMAND_WINDOW_DAYS = 365
 SAFETY_CAP_MONTHS = 1.0
 
 # PAD items (carpet padding/cushion, BMS PRODCODE "18") take a large warehouse
-# footprint, so they get a TIGHTER cap than everything else — hold less, lean
-# harder on the ~1–2 week restock. Identified by product code from the catalog
-# cache (CAT_PRODCODE) with /productstock PRODCODE as a live fallback.
+# footprint AND arrive on a ~weekly truck, so the busy-month model is the wrong
+# basis entirely. Instead size them to a days-of-supply target keyed to that
+# delivery cadence: keep ~2 weeks max, reorder when ~12 days remain, safety floor
+# ~1 week. All three are daily_demand (SOLD_1YR/365) × the day count, ceil to box.
+# Identified by product code from the catalog cache (CAT_PRODCODE) with
+# /productstock PRODCODE as a live fallback.
 PAD_PRODCODE = "18"
-PAD_SAFETY_CAP_MONTHS = 0.5
+PAD_SAFETY_DAYS = 7       # safety floor (days of avg demand)
+PAD_REORDER_DAYS = 12     # ORDER NOW when inventory position drops to this many days
+PAD_ORDER_UP_TO_DAYS = 14 # replenish target / max held (~2 weeks, one+ truck cycle)
 
 # Lower bound on order history we pull for UNASSIGN / PEAK_WK / bulk orderline
 ORDER_HISTORY_FLOOR = "20240101"
