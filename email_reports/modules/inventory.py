@@ -55,7 +55,7 @@ def _pull_rows() -> list[dict]:
 
 
 def _render_html(rows: list[dict]) -> str:
-    """Compact 7-column table — readable on phones and laptops."""
+    """Compact 6-column table — readable on phones and laptops."""
     th_style  = "text-align:left; padding:6px 10px; border-bottom:1px solid #c8c8c8; font-size:11px; letter-spacing:1px; color:#555;"
     thr_style = "text-align:right; padding:6px 10px; border-bottom:1px solid #c8c8c8; font-size:11px; letter-spacing:1px; color:#555;"
     td_style  = "padding:5px 10px; border-bottom:1px solid #eee;"
@@ -69,7 +69,6 @@ def _render_html(rows: list[dict]) -> str:
         f'<thead><tr>'
         f'<th style="{th_style}">Style / Color</th>'
         f'<th style="{th_style}">Vendor</th>'
-        f'<th style="{thr_style}">LT</th>'
         f'<th style="{thr_style}">On Hand</th>'
         f'<th style="{thr_style}">Inv Pos</th>'
         f'<th style="{thr_style}">Safety (Cur → Rec)</th>'
@@ -88,7 +87,6 @@ def _render_html(rows: list[dict]) -> str:
             f'<td style="{td_style}">{style_color}'
             f'<div style="{seq_style}">{seq}</div></td>'
             f'<td style="{td_style}">{r.get("vendor", "") or "—"}</td>'
-            f'<td style="{tdr_style}">{int(r.get("lead_time", 0))}</td>'
             f'<td style="{tdr_style}">{r.get("on_hand", 0):.0f}</td>'
             f'<td style="{tdr_style}">{r.get("inv_pos", 0):.0f}</td>'
             f'<td style="{tdr_style}">{r.get("safety_cur", 0):.0f} → '

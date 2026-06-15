@@ -15,48 +15,21 @@ BMS_COMPANY = "99"
 #   95% fill = 1.65   97% fill = 1.88   99% fill = 2.33
 SERVICE_LEVEL_Z = 1.88
 
-# Lead time per vendor (days from PO placed to available on shelf).
-# Keys match the VENDOR field returned by /purchaseorderlines.
-# Pre-populated from your PO history — just edit the day values.
-# Anything not listed uses DEFAULT_LEAD_TIME_DAYS.
-VENDOR_LEAD_TIMES = {
-    "ALLSURF":  7,    # most PO history is special orders; stocking items ship ~1 week
-    "ALTRO":    14,
-    "DALTILE":  14,
-    "DDCC":     14,
-    "DIXIE":    14,
-    "DREAM":    14,
-    "FABRICA":  14,
-    "FIRSTGRA": 14,
-    "FLORSTAR": 14,
-    "GLASSTIL": 14,
-    "HAPPY":    14,
-    "HAPPYFEE": 14,
-    "HERREGAN": 14,
-    "HOME":     14,
-    "INTERFAC": 14,
-    "JAEDIS":   14,
-    "JUNCKERS": 14,
-    "KANE":     14,
-    "KARNDEAN": 14,
-    "MASLAND":  14,
-    "MIRAGE":   14,
-    "MOHAWK":   14,
-    "MSI":      14,
-    "NOURISON": 14,
-    "PHOENTIL": 14,
-    "PREVERCO": 14,
-    "ROCA":     14,
-    "SHAW":     14,
-    "STANTON":  14,
-    "SURYA":    14,
-    "VERSATRI": 14,
-    "VIRGINIA": 14,
-}
-DEFAULT_LEAD_TIME_DAYS = 14
+# Lead time assumption (days from PO placed to available on shelf). Stocking
+# items run ~1–2 weeks regardless of vendor, so we assume a flat 7–14 day window
+# and use its midpoint in the reorder-point math rather than tracking per-vendor
+# times. Bump this if deliveries trend slower.
+ASSUMED_LEAD_TIME_DAYS = 10
 
-# Trailing window for SOLD_1YR, weekly sigma, PEAK_WK
+# Trailing window for SOLD_1YR and the busy-month figure.
 DEMAND_WINDOW_DAYS = 365
+
+# Safety-stock cap. The raw busy_month (peak rolling-30-day shipped qty) can be
+# blown up by a single one-off project, so we cap the *effective* busy month used
+# for safety / reorder / order-up-to at this many months of AVERAGE demand
+# (SOLD_1YR / 12 × SAFETY_CAP_MONTHS). One month aligns with the ~1–2 week restock
+# ability — no need to hoard a freak peak you can replenish quickly.
+SAFETY_CAP_MONTHS = 1.0
 
 # Lower bound on order history we pull for UNASSIGN / PEAK_WK / bulk orderline
 ORDER_HISTORY_FLOOR = "20240101"

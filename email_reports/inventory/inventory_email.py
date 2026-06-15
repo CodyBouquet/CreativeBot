@@ -9,17 +9,17 @@ that cache is missing/stale.
 
 Reorder policy (per SKU), all stock figures rounded up to CAT_UNIT_PER_BOX:
     busy_month   = peak rolling-30-day shipped qty over the trailing window
-    safety       = busy_month                       # keep one busy month on hand
-    reorder      = busy_month + daily_demand × lead_time
-    order_up_to  = 2 × busy_month
+    busy_eff     = min(busy_month, SOLD_1YR/12 × SAFETY_CAP_MONTHS)   # cap one-off spikes
+    safety       = busy_eff                          # keep one (capped) busy month
+    reorder      = busy_eff + daily_demand × lead_time   # lead_time = flat 7–14d assumption
+    order_up_to  = 2 × busy_eff
     inv_position = on_hand + on_po − backorders(unassign)
     ORDER NOW    when inv_position ≤ reorder
     suggested    = ceil_to_box(max(0, order_up_to − inv_position))
 
 Columns (.txt full audit):
     SEQUENCE   CAT_SEQUENCE
-    VENDOR     PO-history vendor, else catalog CAT_VENDORID (drives lead time)
-    LT         lead time in days, from inventory_email_config.VENDOR_LEAD_TIMES
+    VENDOR     PO-history vendor, else catalog CAT_VENDORID
     ON_HAND    sum of current rolls (/productstock ONHAND_FLOAT)
     UNASN      open-order demand not yet allocated to rolls (= backorders)
     ON_PO      open PO QTYORD minus QTYREC
@@ -28,7 +28,8 @@ Columns (.txt full audit):
     BUSY_MO    peak rolling-30-day shipped qty (the policy anchor)
     BOX        CAT_UNIT_PER_BOX — round recommendations up to multiples of this
     SAF_CUR    current safety stock (catalog CAT_SAFTYSTK, or /lowstock fallback)
-    SAF_REC    recommended safety = busy_month, ceil to box
+    SAF_REC    recommended safety = busy_eff (busy_month capped at
+               SAFETY_CAP_MONTHS months of avg demand), ceil to box
     ROP_REC    recommended reorder = busy_month + daily_demand × lead_time, ceil to box
     UPTO       order-up-to level = 2 × busy_month, ceil to box
     QTY_REC    suggested order = max(0, UPTO − INV_POS), ceil to box
@@ -480,10 +481,10 @@ def build_report():
 
     target = set(universe.keys())
 
-    # Best-effort vendor map from /purchaseorderlines. Its VENDOR codes match the
-    # VENDOR_LEAD_TIMES table, so it is the PRIMARY lead-time vendor key; the
-    # catalog's CAT_VENDORID (same code space) is the fallback when a SKU has no
-    # PO history.
+    # Best-effort vendor map from /purchaseorderlines, used for the VENDOR display
+    # column. Prefer the PO-history vendor; fall back to the catalog's CAT_VENDORID
+    # when a SKU has no PO history. (Lead time is now a flat assumption, so vendor
+    # no longer drives the math.)
     vendor_by_seq = {}
     for p in po_lines:
         seq = str(p.get("CATSEQUENCE", "")).strip()
@@ -640,18 +641,24 @@ def build_report():
     #     suggested qty = top back up to order-up-to, rounded up to a full box
     # All stock figures are rounded UP to multiples of CAT_UNIT_PER_BOX.
     for r in items.values():
-        # Lead time keys off the vendor code; unknown vendors use the default.
-        lt_days = cfg.VENDOR_LEAD_TIMES.get(r["vendor"], cfg.DEFAULT_LEAD_TIME_DAYS)
-        r["lead_time"]    = lt_days
+        # Flat lead-time assumption (7–14 day window, midpoint) for every SKU.
+        lt_days = cfg.ASSUMED_LEAD_TIME_DAYS
         r["daily_demand"] = r["sold_1yr"] / float(cfg.DEMAND_WINDOW_DAYS)
-        box  = r["box_qty"]
-        busy = r["busy_month"]
+        box = r["box_qty"]
 
-        # Safety is a full busy month; the reorder point adds the demand we expect
-        # to ship while a replenishment PO is in transit; order-up-to is two months.
-        r["rec_safety"]  = _ceil_to_box(busy, box)
-        r["rec_rop"]     = _ceil_to_box(busy + r["daily_demand"] * lt_days, box)
-        r["order_up_to"] = _ceil_to_box(2.0 * busy, box)
+        # Effective busy month: the raw peak, but capped at SAFETY_CAP_MONTHS of
+        # average demand so a single one-off project month can't inflate the
+        # numbers. (We can restock in ~1–2 weeks, so hoarding a freak peak isn't
+        # warranted.) This capped value drives safety, reorder and order-up-to.
+        cap = r["sold_1yr"] * (cfg.SAFETY_CAP_MONTHS / 12.0)
+        busy_eff = min(r["busy_month"], cap) if cap > 0 else r["busy_month"]
+        r["busy_eff"] = busy_eff
+
+        # Safety is one (capped) busy month; the reorder point adds the demand we
+        # expect to ship while a replenishment PO is in transit; order-up-to is two.
+        r["rec_safety"]  = _ceil_to_box(busy_eff, box)
+        r["rec_rop"]     = _ceil_to_box(busy_eff + r["daily_demand"] * lt_days, box)
+        r["order_up_to"] = _ceil_to_box(2.0 * busy_eff, box)
 
         # Inventory position nets incoming POs in and unfilled backorders out, so
         # the trigger reflects our true committed position — not just on-hand.
@@ -684,7 +691,7 @@ def write_report(rows, path):
     mv = max((len(r["vendor"]) for r in rows), default=6)
     order_now_count = sum(1 for r in rows if r["order_now"])
     hdr = (
-        f"{'SEQUENCE':<14} {'VENDOR':<{mv}} {'LT':>4} "
+        f"{'SEQUENCE':<14} {'VENDOR':<{mv}} "
         f"{'ON_HAND':>8} {'UNASN':>8} {'ON_PO':>8} {'INV_POS':>8} "
         f"{'SOLD_1YR':>9} {'BUSY_MO':>8} "
         f"{'BOX':>5} {'SAF_CUR':>8} {'SAF_REC':>8} {'ROP_REC':>8} {'UPTO':>8} {'QTY_REC':>8} "
@@ -696,15 +703,17 @@ def write_report(rows, path):
             f"{order_now_count} to order now\n"
         )
         w.write(
-            "Busy-month policy: safety = peak rolling-30-day shipped qty (trailing "
-            f"{cfg.DEMAND_WINDOW_DAYS}d); reorder = busy_month + daily_demand×lead_time; "
-            "order-up-to = 2×busy_month; ORDER NOW when on_hand+on_po−backorder ≤ reorder; "
+            "Busy-month policy: busy_month = peak rolling-30-day shipped qty (trailing "
+            f"{cfg.DEMAND_WINDOW_DAYS}d), capped at {cfg.SAFETY_CAP_MONTHS:g} month(s) of avg "
+            "demand (SOLD_1YR/12) to damp one-off spikes; safety = capped busy_month; "
+            f"reorder = +daily_demand×lead_time (assumes {cfg.ASSUMED_LEAD_TIME_DAYS}d, 7–14d window); "
+            "order-up-to = 2×capped; ORDER NOW when on_hand+on_po−backorder ≤ reorder; "
             "recs rounded up to BOX multiples\n"
         )
         w.write("=" * len(hdr) + "\n" + hdr + "\n" + "-" * len(hdr) + "\n")
         for r in rows:
             w.write(
-                f"{r['seq']:<14} {r['vendor']:<{mv}} {r['lead_time']:>4} "
+                f"{r['seq']:<14} {r['vendor']:<{mv}} "
                 f"{r['on_hand']:>8.2f} {r['unassign']:>8.2f} {r['on_po']:>8.2f} {r['inv_pos']:>8.2f} "
                 f"{r['sold_1yr']:>9.2f} {r['busy_month']:>8.2f} "
                 f"{r['box_qty']:>5.0f} {r['safety_cur']:>8.2f} {r['rec_safety']:>8.2f} {r['rec_rop']:>8.2f} {r['order_up_to']:>8.2f} {r['rec_qty']:>8.2f} "
