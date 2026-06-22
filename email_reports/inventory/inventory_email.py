@@ -1,5 +1,5 @@
 """
-BMS stocked-SKU reorder report (busy-month policy).
+BMS stocked-SKU reorder report (days-of-supply policy).
 
 Pulls demand + supply data from the Rollmaster (Broadlume BMS) API and evaluates
 EVERY stocked SKU (CAT_SAFTYSTK > 0), not just the ones currently below safety —
@@ -8,14 +8,17 @@ catalog_scan.py cache (cfg.STOCKED_CATALOG_CACHE), falling back to /lowstock whe
 that cache is missing/stale.
 
 Reorder policy (per SKU), all stock figures rounded up to CAT_UNIT_PER_BOX:
-    busy_month   = peak rolling-30-day shipped qty over the trailing window
-    busy_eff     = min(busy_month, SOLD_1YR/12 × SAFETY_CAP_MONTHS)   # cap one-off spikes
-    safety       = busy_eff                          # keep one (capped) busy month
-    reorder      = busy_eff + daily_demand × lead_time   # lead_time = flat 7–14d assumption
-    order_up_to  = 2 × busy_eff
+    daily_demand = SOLD_1YR / DEMAND_WINDOW_DAYS          # average daily shipped
+    safety       = daily_demand × safety_days             # days of supply on hand
+    reorder      = daily_demand × reorder_days
+    order_up_to  = daily_demand × order_up_to_days
     inv_position = on_hand + on_po − backorders(unassign)
     ORDER NOW    when inv_position ≤ reorder
     suggested    = ceil_to_box(max(0, order_up_to − inv_position))
+
+    Day counts: general items use GENERAL_*_DAYS (7 / 21 / 35); pad items use the
+    tighter PAD_*_DAYS (7 / 12 / 14) and are then squeezed by the shared roll cap
+    (PAD_TOTAL_ROLL_CAPACITY) so the combined pad footprint fits the warehouse.
 
 Columns (.txt full audit):
     SEQUENCE   CAT_SEQUENCE
@@ -25,13 +28,13 @@ Columns (.txt full audit):
     ON_PO      open PO QTYORD minus QTYREC
     INV_POS    inventory position = ON_HAND + ON_PO − UNASN
     SOLD_1YR   sum of IVL_SQUAN on invoices dated within DEMAND_WINDOW_DAYS
-    BUSY_MO    peak rolling-30-day shipped qty (the policy anchor)
+    BUSY_MO    peak rolling-30-day shipped qty (context only; not the policy basis)
     BOX        CAT_UNIT_PER_BOX — round recommendations up to multiples of this
     SAF_CUR    current safety stock (catalog CAT_SAFTYSTK, or /lowstock fallback)
-    SAF_REC    recommended safety = busy_eff (busy_month capped at
-               SAFETY_CAP_MONTHS months of avg demand), ceil to box
-    ROP_REC    recommended reorder = busy_month + daily_demand × lead_time, ceil to box
-    UPTO       order-up-to level = 2 × busy_month, ceil to box
+    SAF_REC    recommended safety = daily_demand × safety_days, ceil to box
+    ROP_CUR    current reorder point (catalog CAT_REORDER; often 0/unset)
+    ROP_REC    recommended reorder = daily_demand × reorder_days, ceil to box
+    UPTO       order-up-to = daily_demand × order_up_to_days, ceil to box
     QTY_REC    suggested order = max(0, UPTO − INV_POS), ceil to box
     ORDER      "YES" when INV_POS ≤ ROP_REC
 
@@ -544,7 +547,7 @@ def build_report():
             "unassign":     0.0,                                       # = backorders
             "on_po":        0.0,
             "sold_1yr":     0.0,
-            "busy_month":   0.0,                                       # policy anchor
+            "busy_month":   0.0,                                       # peak 30-day demand (context only)
             "box_qty":      _f(u.get("box")) or 1.0,                   # CAT_UNIT_PER_BOX
             "prodcode":     str(u.get("prodcode", "")).strip(),        # product type (PAD = "18")
             "roll_sy":      _f(u.get("roll_sy")),                      # scraped SY/roll (0 if unknown)
@@ -686,55 +689,43 @@ def build_report():
         items[seq]["busy_month"] = _rolling_30day_max(ev)
     print(f"[{time.time()-t0:5.1f}s] invoicelines walked, busy_month computed", file=sys.stderr)
 
-    # --- Reorder policy (busy-month model). For every stocked SKU:
-    #     safety        = one busy month on hand
-    #     reorder point = busy month + demand expected during the lead time
-    #     order-up-to   = two busy months
+    # --- Reorder policy (days-of-supply on average demand). For every stocked SKU:
+    #     safety        = N days of average demand on hand
+    #     reorder point = M days of average demand (M > N)
+    #     order-up-to   = K days of average demand (K > M)
     #     inv position  = what we effectively have: on_hand + on_po − backorders
     #     ORDER NOW     when inventory position has fallen to/below the reorder point
     #     suggested qty = top back up to order-up-to, rounded up to a full box
+    # Pad uses its own day counts (PAD_*_DAYS) and is then squeezed by the shared
+    # roll-capacity cap; everything else uses the general counts (GENERAL_*_DAYS).
     # All stock figures are rounded UP to multiples of CAT_UNIT_PER_BOX.
     for r in items.values():
         r["daily_demand"] = r["sold_1yr"] / float(cfg.DEMAND_WINDOW_DAYS)
+        dd  = r["daily_demand"]
         box = r["box_qty"]
 
         if _is_pad(r):
-            # PAD: bulky and delivered on a ~weekly truck, so size to a flat
-            # days-of-supply target tied to that cadence rather than the busy
-            # month. Footprint is the binding constraint; we restock weekly.
-            # These are the per-SKU *desired* levels; the shared-capacity cap
-            # below may scale them down so the pad total fits the warehouse.
-            dd = r["daily_demand"]
-            r["busy_eff"]    = 0.0  # busy-month basis not used for pad
-            r["rec_safety"]  = _ceil_to_box(dd * cfg.PAD_SAFETY_DAYS, box)
-            r["rec_rop"]     = _ceil_to_box(dd * cfg.PAD_REORDER_DAYS, box)
-            r["order_up_to"] = _ceil_to_box(dd * cfg.PAD_ORDER_UP_TO_DAYS, box)
+            # PAD: bulky and delivered on a ~weekly truck, so its day counts are
+            # kept tight (footprint is the binding constraint, restocked weekly).
+            # The physical roll cap (applied after triggers) further limits how much
+            # can actually be ordered on top of what's already on hand + on PO.
+            safety_days, reorder_days, upto_days = (
+                cfg.PAD_SAFETY_DAYS, cfg.PAD_REORDER_DAYS, cfg.PAD_ORDER_UP_TO_DAYS)
         else:
-            # Everything else: effective busy month = the raw peak capped at N
-            # months of average demand so a single one-off project month can't
-            # inflate the numbers. (We can restock in ~1–2 weeks, so hoarding a
-            # freak peak isn't warranted.) Drives safety/reorder/order-up-to.
-            lt_days = cfg.ASSUMED_LEAD_TIME_DAYS  # flat 7–14d window, midpoint
-            cap = r["sold_1yr"] * (cfg.SAFETY_CAP_MONTHS / 12.0)
-            busy_eff = min(r["busy_month"], cap) if cap > 0 else r["busy_month"]
-            r["busy_eff"]    = busy_eff
-            # Safety is one (capped) busy month; reorder adds lead-time demand;
-            # order-up-to is two busy months.
-            r["rec_safety"]  = _ceil_to_box(busy_eff, box)
-            r["rec_rop"]     = _ceil_to_box(busy_eff + r["daily_demand"] * lt_days, box)
-            r["order_up_to"] = _ceil_to_box(2.0 * busy_eff, box)
+            # Everything else: general days-of-supply policy.
+            safety_days, reorder_days, upto_days = (
+                cfg.GENERAL_SAFETY_DAYS, cfg.GENERAL_REORDER_DAYS, cfg.GENERAL_ORDER_UP_TO_DAYS)
+
+        r["rec_safety"]  = _ceil_to_box(dd * safety_days, box)
+        r["rec_rop"]     = _ceil_to_box(dd * reorder_days, box)
+        r["order_up_to"] = _ceil_to_box(dd * upto_days, box)
 
         # Inventory position nets incoming POs in and unfilled backorders out, so
         # the trigger reflects our true committed position — not just on-hand.
         # (Independent of the targets, so it's safe to set before the pad cap.)
         r["inv_pos"] = r["on_hand"] + r["on_po"] - r["unassign"]
 
-    # --- Pad capacity cap: the per-SKU pad targets above are sized in isolation,
-    # so their combined footprint can exceed the warehouse. Scale them down to the
-    # shared roll budget (favoring fast movers) before the triggers are derived.
-    _apply_pad_capacity_cap(items)
-
-    # --- Finalize triggers from the (possibly capped) targets, for every SKU.
+    # --- Finalize triggers from the targets, for every SKU.
     for r in items.values():
         box = r["box_qty"]
         r["order_now"] = r["inv_pos"] <= r["rec_rop"]
@@ -742,26 +733,32 @@ def build_report():
         # Display delta of current vs recommended safety threshold (cur → rec).
         r["safety_delta"] = r["rec_safety"] - r["safety_cur"]
 
+    # --- Pad capacity cap (runs last — it adjusts rec_qty). Pad is stored as
+    # discrete rolls and the warehouse holds only PAD_TOTAL_ROLL_CAPACITY of them.
+    # Each pad order was sized in isolation, so the combined order can push physical
+    # stock past the cap. Trim pad orders to the space left after what's on hand + on PO.
+    _apply_pad_capacity_cap(items)
+
     return list(items.values())
 
 
 def _apply_pad_capacity_cap(items):
     """
-    Enforce the shared physical pad capacity (cfg.PAD_TOTAL_ROLL_CAPACITY rolls).
+    Trim recommended pad ORDERS to the shared physical roll capacity.
 
-    Pad SKUs (prodcode in PAD_PRODCODES) are each sized by days-of-supply with no
-    knowledge of one another, so their combined order-up-to can exceed what the
-    building physically holds. We convert every pad's desired order-up-to from
-    square yards to ROLLS via its scraped roll_sy (falling back to
-    PAD_DEFAULT_ROLL_SY), and when the pad total exceeds the cap we hand out the
-    roll budget proportional to each pad's trailing demand — never more than a SKU
-    actually wants, with the surplus from satisfied SKUs redistributed to the rest.
-    Demand weighting makes the cut fall on slow movers while fast movers keep their
-    full target. Each capped pad's safety / reorder / order-up-to are then scaled by
-    the same factor, preserving the 7/12/14-day relationship.
+    Pad is stored as discrete rolls and the warehouse holds at most
+    cfg.PAD_TOTAL_ROLL_CAPACITY of them across every pad SKU (prodcode in
+    PAD_PRODCODES). Each pad order is sized in isolation (order_up_to − inventory
+    position), so the combined order can push physical stock past what the building
+    holds. We measure occupied rolls as on_hand + on_po — what's physically here
+    plus what's already inbound — convert via each SKU's roll_sy (falling back to
+    PAD_DEFAULT_ROLL_SY), and only let new orders fill the space that's left. When
+    the desired orders don't all fit, the remaining space is handed out proportional
+    to demand (fast movers first), each clamped to what it actually wants. If the
+    pads are already at/over capacity, every pad order is trimmed to zero.
 
-    Mutates pad records in place (adds roll_size / want_rolls / alloc_rolls for the
-    report) and returns True when the cap actually bound, else False.
+    Mutates pad records in place (sets roll_size / want_order_rolls / alloc_order_rolls
+    for the report and rewrites rec_qty) and returns True when any order was trimmed.
     """
     pads = [r for r in items.values() if _is_pad(r)]
     if not pads:
@@ -769,19 +766,24 @@ def _apply_pad_capacity_cap(items):
 
     cap = float(cfg.PAD_TOTAL_ROLL_CAPACITY)
     for r in pads:
-        r["roll_size"]  = r["roll_sy"] if r["roll_sy"] > 0 else float(cfg.PAD_DEFAULT_ROLL_SY)
-        r["want_rolls"] = r["order_up_to"] / r["roll_size"] if r["roll_size"] > 0 else 0.0
-        r["alloc_rolls"] = r["want_rolls"]  # default: uncapped
+        r["roll_size"]        = r["roll_sy"] if r["roll_sy"] > 0 else float(cfg.PAD_DEFAULT_ROLL_SY)
+        r["want_order_rolls"] = (r["rec_qty"] / r["roll_size"]) if r["roll_size"] > 0 else 0.0
+        r["alloc_order_rolls"] = r["want_order_rolls"]  # default: nothing trimmed
 
-    want_total = sum(r["want_rolls"] for r in pads)
-    if want_total <= cap or want_total <= 0:
-        return False  # fits — leave every pad's desired target untouched
+    # Rolls already committed to the building: physically on hand + already on order.
+    occupied  = sum((r["on_hand"] + r["on_po"]) / r["roll_size"]
+                    for r in pads if r["roll_size"] > 0)
+    available = max(0.0, cap - occupied)
+    want_total = sum(r["want_order_rolls"] for r in pads)
 
-    # Over capacity. Water-fill the roll budget by demand share, clamping each SKU
-    # at its own want and redistributing the overflow; a few passes converge.
+    if want_total <= available or want_total <= 0:
+        return False  # the desired orders fit in the space that's left (or none)
+
+    # Over the remaining space. Water-fill `available` rolls by demand share,
+    # clamping each pad at its own desired order and redistributing the overflow.
     alloc = {r["seq"]: 0.0 for r in pads}
-    pool = [r for r in pads if r["daily_demand"] > 0 and r["want_rolls"] > 0]
-    remaining = cap
+    pool = [r for r in pads if r["daily_demand"] > 0 and r["want_order_rolls"] > 0]
+    remaining = available
     for _ in range(12):
         weight_total = sum(r["daily_demand"] for r in pool)
         if not pool or weight_total <= 0 or remaining <= 1e-9:
@@ -789,26 +791,23 @@ def _apply_pad_capacity_cap(items):
         still = []
         for r in pool:
             share    = remaining * (r["daily_demand"] / weight_total)
-            headroom = r["want_rolls"] - alloc[r["seq"]]
+            headroom = r["want_order_rolls"] - alloc[r["seq"]]
             take     = min(share, headroom)
             alloc[r["seq"]] += take
             if headroom - take > 1e-9:
                 still.append(r)
-        remaining = cap - sum(alloc.values())
+        remaining = available - sum(alloc.values())
         pool = still
 
-    # Scale each pad's targets down to its allocated rolls.
+    # Rewrite each pad's order qty from its allocated rolls.
     for r in pads:
-        factor = min(1.0, alloc[r["seq"]] / r["want_rolls"]) if r["want_rolls"] > 0 else 0.0
-        box = r["box_qty"]
-        r["rec_safety"]  = _ceil_to_box(r["rec_safety"]  * factor, box)
-        r["rec_rop"]     = _ceil_to_box(r["rec_rop"]     * factor, box)
-        r["order_up_to"] = _ceil_to_box(r["order_up_to"] * factor, box)
-        r["alloc_rolls"] = alloc[r["seq"]]
+        r["alloc_order_rolls"] = alloc[r["seq"]]
+        r["rec_qty"] = _ceil_to_box(alloc[r["seq"]] * r["roll_size"], r["box_qty"])
 
     print(
-        f"pad capacity cap: want {want_total:.0f} rolls > {cap:.0f} cap — "
-        f"allocated {sum(alloc.values()):.0f} across {len(pads)} pad SKU(s)",
+        f"pad capacity cap: {occupied:.0f}/{cap:.0f} rolls occupied (on-hand+on-PO), "
+        f"{available:.0f} free — trimmed pad orders {want_total:.0f} → "
+        f"{sum(alloc.values()):.0f} rolls",
         file=sys.stderr,
     )
     return True
@@ -845,28 +844,31 @@ def write_report(rows, path):
             f"{order_now_count} to order now\n"
         )
         w.write(
-            "Busy-month policy: busy_month = peak rolling-30-day shipped qty (trailing "
-            f"{cfg.DEMAND_WINDOW_DAYS}d), capped at {cfg.SAFETY_CAP_MONTHS:g} month(s) of avg "
-            "demand (SOLD_1YR/12) to damp one-off spikes; safety = capped busy_month; "
-            f"reorder = +daily_demand×lead_time (assumes {cfg.ASSUMED_LEAD_TIME_DAYS}d, 7–14d window); "
-            "order-up-to = 2×capped; ORDER NOW when on_hand+on_po−backorder ≤ reorder; "
-            f"PAD items (prodcode {'/'.join(sorted(cfg.PAD_PRODCODES))}) sized to days-of-supply instead "
-            f"(safety {cfg.PAD_SAFETY_DAYS}d / reorder {cfg.PAD_REORDER_DAYS}d / "
-            f"up-to {cfg.PAD_ORDER_UP_TO_DAYS}d of avg demand — big footprint, weekly truck); "
+            f"Days-of-supply policy on avg demand (daily_demand = SOLD_1YR/{cfg.DEMAND_WINDOW_DAYS}d): "
+            f"general items safety {cfg.GENERAL_SAFETY_DAYS}d / reorder {cfg.GENERAL_REORDER_DAYS}d / "
+            f"up-to {cfg.GENERAL_ORDER_UP_TO_DAYS}d; "
+            f"PAD items (prodcode {'/'.join(sorted(cfg.PAD_PRODCODES))}) safety {cfg.PAD_SAFETY_DAYS}d / "
+            f"reorder {cfg.PAD_REORDER_DAYS}d / up-to {cfg.PAD_ORDER_UP_TO_DAYS}d (big footprint, weekly "
+            f"truck) then squeezed to fit {cfg.PAD_TOTAL_ROLL_CAPACITY} rolls of shared capacity; "
+            "ORDER NOW when on_hand+on_po−backorder ≤ reorder; BUSY_MO shown for context only; "
             "recs rounded up to BOX multiples\n"
         )
-        # Pad capacity line: total desired vs. the physical roll budget. roll_size /
-        # want_rolls / alloc_rolls only exist on pad rows (set by the capacity pass).
-        pads = [r for r in rows if r.get("want_rolls") is not None]
+        # Pad capacity line: occupied (on-hand + on-PO) vs the physical roll budget,
+        # and how much of the desired order fit. roll_size / want_order_rolls /
+        # alloc_order_rolls only exist on pad rows (set by the capacity pass).
+        pads = [r for r in rows if r.get("roll_size") is not None]
         if pads:
-            want  = sum(r["want_rolls"] for r in pads)
-            alloc = sum(r.get("alloc_rolls", r["want_rolls"]) for r in pads)
-            capped = want > cfg.PAD_TOTAL_ROLL_CAPACITY + 1e-9
+            cap      = cfg.PAD_TOTAL_ROLL_CAPACITY
+            occupied = sum((r["on_hand"] + r["on_po"]) / r["roll_size"] for r in pads)
+            want     = sum(r.get("want_order_rolls", 0.0) for r in pads)
+            alloc    = sum(r.get("alloc_order_rolls", r.get("want_order_rolls", 0.0)) for r in pads)
+            trimmed  = alloc + 1e-9 < want
             w.write(
-                f"Pad capacity: {len(pads)} pad SKU(s) want {want:.0f} rolls vs "
-                f"{cfg.PAD_TOTAL_ROLL_CAPACITY} cap — "
-                + (f"CAPPED, allocated {alloc:.0f} rolls proportional to demand "
-                   "(fast movers favored)\n" if capped else "fits, no scaling\n")
+                f"Pad capacity: {len(pads)} pad SKU(s), {occupied:.0f}/{cap} rolls "
+                f"occupied (on-hand+on-PO); new orders "
+                + (f"TRIMMED {want:.0f} → {alloc:.0f} rolls to fit remaining space "
+                   "(fast movers favored)\n" if trimmed
+                   else f"{want:.0f} rolls (fit)\n")
             )
         w.write("=" * len(hdr) + "\n" + hdr + "\n" + "-" * len(hdr) + "\n")
         for r in rows:

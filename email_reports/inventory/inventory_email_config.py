@@ -11,25 +11,17 @@ BMS_ALIAS = "creativecarpets"
 BMS_COMPANY = "99"
 
 # ---- Algorithm parameters ----
-# Service-level Z-score. Higher Z = bigger safety buffer.
-#   95% fill = 1.65   97% fill = 1.88   99% fill = 2.33
-SERVICE_LEVEL_Z = 1.88
-
-# Lead time assumption (days from PO placed to available on shelf). Stocking
-# items run ~1–2 weeks regardless of vendor, so we assume a flat 7–14 day window
-# and use its midpoint in the reorder-point math rather than tracking per-vendor
-# times. Bump this if deliveries trend slower.
-ASSUMED_LEAD_TIME_DAYS = 10
-
 # Trailing window for SOLD_1YR and the busy-month figure.
 DEMAND_WINDOW_DAYS = 365
 
-# Safety-stock cap. The raw busy_month (peak rolling-30-day shipped qty) can be
-# blown up by a single one-off project, so we cap the *effective* busy month used
-# for safety / reorder / order-up-to at this many months of AVERAGE demand
-# (SOLD_1YR / 12 × SAFETY_CAP_MONTHS). One month aligns with the ~1–2 week restock
-# ability — no need to hoard a freak peak you can replenish quickly.
-SAFETY_CAP_MONTHS = 1.0
+# General (non-pad) reorder policy — days-of-supply on average demand
+# (daily_demand = SOLD_1YR / DEMAND_WINDOW_DAYS), ceil to box. Replaces the older
+# busy-month model. Pad has its own cadence below (PAD_*_DAYS). The busy-month
+# figure is still computed and shown in the .txt as context (peak 30-day demand),
+# but no longer drives the recommendation.
+GENERAL_SAFETY_DAYS = 7        # safety floor (~1 week of demand)
+GENERAL_REORDER_DAYS = 21      # ORDER NOW when inventory position drops to ~3 weeks
+GENERAL_ORDER_UP_TO_DAYS = 35  # restock target / max held (~5 weeks)
 
 # PAD items (carpet padding/cushion) take a large warehouse footprint AND arrive
 # on a ~weekly truck, so the busy-month model is the wrong basis entirely. Instead
@@ -65,10 +57,6 @@ PAD_DEFAULT_ROLL_SY = 30.0
 
 # Lower bound on order history we pull for UNASSIGN / PEAK_WK / bulk orderline
 ORDER_HISTORY_FLOOR = "20240101"
-
-# Reorder period (days) — how much demand one PO should cover.
-# REC_QTY = daily_demand * REORDER_PERIOD_DAYS, rounded up to box multiples.
-REORDER_PERIOD_DAYS = 30
 
 # Box-quantity cache. Scanning /catalogitems for CAT_UNIT_PER_BOX takes ~2 min,
 # so we cache the result here and refresh weekly. Delete the file to force refresh.
