@@ -65,13 +65,13 @@ def _render_html(rows: list[dict]) -> str:
 
     Six columns — Item (style/color with a vendor·sequence subline), On Hand,
     Inv Pos, Safety (current→recommended), Reorder (current→recommended), and
-    Order Qty. The two threshold columns convey how urgent the reorder is: how
-    far inventory position sits below the recommended safety and reorder points,
-    and — since current reorder points are mostly unset in BMS — make the 0→value
-    gap visible. Rows alternate a faint zebra fill; SKUs already below their
-    recommended safety stock (inv_pos < rec_safety, not merely below the reorder
-    point) get a red left-accent and a red, bold order qty so the genuinely
-    urgent items stand out from the rest of the order-now list.
+    Order Qty. The threshold columns convey how urgent the reorder is and, since
+    current reorder points are mostly unset in BMS, make the 0→value gap visible.
+    Manual-safety SKUs (hand-managed cushion/trim) carry no computed reorder or
+    order qty, so those two cells show "—"; their alert is purely "below your
+    entered safety stock." Rows alternate a faint zebra fill; urgent rows (general:
+    inv_pos below recommended safety; manual: on-hand below the entered safety)
+    get a red left-accent and red, bold order qty so they stand out.
     """
     th  = ("text-align:left; padding:7px 9px; border-bottom:2px solid #e4e4e4; "
            "font-size:11px; letter-spacing:0.5px; color:#999; text-transform:uppercase;")
@@ -93,9 +93,12 @@ def _render_html(rows: list[dict]) -> str:
     )
 
     # cur → rec cell: current value muted, recommended bold (so the target reads
-    # first). Used for both the safety-stock and reorder-point columns.
+    # first). When the two match (e.g. manual-safety items, where the threshold is
+    # just the entered number) collapse to a single value rather than "900 → 900".
     def _cur_rec(cur, rec):
         """Render a 'current → recommended' threshold cell body."""
+        if abs(cur - rec) < 0.5:
+            return f'<strong>{rec:.0f}</strong>'
         return (f'<span style="color:#aaa;">{cur:.0f}</span> '
                 f'<span style="color:#ccc;">→</span> '
                 f'<strong>{rec:.0f}</strong>')
@@ -106,14 +109,20 @@ def _render_html(rows: list[dict]) -> str:
         color  = (r.get("color") or "").strip()
         vendor = (r.get("vendor") or "").strip() or "—"
         seq    = r.get("seq", "")
+        manual = r.get("manual_safety")
 
-        critical  = r.get("inv_pos", 0) < r.get("rec_safety", 0)
+        urgent    = r.get("urgent", False)
         zebra     = "#ffffff" if i % 2 == 0 else "#fafafa"
-        accent    = "#d6452c" if critical else "transparent"
-        qty_color = "#d6452c" if critical else "#222"
+        accent    = "#d6452c" if urgent else "transparent"
+        qty_color = "#d6452c" if urgent else "#222"
 
         name = style if not color else f'{style} <span style="color:#999;">· {color}</span>'
         sub  = f'{vendor} · {seq}'
+
+        # Manual-safety SKUs have no computed reorder or order qty — show "—".
+        safety_cell  = _cur_rec(r.get("safety_cur", 0), r.get("rec_safety", 0))
+        reorder_cell = "—" if manual else _cur_rec(r.get("reorder_cur", 0), r.get("rec_rop", 0))
+        qty_cell     = "—" if manual else f'{r.get("rec_qty", 0):.0f}'
 
         td  = f"padding:8px 9px; border-bottom:1px solid #f0f0f0; background:{zebra};"
         tdr = td + " text-align:right; font-variant-numeric:tabular-nums;"
@@ -124,10 +133,9 @@ def _render_html(rows: list[dict]) -> str:
             f'margin-top:2px;">{sub}</div></td>'
             f'<td style="{tdr}">{r.get("on_hand", 0):.0f}</td>'
             f'<td style="{tdr}">{r.get("inv_pos", 0):.0f}</td>'
-            f'<td style="{tdr}">{_cur_rec(r.get("safety_cur", 0), r.get("rec_safety", 0))}</td>'
-            f'<td style="{tdr}">{_cur_rec(r.get("reorder_cur", 0), r.get("rec_rop", 0))}</td>'
-            f'<td style="{tdr} color:{qty_color}; font-weight:bold;">'
-            f'{r.get("rec_qty", 0):.0f}</td>'
+            f'<td style="{tdr}">{safety_cell}</td>'
+            f'<td style="{tdr}">{reorder_cell}</td>'
+            f'<td style="{tdr} color:{qty_color}; font-weight:bold;">{qty_cell}</td>'
             '</tr>'
         )
     return head + "".join(rows_html) + "</tbody></table>"
