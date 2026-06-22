@@ -109,6 +109,13 @@ def _extract_stocked(rows, items):
             "stynum":  str(it.get("CAT_STYNUM", "")).strip(),   # vendor style number
             "color":   str(it.get("CAT_COLOR", "")).strip(),
             "desc":    str(it.get("CAT_ITEMDESC", "")).strip(), # full item description
+            # Per-roll yardage (SY/roll) scraped from the descriptive text — BMS has
+            # no clean field for it and which field carries it varies by product.
+            # 0.0 when no token is found (non-roll goods). Used to convert a SKU's
+            # SY-based stock target into physical rolls for the pad capacity cap.
+            "roll_sy": ie.parse_yardage(
+                it.get("CAT_STYLE"), it.get("CAT_ITEMDESC"), it.get("CAT_COLOR")
+            ),
         }
 
 

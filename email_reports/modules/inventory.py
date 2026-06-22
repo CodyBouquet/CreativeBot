@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from .base import ReportContext
+from .base import ReportContext, report_card
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +25,12 @@ def build_section(user, ctx: ReportContext) -> str | None:
     order_rows = [r for r in rows if r.get("order_now")]
     if not order_rows:
         return None
-    return _render_html(order_rows)
+    return report_card(
+        "Inventory — Low Stock",
+        _render_html(order_rows),
+        icon="📦",
+        badge=f"{len(order_rows)} to order",
+    )
 
 
 def _pull_rows() -> list[dict]:
@@ -55,43 +60,74 @@ def _pull_rows() -> list[dict]:
 
 
 def _render_html(rows: list[dict]) -> str:
-    """Compact 6-column table — readable on phones and laptops."""
-    th_style  = "text-align:left; padding:6px 10px; border-bottom:1px solid #c8c8c8; font-size:11px; letter-spacing:1px; color:#555;"
-    thr_style = "text-align:right; padding:6px 10px; border-bottom:1px solid #c8c8c8; font-size:11px; letter-spacing:1px; color:#555;"
-    td_style  = "padding:5px 10px; border-bottom:1px solid #eee;"
-    tdr_style = "padding:5px 10px; border-bottom:1px solid #eee; text-align:right; font-variant-numeric: tabular-nums;"
-    seq_style = "padding:5px 10px; border-bottom:1px solid #eee; font-family: monospace; font-size:11px; color:#555;"
+    """
+    Action-focused table for the card body: one row per SKU to order.
+
+    Six columns — Item (style/color with a vendor·sequence subline), On Hand,
+    Inv Pos, Safety (current→recommended), Reorder (current→recommended), and
+    Order Qty. The two threshold columns convey how urgent the reorder is: how
+    far inventory position sits below the recommended safety and reorder points,
+    and — since current reorder points are mostly unset in BMS — make the 0→value
+    gap visible. Rows alternate a faint zebra fill; SKUs already below their
+    recommended safety stock (inv_pos < rec_safety, not merely below the reorder
+    point) get a red left-accent and a red, bold order qty so the genuinely
+    urgent items stand out from the rest of the order-now list.
+    """
+    th  = ("text-align:left; padding:7px 9px; border-bottom:2px solid #e4e4e4; "
+           "font-size:11px; letter-spacing:0.5px; color:#999; text-transform:uppercase;")
+    thr = th + " text-align:right;"
 
     head = (
-        f'<p style="font-size:13px; color:#555; margin: 4px 0 12px;">'
-        f'{len(rows)} stocked SKU(s) at or below reorder point — order now.</p>'
-        f'<table style="border-collapse:collapse; width:100%; font-size:13px;">'
-        f'<thead><tr>'
-        f'<th style="{th_style}">Style / Color</th>'
-        f'<th style="{th_style}">Vendor</th>'
-        f'<th style="{thr_style}">On Hand</th>'
-        f'<th style="{thr_style}">Inv Pos</th>'
-        f'<th style="{thr_style}">Safety (Cur → Rec)</th>'
-        f'<th style="{thr_style}">Order Qty</th>'
-        f'</tr></thead><tbody>'
+        '<p style="font-size:12px; color:#888; margin:2px 0 10px;">'
+        'At or below reorder point — order now. Thresholds shown current → '
+        '<strong>recommended</strong>.</p>'
+        '<table style="border-collapse:collapse; width:100%; font-size:13px;">'
+        '<thead><tr>'
+        f'<th style="{th}">Item</th>'
+        f'<th style="{thr}">On Hand</th>'
+        f'<th style="{thr}">Inv Pos</th>'
+        f'<th style="{thr}">Safety</th>'
+        f'<th style="{thr}">Reorder</th>'
+        f'<th style="{thr}">Order Qty</th>'
+        '</tr></thead><tbody>'
     )
 
+    # cur → rec cell: current value muted, recommended bold (so the target reads
+    # first). Used for both the safety-stock and reorder-point columns.
+    def _cur_rec(cur, rec):
+        """Render a 'current → recommended' threshold cell body."""
+        return (f'<span style="color:#aaa;">{cur:.0f}</span> '
+                f'<span style="color:#ccc;">→</span> '
+                f'<strong>{rec:.0f}</strong>')
+
     rows_html = []
-    for r in rows:
-        style = (r.get("style") or "").strip() or "—"
-        color = (r.get("color") or "").strip()
-        style_color = f"{style}<br><span style='color:#888;font-size:11px;'>{color}</span>" if color else style
-        seq = r.get("seq", "")
+    for i, r in enumerate(rows):
+        style  = (r.get("style") or "").strip() or "—"
+        color  = (r.get("color") or "").strip()
+        vendor = (r.get("vendor") or "").strip() or "—"
+        seq    = r.get("seq", "")
+
+        critical  = r.get("inv_pos", 0) < r.get("rec_safety", 0)
+        zebra     = "#ffffff" if i % 2 == 0 else "#fafafa"
+        accent    = "#d6452c" if critical else "transparent"
+        qty_color = "#d6452c" if critical else "#222"
+
+        name = style if not color else f'{style} <span style="color:#999;">· {color}</span>'
+        sub  = f'{vendor} · {seq}'
+
+        td  = f"padding:8px 9px; border-bottom:1px solid #f0f0f0; background:{zebra};"
+        tdr = td + " text-align:right; font-variant-numeric:tabular-nums;"
         rows_html.append(
-            f'<tr>'
-            f'<td style="{td_style}">{style_color}'
-            f'<div style="{seq_style}">{seq}</div></td>'
-            f'<td style="{td_style}">{r.get("vendor", "") or "—"}</td>'
-            f'<td style="{tdr_style}">{r.get("on_hand", 0):.0f}</td>'
-            f'<td style="{tdr_style}">{r.get("inv_pos", 0):.0f}</td>'
-            f'<td style="{tdr_style}">{r.get("safety_cur", 0):.0f} → '
-            f'<strong>{r.get("rec_safety", 0):.0f}</strong></td>'
-            f'<td style="{tdr_style}"><strong>{r.get("rec_qty", 0):.0f}</strong></td>'
-            f'</tr>'
+            '<tr>'
+            f'<td style="{td} border-left:3px solid {accent};">{name}'
+            f'<div style="color:#aaa; font-size:11px; font-family:monospace; '
+            f'margin-top:2px;">{sub}</div></td>'
+            f'<td style="{tdr}">{r.get("on_hand", 0):.0f}</td>'
+            f'<td style="{tdr}">{r.get("inv_pos", 0):.0f}</td>'
+            f'<td style="{tdr}">{_cur_rec(r.get("safety_cur", 0), r.get("rec_safety", 0))}</td>'
+            f'<td style="{tdr}">{_cur_rec(r.get("reorder_cur", 0), r.get("rec_rop", 0))}</td>'
+            f'<td style="{tdr} color:{qty_color}; font-weight:bold;">'
+            f'{r.get("rec_qty", 0):.0f}</td>'
+            '</tr>'
         )
     return head + "".join(rows_html) + "</tbody></table>"

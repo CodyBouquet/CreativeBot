@@ -41,6 +41,7 @@ Usage:
 import json
 import math
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -74,6 +75,34 @@ def _f(x):
         return float(str(x).strip() or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+# Roll yardage (square yards per roll) is not a clean catalog field — BMS embeds
+# it in free text, and which text field carries it varies by product. So we scrape
+# a "<number> SY/SYD/SQYD" token out of the descriptive fields. SYD/SQ.YD come
+# before SY in the alternation so "30 SYD" matches the longer unit, not a bare SY.
+_YARDAGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:SQ\.?\s?YD|SYD|SY|S/?Y)\b", re.IGNORECASE)
+
+
+def parse_yardage(*texts):
+    """
+    Scrape the per-roll yardage (square yards) out of free-text catalog fields.
+
+    Pass the descriptive fields in priority order (e.g. style, desc, color); the
+    first one containing a yardage token wins — so "BLACK DIAMOND … 6LB PAD" with
+    no token falls through to its "30 SY PER ROLL" description. Returns the parsed
+    float, or 0.0 when nothing matches (per-LF base shoe, tile, cleaners, etc.).
+    """
+    for t in texts:
+        if not t:
+            continue
+        m = _YARDAGE_RE.search(str(t))
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                continue
+    return 0.0
 
 
 def _parse_date(s):
@@ -126,6 +155,16 @@ def _rolling_30day_max(events):
         # Slide the left edge off events[i] before advancing to events[i+1].
         running -= events[i][1]
     return best
+
+
+def _is_pad(r):
+    """
+    True when a record should be handled as pad: its product code is in
+    PAD_PRODCODES and it isn't on the explicit exclusion list (e.g. FIRM GRIP, an
+    area rug pad sold per square yard rather than as a roll good). Both the
+    days-of-supply sizing and the roll capacity cap key off this single predicate.
+    """
+    return r["prodcode"] in cfg.PAD_PRODCODES and r["seq"] not in cfg.PAD_EXCLUDE_SEQS
 
 
 def _ceil_to_box(value, box_qty):
@@ -499,6 +538,7 @@ def build_report():
         seq: {
             "seq":          seq,
             "safety_cur":   _f(u.get("safety")),                       # current CAT_SAFTYSTK
+            "reorder_cur":  _f(u.get("reorder")),                      # current CAT_REORDER (often 0/unset)
             "vendor":       vendor_by_seq.get(seq) or str(u.get("vendor", "")).strip(),
             "on_hand":      0.0,
             "unassign":     0.0,                                       # = backorders
@@ -507,6 +547,7 @@ def build_report():
             "busy_month":   0.0,                                       # policy anchor
             "box_qty":      _f(u.get("box")) or 1.0,                   # CAT_UNIT_PER_BOX
             "prodcode":     str(u.get("prodcode", "")).strip(),        # product type (PAD = "18")
+            "roll_sy":      _f(u.get("roll_sy")),                      # scraped SY/roll (0 if unknown)
             "style":        str(u.get("style", "")).strip(),
             "color":        str(u.get("color", "")).strip(),
         }
@@ -550,11 +591,18 @@ def build_report():
                     items[seq]["style"] = st
                 if co:
                     items[seq]["color"] = co
-                # Live product type — fallback when the cache predates the
-                # CAT_PRODCODE field (used to flag PAD items for a tighter cap).
+                # Product type drives PAD detection (CAT_PRODCODE in PAD_PRODCODES).
+                # The catalog code is authoritative; /productstock carries a
+                # DIFFERENT code (e.g. "az" on cushion rolls that are CAT_PRODCODE
+                # "18"), so only use it as a fallback when the catalog left it blank
+                # — never overwrite the cached catalog value, or pads get misflagged.
                 pc = (data[0].get("PRODCODE") or "").strip()
-                if pc:
+                if pc and not items[seq]["prodcode"]:
                     items[seq]["prodcode"] = pc
+                # Roll yardage fallback for the /lowstock path (no catalog cache to
+                # scrape): pull it from the live style/color text instead.
+                if items[seq]["roll_sy"] <= 0:
+                    items[seq]["roll_sy"] = parse_yardage(st, co)
 
     # --- ON_PO from open /purchaseorderlines records
     for p in po_lines:
@@ -650,10 +698,12 @@ def build_report():
         r["daily_demand"] = r["sold_1yr"] / float(cfg.DEMAND_WINDOW_DAYS)
         box = r["box_qty"]
 
-        if r["prodcode"] == cfg.PAD_PRODCODE:
+        if _is_pad(r):
             # PAD: bulky and delivered on a ~weekly truck, so size to a flat
             # days-of-supply target tied to that cadence rather than the busy
             # month. Footprint is the binding constraint; we restock weekly.
+            # These are the per-SKU *desired* levels; the shared-capacity cap
+            # below may scale them down so the pad total fits the warehouse.
             dd = r["daily_demand"]
             r["busy_eff"]    = 0.0  # busy-month basis not used for pad
             r["rec_safety"]  = _ceil_to_box(dd * cfg.PAD_SAFETY_DAYS, box)
@@ -676,14 +726,92 @@ def build_report():
 
         # Inventory position nets incoming POs in and unfilled backorders out, so
         # the trigger reflects our true committed position — not just on-hand.
-        r["inv_pos"]   = r["on_hand"] + r["on_po"] - r["unassign"]
+        # (Independent of the targets, so it's safe to set before the pad cap.)
+        r["inv_pos"] = r["on_hand"] + r["on_po"] - r["unassign"]
+
+    # --- Pad capacity cap: the per-SKU pad targets above are sized in isolation,
+    # so their combined footprint can exceed the warehouse. Scale them down to the
+    # shared roll budget (favoring fast movers) before the triggers are derived.
+    _apply_pad_capacity_cap(items)
+
+    # --- Finalize triggers from the (possibly capped) targets, for every SKU.
+    for r in items.values():
+        box = r["box_qty"]
         r["order_now"] = r["inv_pos"] <= r["rec_rop"]
         r["rec_qty"]   = _ceil_to_box(max(0.0, r["order_up_to"] - r["inv_pos"]), box)
-
         # Display delta of current vs recommended safety threshold (cur → rec).
         r["safety_delta"] = r["rec_safety"] - r["safety_cur"]
 
     return list(items.values())
+
+
+def _apply_pad_capacity_cap(items):
+    """
+    Enforce the shared physical pad capacity (cfg.PAD_TOTAL_ROLL_CAPACITY rolls).
+
+    Pad SKUs (prodcode in PAD_PRODCODES) are each sized by days-of-supply with no
+    knowledge of one another, so their combined order-up-to can exceed what the
+    building physically holds. We convert every pad's desired order-up-to from
+    square yards to ROLLS via its scraped roll_sy (falling back to
+    PAD_DEFAULT_ROLL_SY), and when the pad total exceeds the cap we hand out the
+    roll budget proportional to each pad's trailing demand — never more than a SKU
+    actually wants, with the surplus from satisfied SKUs redistributed to the rest.
+    Demand weighting makes the cut fall on slow movers while fast movers keep their
+    full target. Each capped pad's safety / reorder / order-up-to are then scaled by
+    the same factor, preserving the 7/12/14-day relationship.
+
+    Mutates pad records in place (adds roll_size / want_rolls / alloc_rolls for the
+    report) and returns True when the cap actually bound, else False.
+    """
+    pads = [r for r in items.values() if _is_pad(r)]
+    if not pads:
+        return False
+
+    cap = float(cfg.PAD_TOTAL_ROLL_CAPACITY)
+    for r in pads:
+        r["roll_size"]  = r["roll_sy"] if r["roll_sy"] > 0 else float(cfg.PAD_DEFAULT_ROLL_SY)
+        r["want_rolls"] = r["order_up_to"] / r["roll_size"] if r["roll_size"] > 0 else 0.0
+        r["alloc_rolls"] = r["want_rolls"]  # default: uncapped
+
+    want_total = sum(r["want_rolls"] for r in pads)
+    if want_total <= cap or want_total <= 0:
+        return False  # fits — leave every pad's desired target untouched
+
+    # Over capacity. Water-fill the roll budget by demand share, clamping each SKU
+    # at its own want and redistributing the overflow; a few passes converge.
+    alloc = {r["seq"]: 0.0 for r in pads}
+    pool = [r for r in pads if r["daily_demand"] > 0 and r["want_rolls"] > 0]
+    remaining = cap
+    for _ in range(12):
+        weight_total = sum(r["daily_demand"] for r in pool)
+        if not pool or weight_total <= 0 or remaining <= 1e-9:
+            break
+        still = []
+        for r in pool:
+            share    = remaining * (r["daily_demand"] / weight_total)
+            headroom = r["want_rolls"] - alloc[r["seq"]]
+            take     = min(share, headroom)
+            alloc[r["seq"]] += take
+            if headroom - take > 1e-9:
+                still.append(r)
+        remaining = cap - sum(alloc.values())
+        pool = still
+
+    # Scale each pad's targets down to its allocated rolls.
+    for r in pads:
+        factor = min(1.0, alloc[r["seq"]] / r["want_rolls"]) if r["want_rolls"] > 0 else 0.0
+        box = r["box_qty"]
+        r["rec_safety"]  = _ceil_to_box(r["rec_safety"]  * factor, box)
+        r["rec_rop"]     = _ceil_to_box(r["rec_rop"]     * factor, box)
+        r["order_up_to"] = _ceil_to_box(r["order_up_to"] * factor, box)
+        r["alloc_rolls"] = alloc[r["seq"]]
+
+    print(
+        f"pad capacity cap: want {want_total:.0f} rolls > {cap:.0f} cap — "
+        f"allocated {sum(alloc.values()):.0f} across {len(pads)} pad SKU(s)",
+        file=sys.stderr,
+    )
+    return True
 
 
 def write_report(rows, path):
@@ -708,7 +836,7 @@ def write_report(rows, path):
         f"{'SEQUENCE':<14} {'VENDOR':<{mv}} "
         f"{'ON_HAND':>8} {'UNASN':>8} {'ON_PO':>8} {'INV_POS':>8} "
         f"{'SOLD_1YR':>9} {'BUSY_MO':>8} "
-        f"{'BOX':>5} {'SAF_CUR':>8} {'SAF_REC':>8} {'ROP_REC':>8} {'UPTO':>8} {'QTY_REC':>8} "
+        f"{'BOX':>5} {'SAF_CUR':>8} {'SAF_REC':>8} {'ROP_CUR':>8} {'ROP_REC':>8} {'UPTO':>8} {'QTY_REC':>8} "
         f"{'ORDER':>6} {'STYLE':<{ms}} {'COLOR':<{mc}}"
     )
     with open(path, "w") as w:
@@ -722,18 +850,31 @@ def write_report(rows, path):
             "demand (SOLD_1YR/12) to damp one-off spikes; safety = capped busy_month; "
             f"reorder = +daily_demand×lead_time (assumes {cfg.ASSUMED_LEAD_TIME_DAYS}d, 7–14d window); "
             "order-up-to = 2×capped; ORDER NOW when on_hand+on_po−backorder ≤ reorder; "
-            f"PAD items (prodcode {cfg.PAD_PRODCODE}) sized to days-of-supply instead "
+            f"PAD items (prodcode {'/'.join(sorted(cfg.PAD_PRODCODES))}) sized to days-of-supply instead "
             f"(safety {cfg.PAD_SAFETY_DAYS}d / reorder {cfg.PAD_REORDER_DAYS}d / "
             f"up-to {cfg.PAD_ORDER_UP_TO_DAYS}d of avg demand — big footprint, weekly truck); "
             "recs rounded up to BOX multiples\n"
         )
+        # Pad capacity line: total desired vs. the physical roll budget. roll_size /
+        # want_rolls / alloc_rolls only exist on pad rows (set by the capacity pass).
+        pads = [r for r in rows if r.get("want_rolls") is not None]
+        if pads:
+            want  = sum(r["want_rolls"] for r in pads)
+            alloc = sum(r.get("alloc_rolls", r["want_rolls"]) for r in pads)
+            capped = want > cfg.PAD_TOTAL_ROLL_CAPACITY + 1e-9
+            w.write(
+                f"Pad capacity: {len(pads)} pad SKU(s) want {want:.0f} rolls vs "
+                f"{cfg.PAD_TOTAL_ROLL_CAPACITY} cap — "
+                + (f"CAPPED, allocated {alloc:.0f} rolls proportional to demand "
+                   "(fast movers favored)\n" if capped else "fits, no scaling\n")
+            )
         w.write("=" * len(hdr) + "\n" + hdr + "\n" + "-" * len(hdr) + "\n")
         for r in rows:
             w.write(
                 f"{r['seq']:<14} {r['vendor']:<{mv}} "
                 f"{r['on_hand']:>8.2f} {r['unassign']:>8.2f} {r['on_po']:>8.2f} {r['inv_pos']:>8.2f} "
                 f"{r['sold_1yr']:>9.2f} {r['busy_month']:>8.2f} "
-                f"{r['box_qty']:>5.0f} {r['safety_cur']:>8.2f} {r['rec_safety']:>8.2f} {r['rec_rop']:>8.2f} {r['order_up_to']:>8.2f} {r['rec_qty']:>8.2f} "
+                f"{r['box_qty']:>5.0f} {r['safety_cur']:>8.2f} {r['rec_safety']:>8.2f} {r['reorder_cur']:>8.2f} {r['rec_rop']:>8.2f} {r['order_up_to']:>8.2f} {r['rec_qty']:>8.2f} "
                 f"{('YES' if r['order_now'] else ''):>6} {r['style']:<{ms}} {r['color']:<{mc}}\n"
             )
 

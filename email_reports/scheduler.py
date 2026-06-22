@@ -77,23 +77,33 @@ def _should_dispatch(now: datetime, schedule: dict) -> tuple[bool, str]:
 # ---- Dispatch -------------------------------------------------------------
 
 def _wrap_digest(user, sections: list[tuple[str, str]]) -> str:
-    """Compose the multi-section HTML body for one recipient."""
-    label_for = {r["key"]: r["label"] for r in AVAILABLE_REPORTS}
+    """
+    Compose the multi-section HTML body for one recipient.
+
+    Each section already renders itself as a self-contained card (see
+    modules.base.report_card), so the wrapper just supplies the outer shell —
+    a centered, max-width column on a light backdrop — and stacks the cards.
+    """
     first_name = (user["display_name"] or user["email"]).split(" ")[0]
+    date_str = datetime.now().strftime("%b %d, %Y")
     parts = [
-        '<html><body style="font-family: Arial, sans-serif; color: #111; max-width: 760px;">',
-        f'<p>Hi {first_name},</p>',
-        '<p>Here are your reports for today:</p>',
+        '<html><body style="margin:0; padding:0; background:#f4f5f7;">',
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        'style="background:#f4f5f7;"><tr><td align="center" style="padding:24px 12px;">',
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+        'style="max-width:680px; font-family:Arial,Helvetica,sans-serif; color:#222;">',
+        '<tr><td style="padding:0 4px 4px;">',
+        f'<p style="margin:0; font-size:15px;">Hi {first_name},</p>',
+        f'<p style="margin:4px 0 0; color:#888; font-size:13px;">Your reports for {date_str}</p>',
+        '</td></tr>',
     ]
-    for key, html in sections:
-        parts.append(
-            f'<h2 style="border-bottom:1px solid #ddd; padding:18px 0 6px; margin-top:24px; '
-            f'color:#0077aa; font-size:16px;">{label_for.get(key, key)}</h2>'
-        )
-        parts.append(html)
-    parts.append('<p style="color:#888; font-size:11px; margin-top:32px;">'
-                 '— CreativeBot. Manage subscriptions in /reports/settings.</p>')
-    parts.append('</body></html>')
+    for _key, html in sections:
+        parts.append(f'<tr><td>{html}</td></tr>')
+    parts.append(
+        '<tr><td style="padding:18px 4px 0; color:#aaa; font-size:11px;">'
+        '— CreativeBot · manage subscriptions in /reports/settings</td></tr>'
+    )
+    parts.append('</table></td></tr></table></body></html>')
     return "\n".join(parts)
 
 

@@ -31,17 +31,37 @@ DEMAND_WINDOW_DAYS = 365
 # ability — no need to hoard a freak peak you can replenish quickly.
 SAFETY_CAP_MONTHS = 1.0
 
-# PAD items (carpet padding/cushion, BMS PRODCODE "18") take a large warehouse
-# footprint AND arrive on a ~weekly truck, so the busy-month model is the wrong
-# basis entirely. Instead size them to a days-of-supply target keyed to that
-# delivery cadence: keep ~2 weeks max, reorder when ~12 days remain, safety floor
-# ~1 week. All three are daily_demand (SOLD_1YR/365) × the day count, ceil to box.
-# Identified by product code from the catalog cache (CAT_PRODCODE) with
-# /productstock PRODCODE as a live fallback.
-PAD_PRODCODE = "18"
+# PAD items (carpet padding/cushion) take a large warehouse footprint AND arrive
+# on a ~weekly truck, so the busy-month model is the wrong basis entirely. Instead
+# size them to a days-of-supply target keyed to that delivery cadence: keep ~2
+# weeks max, reorder when ~12 days remain, safety floor ~1 week. All three are
+# daily_demand (SOLD_1YR/365) × the day count, ceil to box.
+#
+# Identified by BMS product code (CAT_PRODCODE from the catalog cache; /productstock
+# PRODCODE only as a fallback when the catalog left it blank). Pad spans MORE THAN
+# ONE code: "18" (e.g. FIRM GRIP rug pad) and "az" (the cushion rolls — GLACIER,
+# EMERALD, TITAN — plus heavier roll goods CC files under the same code). Any SKU
+# whose code is in this set is treated as pad and counts toward the roll cap.
+PAD_PRODCODES = frozenset({"18", "az"})
+
+# Catalog sequences to force OUT of pad handling even though their product code is
+# in PAD_PRODCODES. FIRM GRIP (CAT_SEQUENCE 0000000232689) is an area rug pad sold
+# per square yard, not a roll good — it shouldn't be sized as pad or charged against
+# the roll capacity. Excluded SKUs fall back to the normal busy-month model.
+PAD_EXCLUDE_SEQS = frozenset({"0000000232689"})  # FIRM GRIP - AREA RUG PAD
 PAD_SAFETY_DAYS = 7       # safety floor (days of avg demand)
 PAD_REORDER_DAYS = 12     # ORDER NOW when inventory position drops to this many days
 PAD_ORDER_UP_TO_DAYS = 14 # replenish target / max held (~2 weeks, one+ truck cycle)
+
+# Total physical warehouse capacity for carpet pad, in ROLLS, shared across every
+# pad SKU. The days-of-supply targets above are sized per SKU and can sum past what
+# the building holds, so when the combined pad order-up-to (converted SY→rolls via
+# each SKU's scraped roll_sy) exceeds this, the budget is allocated proportional to
+# demand — fast movers keep the most space, slow movers absorb the cut.
+PAD_TOTAL_ROLL_CAPACITY = 288
+# Fallback roll size (SY/roll) when a pad SKU's yardage can't be scraped from its
+# catalog text. Most pad rolls are 30 SY.
+PAD_DEFAULT_ROLL_SY = 30.0
 
 # Lower bound on order history we pull for UNASSIGN / PEAK_WK / bulk orderline
 ORDER_HISTORY_FLOOR = "20240101"
