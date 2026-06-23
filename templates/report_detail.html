@@ -315,7 +315,12 @@
       try {
         const r = await fetch('/reports/{{ report.key }}/run', { method: 'POST' });
         const data = await r.json();
-        if (data.ok) {
+        if (data.ok && data.started) {
+          // Build runs in the background (can take a few minutes); the outcome
+          // lands in "Last 5 Runs" below. Reload shortly so it shows up.
+          toast('Report started — it can take a few minutes. Check "Last 5 Runs".', 'ok');
+          setTimeout(() => location.reload(), 2000);
+        } else if (data.ok) {
           toast(`Sent to ${data.recipient_count || 0} recipient(s)`, 'ok');
           setTimeout(() => location.reload(), 800);
         } else {

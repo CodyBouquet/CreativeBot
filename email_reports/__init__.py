@@ -7,6 +7,7 @@ data/sync.db. The bot does NOT retain copies of sent mail beyond a one-line
 operational log entry per send.
 """
 import logging
+import threading
 from functools import wraps
 
 from flask import Blueprint, jsonify, redirect, render_template, request, session, url_for
@@ -141,19 +142,31 @@ def report_save(report_key: str):
 @bp.route("/reports/<report_key>/run", methods=["POST"])
 @admin_required
 def report_run_now(report_key: str):
-    """Manual trigger — sends this report (only) to its current subscribers."""
+    """
+    Manual trigger — sends this report (only) to its current subscribers.
+
+    The build can be slow (the inventory report does a multi-minute BMS pull), so
+    we run it in a background thread and return immediately rather than blocking the
+    request until it times out at the proxy. The outcome is recorded by
+    run_one_report into report_runs, visible in the detail page's "Last 5 Runs".
+    """
     if not report_by_key(report_key):
         return jsonify(ok=False, error="unknown report"), 404
     try:
         from .scheduler import run_one_report
     except ImportError:
         return jsonify(ok=False, error="scheduler not yet wired"), 500
-    try:
-        result = run_one_report(report_key)
-        return jsonify(ok=True, **result)
-    except Exception as e:
-        logger.exception("manual run for %s failed", report_key)
-        return jsonify(ok=False, error=str(e)), 500
+
+    def _run():
+        """Build + send off-thread so the HTTP request can return right away."""
+        try:
+            run_one_report(report_key)
+        except Exception:
+            logger.exception("manual run for %s failed", report_key)
+
+    threading.Thread(target=_run, daemon=True, name=f"manual-run-{report_key}").start()
+    logger.info("manual run for %s started (background)", report_key)
+    return jsonify(ok=True, started=True), 202
 
 
 @bp.route("/reports/settings", methods=["GET"])
