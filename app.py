@@ -484,14 +484,32 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
             return "Cancelled task, moved to Ready to Schedule"
         return "Cancelled task, recalculated install dates"
     elif event_type == "TASK_COMPLETED":
-        pre_dates = recalc_install(conn, deal_id)
-        is_part1 = bool(pre_dates and pre_dates[0] == date)
         upsert_task_state(conn, task_id, deal_id, "install", date, status="completed")
         recalc_install(conn, deal_id)
-        if is_part1:
-            pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
-            return "Moved to Install Complete"
-        return "Marked install task completed"
+        # Only close the deal out (→ Install Complete) when this completion is truly
+        # the last install. Another install still scheduled for a LATER date always
+        # holds it back. Installs on the SAME day hold it back too — UNLESS this task
+        # is the "final" phase, the one designated to close the job out. (Phase is
+        # read from task_state, which preserves it even if the completion event omits
+        # the extra field; repair tasks are stored as "final".)
+        later = conn.execute(
+            "SELECT 1 FROM task_state WHERE deal_id=? AND task_type='install' "
+            "AND status='active' AND archived=0 AND task_date > ? LIMIT 1",
+            (deal_id, date),
+        ).fetchone()
+        same_day = conn.execute(
+            "SELECT 1 FROM task_state WHERE deal_id=? AND task_type='install' "
+            "AND status='active' AND archived=0 AND task_date = ? LIMIT 1",
+            (deal_id, date),
+        ).fetchone()
+        phase_row = conn.execute(
+            "SELECT install_phase FROM task_state WHERE task_id=? LIMIT 1", (task_id,)
+        ).fetchone()
+        is_final = bool(phase_row and (phase_row["install_phase"] or "").lower() == "final")
+        if later or (same_day and not is_final):
+            return "Install task completed; a later/same-day install is still scheduled — staying put"
+        pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
+        return "Moved to Install Complete"
 
 # ---------------------------------------------------------------------------
 # IP RESTRICTION — only accessible from the Pi itself
