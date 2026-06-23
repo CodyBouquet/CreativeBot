@@ -19,9 +19,11 @@ Two groups, both off the same inv_position = on_hand + on_po − backorders:
     suggested    = ceil_to_box(max(0, order_up_to − inv_position))
 
   Manual-safety items (prodcode in MANUAL_SAFETY_PRODCODES — hand-managed cushion
-  rolls "az" and trim "19"): no computed reorder point or order qty — just notify
+  rolls "az" and trim "19"): the days-of-supply safety/reorder are shown only as a
+  suggested ballpark for setting the fields; the live trigger uses the ENTERED
+  safety stock —
     NOTIFY when inv_position < manual safety (CAT_SAFTYSTK), OR on_hand < it
-    (the on-hand trip is the urgent one); suggested order is left blank.
+    (the on-hand trip is the urgent one); no auto order qty.
 
 Columns (.txt full audit):
     SEQUENCE   CAT_SEQUENCE
@@ -700,28 +702,30 @@ def build_report():
     #     position ≤ reorder; suggested qty tops back up to order-up-to.
     for r in items.values():
         r["daily_demand"] = r["sold_1yr"] / float(cfg.DEMAND_WINDOW_DAYS)
+        dd  = r["daily_demand"]
         box = r["box_qty"]
         r["inv_pos"] = r["on_hand"] + r["on_po"] - r["unassign"]
         r["manual_safety"] = _is_manual_safety(r)
 
+        # Days-of-supply figures, computed for EVERY SKU. For general items these are
+        # the live reorder targets; for manual-safety items they're shown only as a
+        # suggested "ballpark" to help set the hand-entered fields — the live alert
+        # for those still keys off the entered safety stock (below).
+        r["rec_safety"]  = _ceil_to_box(dd * cfg.GENERAL_SAFETY_DAYS, box)
+        r["rec_rop"]     = _ceil_to_box(dd * cfg.GENERAL_REORDER_DAYS, box)
+        r["order_up_to"] = _ceil_to_box(dd * cfg.GENERAL_ORDER_UP_TO_DAYS, box)
+
         if r["manual_safety"]:
-            # Trust the hand-entered safety stock; no computed targets, no order qty.
+            # Hand-managed: notify when stock falls below the ENTERED safety stock
+            # (inventory position, or — urgently — physical on-hand); no auto order.
             saf = r["safety_cur"]
-            r["rec_safety"]  = saf       # the threshold is the manual number itself
-            r["rec_rop"]     = saf
-            r["order_up_to"] = saf
-            r["rec_qty"]     = 0.0       # notify only — these are reordered by hand
-            # Notify on either trip; physical on-hand below safety is the urgent one.
-            r["urgent"]      = r["on_hand"] < saf
-            r["order_now"]   = (r["inv_pos"] < saf) or r["urgent"]
+            r["urgent"]    = r["on_hand"] < saf
+            r["order_now"] = (r["inv_pos"] < saf) or r["urgent"]
+            r["rec_qty"]   = 0.0
         else:
-            dd = r["daily_demand"]
-            r["rec_safety"]  = _ceil_to_box(dd * cfg.GENERAL_SAFETY_DAYS, box)
-            r["rec_rop"]     = _ceil_to_box(dd * cfg.GENERAL_REORDER_DAYS, box)
-            r["order_up_to"] = _ceil_to_box(dd * cfg.GENERAL_ORDER_UP_TO_DAYS, box)
-            r["order_now"]   = r["inv_pos"] <= r["rec_rop"]
-            r["rec_qty"]     = _ceil_to_box(max(0.0, r["order_up_to"] - r["inv_pos"]), box)
-            r["urgent"]      = r["inv_pos"] < r["rec_safety"]  # below safety, not just reorder
+            r["order_now"] = r["inv_pos"] <= r["rec_rop"]
+            r["rec_qty"]   = _ceil_to_box(max(0.0, r["order_up_to"] - r["inv_pos"]), box)
+            r["urgent"]    = r["inv_pos"] < r["rec_safety"]  # below safety, not just reorder
 
         # Display delta of current vs recommended safety threshold (cur → rec).
         r["safety_delta"] = r["rec_safety"] - r["safety_cur"]

@@ -64,6 +64,13 @@ STOCKED_CATALOG_MAX_AGE_DAYS = 7
 # 6 stays under the API's sustained-pagination throttle.
 CATALOG_SCAN_BATCH = 6
 
+# ---- Email display ----
+# TEMPORARY: when True, the email lists EVERY stocked SKU (not just the ones below
+# their reorder point) so current vs. suggested safety/reorder can be reviewed and
+# set across the whole catalog. Flip back to False to return to the action-focused
+# "order now only" email.
+INVENTORY_EMAIL_SHOW_ALL = True
+
 # ---- Output ----
 OUTPUT_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),

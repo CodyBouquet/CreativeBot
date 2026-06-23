@@ -15,22 +15,34 @@ log = logging.getLogger(__name__)
 
 
 def build_section(user, ctx: ReportContext) -> str | None:
-    """Return the reorder HTML table (same for every recipient), reusing the cached row pull; None when nothing needs ordering.
+    """Return the reorder HTML table (same for every recipient), reusing the cached row pull; None when there's nothing to show.
 
-    The pull evaluates every stocked SKU, but the email is action-focused: it
-    shows only SKUs at or below their reorder point (ORDER NOW). The full
-    stocked-universe audit lives in the .txt report, not the email.
+    The pull evaluates every stocked SKU. Normally the email is action-focused and
+    shows only SKUs at or below their reorder point (ORDER NOW). When the temporary
+    INVENTORY_EMAIL_SHOW_ALL flag is set it instead lists EVERY stocked SKU — a
+    review view for setting safety/reorder fields catalog-wide (current → suggested).
     """
     rows = ctx.get_or_compute("inventory.lowstock_rows", _pull_rows)
-    order_rows = [r for r in rows if r.get("order_now")]
-    if not order_rows:
+
+    show_all = False
+    try:
+        from ..inventory import inventory_email_config as cfg
+        show_all = bool(getattr(cfg, "INVENTORY_EMAIL_SHOW_ALL", False))
+    except Exception:
+        log.exception("could not read INVENTORY_EMAIL_SHOW_ALL")
+
+    display = rows if show_all else [r for r in rows if r.get("order_now")]
+    if not display:
         return None
-    return report_card(
-        "Inventory — Low Stock",
-        _render_html(order_rows),
-        icon="📦",
-        badge=f"{len(order_rows)} to order",
-    )
+
+    if show_all:
+        below = sum(1 for r in display if r.get("order_now"))
+        title = "Inventory — Stock Review (all stocked SKUs)"
+        badge = f"{below} below / {len(display)} stocked"
+    else:
+        title = "Inventory — Low Stock"
+        badge = f"{len(display)} to order"
+    return report_card(title, _render_html(display, show_all=show_all), icon="📦", badge=badge)
 
 
 def _pull_rows() -> list[dict]:
@@ -59,28 +71,33 @@ def _pull_rows() -> list[dict]:
     return rows
 
 
-def _render_html(rows: list[dict]) -> str:
+def _render_html(rows: list[dict], show_all: bool = False) -> str:
     """
-    Action-focused table for the card body: one row per SKU to order.
+    Table for the card body. Normally one row per SKU to order; when show_all is
+    set it's every stocked SKU — a review view for setting safety/reorder fields.
 
     Six columns — Item (style/color with a vendor·sequence subline), On Hand,
-    Inv Pos, Safety (current→recommended), Reorder (current→recommended), and
-    Order Qty. The threshold columns convey how urgent the reorder is and, since
-    current reorder points are mostly unset in BMS, make the 0→value gap visible.
-    Manual-safety SKUs (hand-managed cushion/trim) carry no computed reorder or
-    order qty, so those two cells show "—"; their alert is purely "below your
-    entered safety stock." Rows alternate a faint zebra fill; urgent rows (general:
-    inv_pos below recommended safety; manual: on-hand below the entered safety)
-    get a red left-accent and red, bold order qty so they stand out.
+    Inv Pos, Safety (current→suggested), Reorder (current→suggested), and Order Qty.
+    The threshold columns show the days-of-supply suggestion against the current
+    value (current reorder points are mostly unset in BMS, so the 0→value gap is
+    visible). Order Qty is shown only for general SKUs that are actually below their
+    reorder point; manual-safety SKUs and not-yet-due rows show "—". Rows alternate
+    a faint zebra fill; urgent rows (general: inv_pos below suggested safety; manual:
+    on-hand below the entered safety) get a red left-accent and red, bold order qty.
     """
     th  = ("text-align:left; padding:7px 9px; border-bottom:2px solid #e4e4e4; "
            "font-size:11px; letter-spacing:0.5px; color:#999; text-transform:uppercase;")
     thr = th + " text-align:right;"
 
-    head = (
-        '<p style="font-size:12px; color:#888; margin:2px 0 10px;">'
+    caption = (
+        'Every stocked SKU — review and set safety / reorder. Below-reorder items '
+        'first. Thresholds shown current → <strong>suggested</strong>.'
+        if show_all else
         'At or below reorder point — order now. Thresholds shown current → '
-        '<strong>recommended</strong>.</p>'
+        '<strong>suggested</strong>.'
+    )
+    head = (
+        f'<p style="font-size:12px; color:#888; margin:2px 0 10px;">{caption}</p>'
         '<table style="border-collapse:collapse; width:100%; font-size:13px;">'
         '<thead><tr>'
         f'<th style="{th}">Item</th>'
@@ -119,10 +136,12 @@ def _render_html(rows: list[dict]) -> str:
         name = style if not color else f'{style} <span style="color:#999;">· {color}</span>'
         sub  = f'{vendor} · {seq}'
 
-        # Manual-safety SKUs have no computed reorder or order qty — show "—".
+        # Safety & reorder show current → suggested for every SKU (the suggestion is
+        # guidance for manual-safety items too). Order Qty is meaningful only for a
+        # general SKU that's actually below its reorder point — otherwise "—".
         safety_cell  = _cur_rec(r.get("safety_cur", 0), r.get("rec_safety", 0))
-        reorder_cell = "—" if manual else _cur_rec(r.get("reorder_cur", 0), r.get("rec_rop", 0))
-        qty_cell     = "—" if manual else f'{r.get("rec_qty", 0):.0f}'
+        reorder_cell = _cur_rec(r.get("reorder_cur", 0), r.get("rec_rop", 0))
+        qty_cell     = f'{r.get("rec_qty", 0):.0f}' if (r.get("order_now") and not manual) else "—"
 
         td  = f"padding:8px 9px; border-bottom:1px solid #f0f0f0; background:{zebra};"
         tdr = td + " text-align:right; font-variant-numeric:tabular-nums;"
