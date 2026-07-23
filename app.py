@@ -485,13 +485,13 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
         return "Cancelled task, recalculated install dates"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "install", date, status="completed")
-        recalc_install(conn, deal_id)
         # Only close the deal out (→ Install Complete) when this completion is truly
         # the last install. Another install still scheduled for a LATER date always
         # holds it back. Installs on the SAME day hold it back too — UNLESS this task
         # is the "final" phase, the one designated to close the job out. (Phase is
         # read from task_state, which preserves it even if the completion event omits
-        # the extra field; repair tasks are stored as "final".)
+        # the extra field; repair tasks are stored as "final".) These checks read
+        # task_state only, so they don't depend on recalc_install having run yet.
         later = conn.execute(
             "SELECT 1 FROM task_state WHERE deal_id=? AND task_type='install' "
             "AND status='active' AND archived=0 AND task_date > ? LIMIT 1",
@@ -506,10 +506,17 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
             "SELECT install_phase FROM task_state WHERE task_id=? LIMIT 1", (task_id,)
         ).fetchone()
         is_final = bool(phase_row and (phase_row["install_phase"] or "").lower() == "final")
-        if later or (same_day and not is_final):
-            return "Install task completed; a later/same-day install is still scheduled — staying put"
-        pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
-        return "Moved to Install Complete"
+        close_out = not (later or (same_day and not is_final))
+        # Push the stage change BEFORE recalculating the date fields. The Pipedrive
+        # automation that fires on entering Install Complete must see the completed
+        # install's dates — so move the stage first, then let recalc_install rewrite
+        # install_start/part2 from the remaining (next) install tasks.
+        if close_out:
+            pd_move_stage(deal_id, INSTALL_COMPLETE_STAGE_ID)
+        recalc_install(conn, deal_id)
+        if close_out:
+            return "Moved to Install Complete"
+        return "Install task completed; a later/same-day install is still scheduled — staying put"
 
 # ---------------------------------------------------------------------------
 # IP RESTRICTION — only accessible from the Pi itself
