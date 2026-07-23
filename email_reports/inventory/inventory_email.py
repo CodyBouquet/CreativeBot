@@ -1,60 +1,42 @@
 """
-BMS stocked-SKU reorder report (days-of-supply policy).
+BMS stocked-SKU reorder report.
 
-Pulls demand + supply data from the Rollmaster (Broadlume BMS) API and evaluates
-EVERY stocked SKU (CAT_SAFTYSTK > 0), not just the ones currently below safety —
-so thresholds set too low get caught. The stocked universe comes from the weekly
-catalog_scan.py cache (cfg.STOCKED_CATALOG_CACHE), falling back to /lowstock when
-that cache is missing/stale.
+Pulls current stock from the Rollmaster (Broadlume BMS) API and evaluates EVERY
+stocked SKU (CAT_SAFTYSTK > 0) against the thresholds ENTERED IN BMS — nothing is
+computed. The stocked universe comes from the weekly catalog_scan.py cache
+(cfg.STOCKED_CATALOG_CACHE), falling back to /lowstock when that cache is
+missing/stale.
 
-Reorder policy (per SKU), all stock figures rounded up to CAT_UNIT_PER_BOX.
-Two groups, both off the same inv_position = on_hand + on_po − backorders:
+Notify policy (per SKU), keyed off available balance = on_hand − reserved
+(the per-roll BMS AVAILABLE_FLOAT, summed across a SKU's rolls):
 
-  General items — days-of-supply on average demand:
-    daily_demand = SOLD_1YR / DEMAND_WINDOW_DAYS
-    safety       = daily_demand × GENERAL_SAFETY_DAYS     (7d)
-    reorder      = daily_demand × GENERAL_REORDER_DAYS    (21d)
-    order_up_to  = daily_demand × GENERAL_ORDER_UP_TO_DAYS (35d)
-    ORDER NOW    when inv_position ≤ reorder
-    suggested    = ceil_to_box(max(0, order_up_to − inv_position))
+    urgent    when available < safety stock  (CAT_SAFTYSTK) — CRITICAL: red, top
+    NOTIFY    when available < reorder point  (CAT_REORDER), OR below safety
 
-  Manual-safety items (prodcode in MANUAL_SAFETY_PRODCODES — hand-managed cushion
-  rolls "az" and trim "19"): the days-of-supply safety/reorder are shown only as a
-  suggested ballpark for setting the fields; the live trigger uses the ENTERED
-  safety stock —
-    NOTIFY when inv_position < manual safety (CAT_SAFTYSTK), OR on_hand < it
-    (the on-hand trip is the urgent one); no auto order qty.
+The OR keeps a below-safety SKU visible even when its reorder point is still
+unset (0) in BMS — a properly set reorder point is always ≥ safety stock, so this
+reduces to plain "available < reorder" whenever the field is populated.
 
 Columns (.txt full audit):
     SEQUENCE   CAT_SEQUENCE
-    VENDOR     PO-history vendor, else catalog CAT_VENDORID
+    VENDOR     catalog CAT_VENDORID
     ON_HAND    sum of current rolls (/productstock ONHAND_FLOAT)
-    UNASN      open-order demand not yet allocated to rolls (= backorders)
-    ON_PO      open PO QTYORD minus QTYREC
-    INV_POS    inventory position = ON_HAND + ON_PO − UNASN
-    SOLD_1YR   sum of IVL_SQUAN on invoices dated within DEMAND_WINDOW_DAYS
-    BUSY_MO    peak rolling-30-day shipped qty (context only; not the policy basis)
-    BOX        CAT_UNIT_PER_BOX — round recommendations up to multiples of this
-    SAF_CUR    current safety stock (catalog CAT_SAFTYSTK, or /lowstock fallback)
-    SAF_REC    recommended safety = daily_demand × safety_days, ceil to box
-    ROP_CUR    current reorder point (catalog CAT_REORDER; often 0/unset)
-    ROP_REC    recommended reorder = daily_demand × reorder_days, ceil to box
-    UPTO       order-up-to = daily_demand × order_up_to_days, ceil to box
-    QTY_REC    suggested order = max(0, UPTO − INV_POS), ceil to box
-    ORDER      "YES" when INV_POS ≤ ROP_REC
+    RESERVED   assigned/committed to orders (/productstock RESERVED_FLOAT)
+    AVAIL      available balance = ON_HAND − RESERVED (/productstock AVAILABLE_FLOAT)
+    SAFETY     entered safety stock (catalog CAT_SAFTYSTK, or /lowstock fallback)
+    REORDER    entered reorder point (catalog CAT_REORDER; often 0/unset)
+    NOTIFY     "CRIT" below safety, else "YES" below reorder, else blank
 
 Usage:
     ./venv/bin/python inventory_email.py
 """
 import json
-import math
 import os
 import re
 import sys
 import time
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -89,6 +71,7 @@ def _f(x):
 # it in free text, and which text field carries it varies by product. So we scrape
 # a "<number> SY/SYD/SQYD" token out of the descriptive fields. SYD/SQ.YD come
 # before SY in the alternation so "30 SYD" matches the longer unit, not a bare SY.
+# (Kept for catalog_scan.py, which caches per-roll yardage.)
 _YARDAGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:SQ\.?\s?YD|SYD|SY|S/?Y)\b", re.IGNORECASE)
 
 
@@ -113,75 +96,12 @@ def parse_yardage(*texts):
     return 0.0
 
 
-def _parse_date(s):
-    """Parse an 8-digit BMS date, trying both YYYYMMDD and MMDDYYYY and keeping whichever gives a plausible year. Returns a datetime or None."""
-    s = (s or "").strip()
-    if len(s) != 8 or not s.isdigit() or s == "00000000":
-        return None
-    # BMS mixes YYYYMMDD and MMDDYYYY; pick whichever yields a plausible year
-    for fmt in ("%Y%m%d", "%m%d%Y"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            if 2000 <= dt.year <= 2099:
-                return dt
-        except ValueError:
-            continue
-    return None
-
-
 def _parse_iso(s):
     """Parse an ISO-8601 timestamp (e.g. the cache's scanned_at) to a datetime, or None."""
     try:
         return datetime.fromisoformat(s)
     except (TypeError, ValueError):
         return None
-
-
-def _rolling_30day_max(events):
-    """
-    Largest total shipped quantity inside any 30-day window of `events`.
-
-    `events` is a date-sorted list of (date, qty). We slide a 30-day window whose
-    left edge sits on each event in turn and sum every event within
-    [d, d + 30 days). The maximum such sum is the SKU's "busy month" — the peak
-    rolling-30-day demand the policy keeps on hand as safety stock. Because the
-    list is sorted, the window's right edge only ever moves forward, so the whole
-    scan is a single linear two-pointer pass. Returns 0.0 for an empty history.
-    """
-    if not events:
-        return 0.0
-    window = timedelta(days=30)
-    best = running = 0.0
-    j = 0
-    n = len(events)
-    for i in range(n):
-        # Extend the right edge to include every event within 30 days of events[i].
-        while j < n and events[j][0] < events[i][0] + window:
-            running += events[j][1]
-            j += 1
-        best = max(best, running)
-        # Slide the left edge off events[i] before advancing to events[i+1].
-        running -= events[i][1]
-    return best
-
-
-def _is_manual_safety(r):
-    """
-    True when a record is in the manual-safety group: its product code is in
-    MANUAL_SAFETY_PRODCODES and it isn't on the exclusion list (e.g. FIRM GRIP).
-    These SKUs are managed by hand — we notify off their entered safety stock
-    instead of computing a reorder point.
-    """
-    return (r["prodcode"] in cfg.MANUAL_SAFETY_PRODCODES
-            and r["seq"] not in cfg.MANUAL_SAFETY_EXCLUDE_SEQS)
-
-
-def _ceil_to_box(value, box_qty):
-    """Round up to the next multiple of box_qty. box_qty <= 0 means no boxes → ceil to int."""
-    if value <= 0:
-        return 0.0
-    q = box_qty if box_qty and box_qty > 0 else 1
-    return math.ceil(value / q) * q
 
 
 def authenticate():
@@ -229,19 +149,17 @@ def load_stocked_universe(S):
     Return (universe, from_cache): the SKUs to evaluate as {seq: {cache fields}},
     plus a flag telling whether they came from the full-catalog cache.
 
-    The busy-month policy must judge EVERY stocked SKU (CAT_SAFTYSTK > 0), not
-    just the ones /lowstock currently flags, so that thresholds set too low get
-    caught. That universe is built by the weekly catalog_scan.py job and cached in
-    cfg.STOCKED_CATALOG_CACHE; here we just read it.
+    We judge EVERY stocked SKU (CAT_SAFTYSTK > 0), not just the ones /lowstock
+    currently flags, so that thresholds set too low get caught. That universe is
+    built by the weekly catalog_scan.py job and cached in cfg.STOCKED_CATALOG_CACHE;
+    here we just read it.
 
     The cache is trusted ONLY when it is a COMPLETE scan AND fresh (scanned within
     cfg.STOCKED_CATALOG_MAX_AGE_DAYS). A missing / partial / stale / unreadable
     cache falls back to /lowstock — the old, narrower behavior — rather than
     silently evaluating an incomplete universe (every fallback is logged loudly).
     Both paths return the same shape so build_report can treat them uniformly; the
-    fallback leaves catalog-only fields (vendor/box/style/...) blank/default. The
-    from_cache flag lets build_report skip the costly box-qty catalog scan when the
-    cache already carries CAT_UNIT_PER_BOX for every SKU.
+    fallback leaves catalog-only fields (vendor/reorder/style/...) blank/default.
     """
     path = cfg.STOCKED_CATALOG_CACHE
 
@@ -283,31 +201,22 @@ def load_stocked_universe(S):
         )
 
     # --- Fallback: the narrower "currently below safety" list. Map it onto the
-    # same dict shape, leaving catalog-only fields blank for downstream code.
+    # same dict shape, leaving catalog-only fields blank for downstream code. The
+    # reorder point isn't in /lowstock, so it defaults to 0 (the safety trigger
+    # still fires on this degraded path).
     universe = {}
     for it in pull_lowstock(S):
         seq = str(it.get("CAT_SEQUENCE", "")).strip()
         if not seq:
             continue
         universe[seq] = {
-            "safety":  _f(it.get("CAT_SAFETY_STOCK")),  # current safety threshold
+            "safety":  _f(it.get("CAT_SAFETY_STOCK")),  # entered safety threshold
             "reorder": 0.0,
-            "vendor":  "",   # filled later from the PO-derived vendor map
-            "box":     1.0,  # filled later from the box-qty cache
+            "vendor":  "",
             "style":   "",
-            "stynum":  "",
             "color":   "",
-            "desc":    "",
         }
     return universe, False
-
-
-def pull_orders(S, open_only=True, end=None):
-    """Fetch order headers from ORDER_HISTORY_FLOOR through `end`; open_only=False adds active-status orders."""
-    params = {"company": COMPANY, "startdate": cfg.ORDER_HISTORY_FLOOR, "enddate": end}
-    if not open_only:
-        params["ordstatus"] = "A"
-    return _get(S, "orders", params).json()
 
 
 def pull_productstock(S, seq):
@@ -316,266 +225,51 @@ def pull_productstock(S, seq):
     return r.json() if r.status_code == 200 else []
 
 
-def pull_orderline_bulk(S, branch, end):
-    """Fetch all order lines for one branch over the history window (used for UNASSIGN and PEAK_WK); [] on non-200."""
-    r = _get(
-        S,
-        "orderline",
-        {"company": COMPANY, "branch": branch, "startdate": cfg.ORDER_HISTORY_FLOOR, "enddate": end},
-        timeout=300,
-    )
-    return r.json() if r.status_code == 200 else []
-
-
-def pull_purchaseorderlines(S):
-    """Fetch PO lines — source of the per-seq vendor map and open-PO (ON_PO) quantities."""
-    return _get(S, "purchaseorderlines", {"company": COMPANY, "pagelimit": "1000"}).json()
-
-
-def pull_invoice_headers(S, branch, start, end):
-    """Return {IVC_INVNO: datetime} for invoices in [start, end]."""
-    invs = {}
-    page = 1
-    while True:
-        r = _get(
-            S,
-            "invoice",
-            {"company": COMPANY, "branch": branch, "startdate": start, "enddate": end,
-             "page": str(page), "pagelimit": "1000"},
-            timeout=120,
-        )
-        if r.status_code != 200:
-            break
-        d = r.json()
-        if not isinstance(d, list) or not d:
-            break
-        for rec in d:
-            invno = str(rec.get("IVC_INVNO", "")).strip()
-            dt = _parse_date(rec.get("IVC_DATE"))
-            if invno and dt:
-                invs[invno] = dt
-        if len(d) < 1000:
-            break
-        page += 1
-    return invs
-
-
-def pull_box_quantities(S, target_seqs, batch=16):
-    """
-    Return {seq: CAT_UNIT_PER_BOX (float)} for each target seq.
-
-    Uses a disk cache (cfg.BOX_QTY_CACHE) refreshed every
-    BOX_QTY_CACHE_MAX_AGE_DAYS to avoid a 2-min catalog scan every run.
-    """
-    # Load cache if fresh
-    cache = {}
-    if os.path.exists(cfg.BOX_QTY_CACHE):
-        age = time.time() - os.path.getmtime(cfg.BOX_QTY_CACHE)
-        if age < cfg.BOX_QTY_CACHE_MAX_AGE_DAYS * 86400:
-            try:
-                with open(cfg.BOX_QTY_CACHE) as f:
-                    cache = json.load(f)
-            except Exception:
-                cache = {}
-
-    missing = [s for s in target_seqs if s not in cache]
-    if not missing:
-        return {s: cache[s] for s in target_seqs}
-
-    # Scan /catalogitems across the full history until every missing seq is found
-    # or pagination ends. Early-stop keeps this from walking the whole catalog
-    # when the targets are concentrated.
-    def fetch_page(p):
-        """Fetch one page of /catalogitems; [] on non-200."""
-        r = _get(
-            S,
-            "catalogitems",
-            {
-                "company": COMPANY,
-                "startdate": "19000101",
-                "enddate": "21000101",
-                "page": str(p),
-                "pagelimit": "1000",
-            },
-            timeout=300,
-        )
-        return r.json() if r.status_code == 200 else []
-
-    missing_set = set(missing)
-    found_here = {}
-    page = 1
-    bar = tqdm(
-        total=len(missing_set),
-        desc="box qty (catalog scan)",
-        unit="seq",
-        file=sys.stderr,
-        dynamic_ncols=True,
-    )
-    try:
-        while missing_set:
-            with ThreadPoolExecutor(max_workers=batch) as ex:
-                results = list(ex.map(fetch_page, range(page, page + batch)))
-            end_of_catalog = False
-            for d in results:
-                if not d:
-                    end_of_catalog = True
-                    continue
-                for it in d:
-                    seq = str(it.get("CAT_SEQUENCE", "")).strip()
-                    if seq in missing_set:
-                        found_here[seq] = _f(it.get("CAT_UNIT_PER_BOX"))
-                        missing_set.discard(seq)
-                        bar.update(1)
-                if len(d) < 1000:
-                    end_of_catalog = True
-            page += batch
-            if end_of_catalog:
-                break
-    finally:
-        bar.close()
-
-    # Any seq we couldn't find in the catalog gets 1 (no box)
-    for s in missing_set:
-        found_here[s] = 1.0
-
-    cache.update(found_here)
-    try:
-        with open(cfg.BOX_QTY_CACHE, "w") as f:
-            json.dump(cache, f)
-    except Exception as e:
-        print(f"(could not write box-qty cache: {e})", file=sys.stderr)
-
-    return {s: cache.get(s, 1.0) for s in target_seqs}
-
-
-def walk_invoice_lines(S, invno_dates, target_seqs, batch=16):
-    """
-    Walk /invoicelines (paginated) and return {seq: [(invoice_date, qty), ...]}
-    for lines whose invoice is in invno_dates and whose catseq is in target_seqs.
-    """
-    events = defaultdict(list)
-    page = 1
-
-    def fetch_page(p):
-        """Fetch one page of /invoicelines; [] on non-200."""
-        r = _get(
-            S,
-            "invoicelines",
-            {"company": COMPANY, "page": str(p), "pagelimit": "1000"},
-            timeout=120,
-        )
-        return r.json() if r.status_code == 200 else []
-
-    # Unknown total; tqdm shows a rolling rate + running count.
-    bar = tqdm(desc="invoicelines", unit="page", file=sys.stderr, dynamic_ncols=True)
-    try:
-        while True:
-            with ThreadPoolExecutor(max_workers=batch) as ex:
-                results = list(ex.map(fetch_page, range(page, page + batch)))
-            done = False
-            pages_with_data = 0
-            for d in results:
-                if not d:
-                    done = True
-                    continue
-                pages_with_data += 1
-                for rec in d:
-                    invno = str(rec.get("IVL_INVNO", "")).strip()
-                    dt = invno_dates.get(invno)
-                    if not dt:
-                        continue
-                    seq = str(rec.get("IVL_CAT_SEQUENCE", "")).strip()
-                    if seq not in target_seqs:
-                        continue
-                    events[seq].append((dt, _f(rec.get("IVL_SQUAN"))))
-                if len(d) < 1000:
-                    done = True
-            bar.update(pages_with_data)
-            page += batch
-            if done:
-                break
-    finally:
-        bar.close()
-    return events
-
-
 # ---- Report build ---------------------------------------------------------
 
 def build_report():
-    """Orchestrate the full low-stock analysis: pull lowstock/orders/PO/stock/invoice data (largely in parallel), compute demand stats per seq, and derive recommended safety stock, reorder point, and order qty. Returns a list of per-item dicts."""
+    """
+    Evaluate every stocked SKU against its entered BMS thresholds and return a list
+    of per-item dicts.
+
+    Pulls the stocked universe (weekly catalog cache, or /lowstock fallback), then
+    the live roll stock per SKU (/productstock, in parallel) to get on_hand,
+    reserved and available. Available = on_hand − reserved. A SKU is flagged
+    order_now when available drops below its reorder point (or below safety), and
+    urgent when available drops below safety stock. Nothing is computed — the
+    thresholds are the values entered in BMS.
+    """
     t0 = time.time()
-    today = datetime.now()
-    end_yyyymmdd = today.strftime("%Y%m%d")
-    start_yyyymmdd = (today - timedelta(days=cfg.DEMAND_WINDOW_DAYS)).strftime("%Y%m%d")
 
     token = authenticate()
     S = make_session(token)
     print(f"[{time.time()-t0:5.1f}s] authenticated", file=sys.stderr)
 
-    # --- Stocked universe (the SKUs we evaluate) + parallel supply pulls.
-    # load_stocked_universe reads the weekly catalog cache (or falls back to
-    # /lowstock); orders/PO pulls run alongside it for UNASSIGN, vendor and ON_PO.
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        f_uni = ex.submit(load_stocked_universe, S)
-        f_ord = ex.submit(pull_orders, S, True, end_yyyymmdd)
-        f_pol = ex.submit(pull_purchaseorderlines, S)
-        universe, universe_from_cache = f_uni.result()
-        open_orders = f_ord.result()
-        po_lines = f_pol.result()
-    print(
-        f"[{time.time()-t0:5.1f}s] stocked SKUs={len(universe)}, open_orders={len(open_orders)}, po_lines={len(po_lines)}",
-        file=sys.stderr,
-    )
-
+    # --- Stocked universe (the SKUs we evaluate).
+    universe, _from_cache = load_stocked_universe(S)
+    print(f"[{time.time()-t0:5.1f}s] stocked SKUs={len(universe)}", file=sys.stderr)
     target = set(universe.keys())
 
-    # Best-effort vendor map from /purchaseorderlines, used for the VENDOR display
-    # column. Prefer the PO-history vendor; fall back to the catalog's CAT_VENDORID
-    # when a SKU has no PO history. (Lead time is now a flat assumption, so vendor
-    # no longer drives the math.)
-    vendor_by_seq = {}
-    for p in po_lines:
-        seq = str(p.get("CATSEQUENCE", "")).strip()
-        v = (p.get("VENDOR") or "").strip()
-        if seq and v and seq not in vendor_by_seq:
-            vendor_by_seq[seq] = v
-
-    # Seed one record per stocked SKU. Current safety, box and descriptive fields
-    # come straight from the catalog cache; live supply/demand numbers are filled
-    # in by the pulls below.
+    # Seed one record per stocked SKU. Entered thresholds and descriptive fields
+    # come from the catalog cache; live stock is filled from /productstock below.
     items = {
         seq: {
-            "seq":          seq,
-            "safety_cur":   _f(u.get("safety")),                       # current CAT_SAFTYSTK
-            "reorder_cur":  _f(u.get("reorder")),                      # current CAT_REORDER (often 0/unset)
-            "vendor":       vendor_by_seq.get(seq) or str(u.get("vendor", "")).strip(),
-            "on_hand":      0.0,
-            "unassign":     0.0,                                       # = backorders
-            "on_po":        0.0,
-            "sold_1yr":     0.0,
-            "busy_month":   0.0,                                       # peak 30-day demand (context only)
-            "box_qty":      _f(u.get("box")) or 1.0,                   # CAT_UNIT_PER_BOX
-            "prodcode":     str(u.get("prodcode", "")).strip(),        # product type (drives manual-safety group)
-            "style":        str(u.get("style", "")).strip(),
-            "color":        str(u.get("color", "")).strip(),
+            "seq":         seq,
+            "safety_cur":  _f(u.get("safety")),                  # entered CAT_SAFTYSTK
+            "reorder_cur": _f(u.get("reorder")),                 # entered CAT_REORDER
+            "vendor":      str(u.get("vendor", "")).strip(),     # catalog CAT_VENDORID
+            "on_hand":     0.0,
+            "reserved":    0.0,                                  # assigned/committed to orders
+            "available":   0.0,                                  # on_hand − reserved
+            "style":       str(u.get("style", "")).strip(),
+            "color":       str(u.get("color", "")).strip(),
         }
         for seq, u in universe.items()
     }
 
-    # --- Box quantities. The stocked-catalog cache already carries CAT_UNIT_PER_BOX
-    # for every SKU, so we only run the (slow, page-by-page) box-qty catalog scan on
-    # the /lowstock fallback path — where box defaulted to 1. Skipping it on the
-    # cache path avoids a ~45-min scan that would re-derive box sizes we already have.
-    if universe_from_cache:
-        print(f"[{time.time()-t0:5.1f}s] box qty from catalog cache (scan skipped)", file=sys.stderr)
-    else:
-        box_qty_map = pull_box_quantities(S, list(target))
-        for seq, bq in box_qty_map.items():
-            if seq in items and bq and bq > 0:
-                items[seq]["box_qty"] = bq
-        print(f"[{time.time()-t0:5.1f}s] box qty resolved", file=sys.stderr)
-
-    # --- Current stock per seq (parallel)
+    # --- Current stock per seq (parallel). on_hand / reserved / available all come
+    # straight from BMS per-roll fields; we sum the rolls for each SKU. BMS already
+    # computes AVAILABLE_FLOAT = ONHAND_FLOAT − RESERVED_FLOAT per roll.
     def stock_one(seq):
         """Pull one seq's stock and return it paired with the seq (for the threaded map)."""
         return seq, pull_productstock(S, seq)
@@ -590,7 +284,9 @@ def build_report():
             dynamic_ncols=True,
         ):
             if isinstance(data, list) and data:
-                items[seq]["on_hand"] = sum(_f(x.get("ONHAND_FLOAT")) for x in data)
+                items[seq]["on_hand"]   = sum(_f(x.get("ONHAND_FLOAT")) for x in data)
+                items[seq]["reserved"]  = sum(_f(x.get("RESERVED_FLOAT")) for x in data)
+                items[seq]["available"] = sum(_f(x.get("AVAILABLE_FLOAT")) for x in data)
                 # Prefer live roll style/color, but never overwrite a populated
                 # cache value with a blank one.
                 st = (data[0].get("STYLE") or "").strip()
@@ -599,194 +295,62 @@ def build_report():
                     items[seq]["style"] = st
                 if co:
                     items[seq]["color"] = co
-                # Product code drives the manual-safety group (CAT_PRODCODE in
-                # MANUAL_SAFETY_PRODCODES). The catalog code is authoritative;
-                # /productstock can carry a different code, so only use it as a
-                # fallback when the catalog left it blank — never overwrite the
-                # cached value, or group membership flips.
-                pc = (data[0].get("PRODCODE") or "").strip()
-                if pc and not items[seq]["prodcode"]:
-                    items[seq]["prodcode"] = pc
+    print(f"[{time.time()-t0:5.1f}s] productstock pulled", file=sys.stderr)
 
-    # --- ON_PO from open /purchaseorderlines records
-    for p in po_lines:
-        if str(p.get("STATUS", "")).strip().upper() != "O":
-            continue
-        seq = str(p.get("CATSEQUENCE", "")).strip()
-        if seq not in target:
-            continue
-        q = _f(p.get("QTYORD")) - _f(p.get("QTYREC"))
-        if q > 0:
-            items[seq]["on_po"] += q
-
-    # --- Bulk /orderline per branch (parallel) for UNASSIGN and PEAK_WK
-    open_ordnos = {str(o.get("DMO_ORDNO", "")).strip() for o in open_orders}
-    order_date = {}
-    for o in open_orders:
-        ordno = str(o.get("DMO_ORDNO", "")).strip()
-        dt = _parse_date(o.get("DMH_DATE"))
-        if ordno and dt:
-            order_date[ordno] = dt
-    branches = sorted({str(o.get("DMO_WHSE", "")).strip() for o in open_orders if str(o.get("DMO_WHSE", "")).strip()})
-
-    # Invoice header pulls (for SOLD_1YR / busy_month) run in parallel with the
-    # per-branch orderline pulls (for UNASSIGN / backorders).
-    with ThreadPoolExecutor(max_workers=max(len(branches) * 2, 2)) as ex:
-        line_futs = {br: ex.submit(pull_orderline_bulk, S, br, end_yyyymmdd) for br in branches}
-        inv_futs  = {br: ex.submit(pull_invoice_headers, S, br, start_yyyymmdd, end_yyyymmdd) for br in branches}
-
-        all_order_lines = []
-        invno_dates = {}
-        futs_all = list(line_futs.values()) + list(inv_futs.values())
-        bar = tqdm(
-            total=len(futs_all),
-            desc="orderline+invoice hdrs",
-            unit="br",
-            file=sys.stderr,
-            dynamic_ncols=True,
-        )
-        for fut in as_completed(futs_all):
-            result = fut.result()
-            if isinstance(result, tuple):
-                # pull_invoice_headers returns dict, pull_orderline_bulk returns list
-                pass
-            if isinstance(result, list):
-                all_order_lines.extend(result)
-            elif isinstance(result, dict):
-                invno_dates.update(result)
-            bar.update(1)
-        bar.close()
-
-    print(
-        f"[{time.time()-t0:5.1f}s] order lines={len(all_order_lines)}, invoice hdrs={len(invno_dates)}",
-        file=sys.stderr,
-    )
-
-    # Backorders (UNASSIGN): open-order demand not yet allocated to rolls. Summed
-    # per SKU from the open orders' lines; this is subtracted from inventory
-    # position so committed-but-unfilled demand counts against what we have.
-    for ln in all_order_lines:
-        seq = str(ln.get("DMI_CAT_SEQUENCE", "")).strip()
-        if seq not in target:
-            continue
-        ordno = str(ln.get("DMI_ORDNO", "")).strip()
-        if ordno in open_ordnos:
-            u = _f(ln.get("DMI_WQUANTITY")) - _f(ln.get("DMI_QTYASSIGNED"))
-            if u > 0:
-                items[seq]["unassign"] += u
-
-    # --- Invoice-line walk (the slow one): shipped history for SOLD_1YR and the
-    # busy-month figure. seq_events is {seq: [(invoice_date, qty), ...]}.
-    seq_events = walk_invoice_lines(S, invno_dates, target)
-    cutoff = today - timedelta(days=cfg.DEMAND_WINDOW_DAYS)
-
-    # Per SKU: total shipped in the window (SOLD_1YR) and the peak rolling-30-day
-    # shipped qty (busy_month) — computed from the same date-sorted event list.
-    for seq, events in seq_events.items():
-        if seq not in items:
-            continue
-        ev = sorted((d, q) for d, q in events if d >= cutoff and q > 0)
-        items[seq]["sold_1yr"]   = sum(q for _, q in ev)
-        items[seq]["busy_month"] = _rolling_30day_max(ev)
-    print(f"[{time.time()-t0:5.1f}s] invoicelines walked, busy_month computed", file=sys.stderr)
-
-    # --- Reorder policy. Two groups, both keyed off the same inventory position
-    # (on_hand + on_po − backorders); all figures ceil to CAT_UNIT_PER_BOX:
-    #   * Manual-safety SKUs (prodcode in MANUAL_SAFETY_PRODCODES, e.g. cushion
-    #     rolls "az" and trim "19"): managed by hand. We do NOT compute a reorder
-    #     point or suggest an order qty — we notify when stock falls below the
-    #     manually entered safety stock (CAT_SAFTYSTK): on inventory position, and
-    #     (more urgently) on physical on-hand.
-    #   * Everything else: days-of-supply on average demand — safety / reorder /
-    #     order-up-to = daily_demand × GENERAL_*_DAYS; ORDER NOW when inventory
-    #     position ≤ reorder; suggested qty tops back up to order-up-to.
+    # --- Notify policy (uniform for every SKU, straight off the entered thresholds):
+    #   urgent    when available < safety stock (CAT_SAFTYSTK) — critical, red, top.
+    #   order_now when available < reorder point (CAT_REORDER), OR below safety — the
+    #     OR keeps a below-safety SKU visible even when its reorder point is unset (0),
+    #     since a set reorder point is always ≥ safety stock.
     for r in items.values():
-        r["daily_demand"] = r["sold_1yr"] / float(cfg.DEMAND_WINDOW_DAYS)
-        dd  = r["daily_demand"]
-        box = r["box_qty"]
-        r["inv_pos"] = r["on_hand"] + r["on_po"] - r["unassign"]
-        r["manual_safety"] = _is_manual_safety(r)
-
-        # Days-of-supply figures, computed for EVERY SKU. For general items these are
-        # the live reorder targets; for manual-safety items they're shown only as a
-        # suggested "ballpark" to help set the hand-entered fields — the live alert
-        # for those still keys off the entered safety stock (below).
-        r["rec_safety"]  = _ceil_to_box(dd * cfg.GENERAL_SAFETY_DAYS, box)
-        r["rec_rop"]     = _ceil_to_box(dd * cfg.GENERAL_REORDER_DAYS, box)
-        r["order_up_to"] = _ceil_to_box(dd * cfg.GENERAL_ORDER_UP_TO_DAYS, box)
-
-        if r["manual_safety"]:
-            # Hand-managed: notify when stock falls below the ENTERED safety stock
-            # (inventory position, or — urgently — physical on-hand); no auto order.
-            saf = r["safety_cur"]
-            r["urgent"]    = r["on_hand"] < saf
-            r["order_now"] = (r["inv_pos"] < saf) or r["urgent"]
-            r["rec_qty"]   = 0.0
-        else:
-            r["order_now"] = r["inv_pos"] <= r["rec_rop"]
-            r["rec_qty"]   = _ceil_to_box(max(0.0, r["order_up_to"] - r["inv_pos"]), box)
-            r["urgent"]    = r["inv_pos"] < r["rec_safety"]  # below safety, not just reorder
-
-        # Display delta of current vs recommended safety threshold (cur → rec).
-        r["safety_delta"] = r["rec_safety"] - r["safety_cur"]
+        r["urgent"]    = r["available"] < r["safety_cur"]
+        r["order_now"] = (r["available"] < r["reorder_cur"]) or r["urgent"]
 
     return list(items.values())
 
 
 def write_report(rows, path):
     """
-    Write the full stocked-universe reorder report as a fixed-width text file.
+    Write the full stocked-universe audit as a fixed-width text file.
 
-    Sorted ORDER NOW first (deepest below the reorder point at the top), then the
-    rest by sequence. Unlike the email — which lists only SKUs that need ordering
-    — this .txt is the complete audit of every stocked SKU, so under-set thresholds
-    stay visible even when nothing needs reordering yet.
+    Sorted below-safety (critical) first, then deepest below reorder, then by
+    sequence. Unlike the email — which lists only SKUs to reorder — this .txt is
+    the complete audit of every stocked SKU, so thresholds set too low stay visible
+    even when nothing needs reordering yet.
     """
-    # ORDER NOW first; within each group, most-negative inv_pos − reorder first.
     rows = sorted(
         rows,
-        key=lambda r: (not r["order_now"], r["inv_pos"] - r["rec_rop"], r["seq"]),
+        key=lambda r: (not r["urgent"], not r["order_now"],
+                       r["available"] - r["reorder_cur"], r["seq"]),
     )
     ms = max((len(r["style"])  for r in rows), default=5)
     mc = max((len(r["color"])  for r in rows), default=5)
     mv = max((len(r["vendor"]) for r in rows), default=6)
-    order_now_count = sum(1 for r in rows if r["order_now"])
+    notify_count = sum(1 for r in rows if r["order_now"])
+    urgent_count = sum(1 for r in rows if r["urgent"])
     hdr = (
         f"{'SEQUENCE':<14} {'VENDOR':<{mv}} "
-        f"{'ON_HAND':>8} {'UNASN':>8} {'ON_PO':>8} {'INV_POS':>8} "
-        f"{'SOLD_1YR':>9} {'BUSY_MO':>8} "
-        f"{'BOX':>5} {'SAF_CUR':>8} {'SAF_REC':>8} {'ROP_CUR':>8} {'ROP_REC':>8} {'UPTO':>8} {'QTY_REC':>8} "
-        f"{'ORDER':>6} {'STYLE':<{ms}} {'COLOR':<{mc}}"
+        f"{'ON_HAND':>8} {'RESERVED':>9} {'AVAIL':>8} "
+        f"{'SAFETY':>8} {'REORDER':>8} {'NOTIFY':>7} {'STYLE':<{ms}} {'COLOR':<{mc}}"
     )
     with open(path, "w") as w:
         w.write(
             f"Stocked-SKU reorder report — company {COMPANY}, {len(rows)} SKUs, "
-            f"{order_now_count} to order now\n"
+            f"{notify_count} to reorder ({urgent_count} below safety stock)\n"
         )
         w.write(
-            f"General items: days-of-supply on avg demand (daily_demand = SOLD_1YR/{cfg.DEMAND_WINDOW_DAYS}d) — "
-            f"safety {cfg.GENERAL_SAFETY_DAYS}d / reorder {cfg.GENERAL_REORDER_DAYS}d / "
-            f"up-to {cfg.GENERAL_ORDER_UP_TO_DAYS}d; ORDER NOW when on_hand+on_po−backorder ≤ reorder. "
-            f"Manual-safety items (prodcode {'/'.join(sorted(cfg.MANUAL_SAFETY_PRODCODES))}): notify when "
-            "inv_pos OR on_hand < entered safety stock (SAF_CUR) — no computed reorder/qty. "
-            "BUSY_MO shown for context only; recs rounded up to BOX multiples\n"
+            "NOTIFY when available (on_hand − reserved) < reorder point (REORDER); "
+            "below safety stock (SAFETY) is critical. Both thresholds are the values "
+            "entered in BMS — nothing is computed.\n"
         )
-        manual = [r for r in rows if r.get("manual_safety")]
-        if manual:
-            tripped = sum(1 for r in manual if r["order_now"])
-            short   = sum(1 for r in manual if r.get("urgent"))
-            w.write(
-                f"Manual-safety group: {len(manual)} SKU(s), {tripped} below entered safety "
-                f"({short} physically on-hand short)\n"
-            )
         w.write("=" * len(hdr) + "\n" + hdr + "\n" + "-" * len(hdr) + "\n")
         for r in rows:
+            flag = "CRIT" if r["urgent"] else ("YES" if r["order_now"] else "")
             w.write(
                 f"{r['seq']:<14} {r['vendor']:<{mv}} "
-                f"{r['on_hand']:>8.2f} {r['unassign']:>8.2f} {r['on_po']:>8.2f} {r['inv_pos']:>8.2f} "
-                f"{r['sold_1yr']:>9.2f} {r['busy_month']:>8.2f} "
-                f"{r['box_qty']:>5.0f} {r['safety_cur']:>8.2f} {r['rec_safety']:>8.2f} {r['reorder_cur']:>8.2f} {r['rec_rop']:>8.2f} {r['order_up_to']:>8.2f} {r['rec_qty']:>8.2f} "
-                f"{('YES' if r['order_now'] else ''):>6} {r['style']:<{ms}} {r['color']:<{mc}}\n"
+                f"{r['on_hand']:>8.2f} {r['reserved']:>9.2f} {r['available']:>8.2f} "
+                f"{r['safety_cur']:>8.2f} {r['reorder_cur']:>8.2f} {flag:>7} "
+                f"{r['style']:<{ms}} {r['color']:<{mc}}\n"
             )
 
 
