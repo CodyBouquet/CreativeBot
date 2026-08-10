@@ -83,7 +83,11 @@ INSTALL_COMPLETE_STAGE_ID      = 12
 INSTALL_SCHEDULED_STAGE_ID     = 10
 INSTALL_READY_TO_SCHEDULE_ID   = 9
 MEASURE_COMPLETE_STAGE_ID      = 5
+MEASURE_SCHEDULED_STAGE_ID     = 4    # "Measure scheduled" — the only stage a measure rollback may leave
 MEASURE_ROLLBACK_STAGE_ID      = 70   # "in store contact" — when measure is cancelled/deleted
+# Scheduling a measure only advances a deal that is still in an early sales stage; anything
+# further along keeps the stage it already has.
+MEASURE_SCHEDULABLE_STAGE_IDS  = {1, 70, 2}   # Lead In, In Store - Contact, Via Phone - Contact
 INSPECTION_SCHEDULED_STAGE_ID  = 36
 INSPECTION_COMPLETE_STAGE_ID   = 37
 INSPECTION_ROLLBACK_STAGE_ID   = 50   # "Customer Contacted/Attempted" — when inspection is cancelled/deleted
@@ -311,23 +315,42 @@ def dates_match(a, b):
 # ---------------------------------------------------------------------------
 # TASK HANDLERS
 # ---------------------------------------------------------------------------
+def move_stage_if_in(deal_id, from_stage_ids, to_stage_id, label=None):
+    """Move a deal to to_stage_id, but ONLY if it currently sits in one of from_stage_ids.
+    Arrivy events are a poor authority on where a deal belongs: a deal that has already moved
+    on (measure complete, install, delivery, …) must not be dragged backwards because someone
+    cleaned up a stale task, nor pulled sideways out of a later stage because a task was
+    scheduled. Returns a short summary fragment for the event log. If the current stage can't
+    be read the move is skipped — leaving the stage alone is always the safer failure."""
+    dest = label or f"stage {to_stage_id}"
+    try:
+        stage_id = pd_get_deal(deal_id).get("stage_id")
+    except Exception as e:
+        logger.warning(f"Could not read stage for deal {deal_id}, skipping move to {dest}: {e}")
+        return "stage left alone (stage unreadable)"
+    if stage_id is not None and int(stage_id) in from_stage_ids:
+        pd_move_stage(deal_id, to_stage_id)
+        return f"moved to {dest}"
+    logger.info(f"Deal {deal_id} is in stage {stage_id}, not {sorted(from_stage_ids)} — skipped move to {dest}")
+    return f"stage left alone (stage {stage_id})"
+
 def handle_measure(conn, event_type, deal_id, task_id, object_date):
     """Apply an Arrivy measure-task event to the deal: set/clear the measure_date field and advance/roll back the stage by event type. Returns a short action summary string."""
     date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED"):
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
         upsert_task_state(conn, task_id, deal_id, "measure", date)
-        return f"Set measure date → {date}"
+        moved = move_stage_if_in(deal_id, MEASURE_SCHEDULABLE_STAGE_IDS,
+                                 MEASURE_SCHEDULED_STAGE_ID, "Measure scheduled")
+        return f"Set measure date → {date}, {moved}"
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
-        pd_move_stage(deal_id, MEASURE_ROLLBACK_STAGE_ID)
-        return "Cleared measure date, rolled back stage"
+        return f"Cleared measure date, {move_stage_if_in(deal_id, {MEASURE_SCHEDULED_STAGE_ID}, MEASURE_ROLLBACK_STAGE_ID, 'In Store - Contact')}"
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "measure", date, status="cancelled")
-        pd_move_stage(deal_id, MEASURE_ROLLBACK_STAGE_ID)
-        return "Cleared measure date, rolled back stage"
+        return f"Cleared measure date, {move_stage_if_in(deal_id, {MEASURE_SCHEDULED_STAGE_ID}, MEASURE_ROLLBACK_STAGE_ID, 'In Store - Contact')}"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "measure", date, status="completed")
         pd_move_stage(deal_id, MEASURE_COMPLETE_STAGE_ID)
@@ -344,13 +367,11 @@ def handle_inspection(conn, event_type, deal_id, task_id, object_date):
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
-        pd_move_stage(deal_id, INSPECTION_ROLLBACK_STAGE_ID)
-        return "Cleared inspection date, rolled back stage"
+        return f"Cleared inspection date, {move_stage_if_in(deal_id, {INSPECTION_SCHEDULED_STAGE_ID}, INSPECTION_ROLLBACK_STAGE_ID, 'Customer Contacted/Attempted')}"
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "inspection", date, status="cancelled")
-        pd_move_stage(deal_id, INSPECTION_ROLLBACK_STAGE_ID)
-        return "Cleared inspection date, rolled back stage"
+        return f"Cleared inspection date, {move_stage_if_in(deal_id, {INSPECTION_SCHEDULED_STAGE_ID}, INSPECTION_ROLLBACK_STAGE_ID, 'Customer Contacted/Attempted')}"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "inspection", date, status="completed")
         pd_move_stage(deal_id, INSPECTION_COMPLETE_STAGE_ID)
