@@ -18,6 +18,7 @@ import queue
 load_dotenv()
 
 from email_reports import bp as reports_bp
+import rollmaster
 
 app = Flask(__name__)
 _secret = os.environ.get("FLASK_SECRET_KEY", "")
@@ -97,6 +98,38 @@ INSTALL_PHASE_OPTIONS = {
     "final":   37,
     "partial": 65,
 }
+
+# ---------------------------------------------------------------------------
+# PIPEDRIVE → ROLLMASTER CUSTOMER SYNC
+# ---------------------------------------------------------------------------
+# Shared secret the Pipedrive automation must present (X-Sync-Key header or ?key=).
+# Unlike the other webhooks, this one CREATES records in the ERP, so it is closed
+# by default: with no secret configured the endpoint refuses every request.
+RM_SYNC_SECRET = os.environ.get("RM_SYNC_SECRET", "")
+# Master switch. Off means the endpoint validates, maps and mints the customer id
+# but does NOT write to Rollmaster — it returns exactly what it would have sent,
+# so the automation can be tested end to end without creating anything.
+RM_CUSTOMER_SYNC_ENABLED = os.environ.get("RM_CUSTOMER_SYNC_ENABLED", "0") == "1"
+# Fixed values every synced customer gets. These are account-setup fields with no
+# Pipedrive equivalent — confirm each against how a customer is keyed in by hand
+# before enabling the sync. Any of them can be overridden per-field from the
+# webhook payload.
+RM_CUSTOMER_DEFAULTS = {
+    "C_WHSE":                os.environ.get("RM_C_WHSE", ""),
+    "C_STAT":                os.environ.get("RM_C_STAT", ""),
+    "C_CUSTTYPE":            os.environ.get("RM_C_CUSTTYPE", ""),
+    "C_TERRFLAG":            os.environ.get("RM_C_TERRFLAG", ""),
+    "C_TERR":                os.environ.get("RM_C_TERR", ""),
+    "C_PRICE_LEVEL_DEFAULT": os.environ.get("RM_C_PRICE_LEVEL", ""),
+    "C_PROMPMGMT_CO":        os.environ.get("RM_C_PROMPMGMT_CO", ""),
+}
+# Pipedrive deal owner → Rollmaster salesperson id (C_SLSID, e.g. "MRB", "AMB").
+# JSON object in the env var, keyed by owner name or Pipedrive user id.
+try:
+    RM_SALESPERSON_MAP = json.loads(os.environ.get("RM_SALESPERSON_MAP", "{}"))
+except ValueError:
+    RM_SALESPERSON_MAP = {}
+    logging.warning("RM_SALESPERSON_MAP is not valid JSON — salesperson mapping disabled")
 
 ALLOWED_DASHBOARD_IPS = {"127.0.0.1", "::1", "10.54.10.135"}
 DASHBOARD_ENDPOINTS  = {"landing", "sync_dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout",
@@ -1004,6 +1037,176 @@ def pipedrive_webhook():
         return jsonify({"error": str(e)}), 500
 
 
+# --- Pipedrive → Rollmaster customer sync -----------------------------------
+# Field aliases, so the Pipedrive automation's payload doesn't have to match one
+# exact spelling. Pipedrive's own address subfield names are included, since an
+# automation that sends an org/person address emits those verbatim.
+_PD_ALIASES = {
+    "name":        ("name", "person_name", "customer_name", "full_name", "title"),
+    "first_name":  ("first_name", "firstname", "given_name"),
+    "last_name":   ("last_name", "lastname", "surname", "family_name"),
+    "org":         ("org_name", "organization", "organisation", "company", "company_name"),
+    "email":       ("email", "person_email", "primary_email", "email_address"),
+    "phone":       ("phone", "person_phone", "primary_phone", "phone_number"),
+    "phone2":      ("phone2", "phone_2", "mobile", "secondary_phone", "cell"),
+    "fax":         ("fax", "fax_number"),
+    "address1":    ("address1", "address", "street", "street_address", "address_street",
+                    "postal_address", "address_route"),
+    "address2":    ("address2", "address_2", "unit", "apt", "suite", "address_subpremise"),
+    "city":        ("city", "address_locality", "postal_address_locality"),
+    "state":       ("state", "address_admin_area_level_1", "postal_address_admin_area_level_1"),
+    "zip":         ("zip", "zipcode", "zip_code", "postal_code", "address_postal_code",
+                    "postal_address_postal_code"),
+    "contact":     ("contact", "contact_name"),
+    "taxid":       ("taxid", "tax_id", "tax_number"),
+    "salesperson": ("slsid", "c_slsid", "salesperson", "sales_rep", "owner", "owner_name"),
+    "deal_id":     ("deal_id", "dealid", "deal", "id"),
+}
+
+
+def _pd_value(payload, key):
+    """
+    Return the first non-empty value for a logical field from the webhook payload.
+
+    Looks through that field's aliases case-insensitively, and follows one level
+    of nesting (payload["person"]["email"]) since Pipedrive automations commonly
+    send the person and org as sub-objects.
+    """
+    flat = {}
+    for k, v in (payload or {}).items():
+        if isinstance(v, dict):
+            for sub_k, sub_v in v.items():
+                flat.setdefault(str(sub_k).strip().lower(), sub_v)
+        flat.setdefault(str(k).strip().lower(), v)
+    for alias in _PD_ALIASES.get(key, (key,)):
+        val = flat.get(alias)
+        if isinstance(val, (str, int, float)) and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
+def map_pipedrive_customer(payload):
+    """
+    Turn a Pipedrive automation payload into (rollmaster_fields, name_for_cid).
+
+    Returns the /customer form values; the caller mints C_CID from the name. This
+    handles PEOPLE only — the account is always keyed under the person's name, and
+    an organization on the payload is ignored rather than guessed at, since a
+    business account uses a different id convention (8-character company names
+    like CITYWIDE) that we haven't specified yet. Fixed account-setup values come
+    from RM_CUSTOMER_DEFAULTS and can be overridden by a field in the payload.
+    """
+    first = _pd_value(payload, "first_name")
+    last  = _pd_value(payload, "last_name")
+    name  = " ".join(p for p in (first, last) if p) or _pd_value(payload, "name")
+
+    contact = _pd_value(payload, "contact")
+    owner   = _pd_value(payload, "salesperson")
+    slsid  = RM_SALESPERSON_MAP.get(owner, owner if len(owner) <= 6 else "")
+
+    fields = dict(RM_CUSTOMER_DEFAULTS)
+    fields.update({
+        "C_NAME":    name,
+        "C_ADDR1":   _pd_value(payload, "address1"),
+        "C_ADDR2":   _pd_value(payload, "address2"),
+        "C_CITY":    _pd_value(payload, "city"),
+        "C_STATE":   _pd_value(payload, "state"),
+        "C_ZIPCD":   _pd_value(payload, "zip"),
+        "C_PHONE":   _pd_value(payload, "phone"),
+        "C_PHONE2":  _pd_value(payload, "phone2"),
+        "C_FAX":     _pd_value(payload, "fax"),
+        "C_EMAIL":   _pd_value(payload, "email"),
+        "C_CONTACT": contact,
+        "C_TAXID":   _pd_value(payload, "taxid"),
+        "C_SLSID":   slsid,
+    })
+    # Let the payload set any Rollmaster field outright (C_WHSE, C_CUSTTYPE, …),
+    # which also covers fields we haven't given an alias.
+    for k, v in (payload or {}).items():
+        key = str(k).strip().upper()
+        if key in rollmaster.CUSTOMER_FIELDS and key != "C_CID" and str(v or "").strip():
+            fields[key] = str(v).strip()
+
+    return fields, name
+
+
+def _sync_key_ok():
+    """True when the request carries the shared secret (X-Sync-Key header or ?key=); always False if none is configured."""
+    if not RM_SYNC_SECRET:
+        return False
+    supplied = request.headers.get("X-Sync-Key", "") or request.args.get("key", "")
+    return hmac.compare_digest(supplied, RM_SYNC_SECRET)
+
+
+@app.route("/rm-customer-sync", methods=["POST"])
+def rm_customer_sync():
+    """
+    Pipedrive → Rollmaster customer create.
+
+    Takes the customer fields a Pipedrive automation posts (JSON or form-encoded),
+    maps them to the /customer form, mints a C_CID from the name (SMIJOH, with a
+    numeric suffix on collision) and creates the record. Returns the new customer
+    id so it can be written back to the deal.
+
+    Guarded twice over, because this is the one endpoint that creates records in
+    the ERP: a shared secret is required, and RM_CUSTOMER_SYNC_ENABLED must be on.
+    With the switch off it does everything except the write and returns the exact
+    payload it would have sent — the safe way to test the automation.
+    """
+    if not _sync_key_ok():
+        logger.warning(f"Rejected rm-customer-sync from {request.remote_addr} (bad or missing key)")
+        return jsonify({"error": "unauthorized"}), 401
+    try:
+        payload = request.get_json(silent=True) or request.form.to_dict() or {}
+        if not payload:
+            return jsonify({"error": "empty payload"}), 400
+
+        fields, name = map_pipedrive_customer(payload)
+        if not fields["C_NAME"]:
+            return jsonify({"error": "no customer name in payload"}), 400
+
+        deal_id = None
+        raw_deal = _pd_value(payload, "deal_id")
+        if str(raw_deal).isdigit():
+            deal_id = int(raw_deal)
+
+        if not RM_CUSTOMER_SYNC_ENABLED:
+            first, last = rollmaster.split_name(name)
+            try:
+                cid = rollmaster.next_free_cid(
+                    rollmaster.cid_base(first, last), rollmaster.load_known_cids()
+                )
+            except Exception as e:
+                logger.exception("dry-run cid preview failed")
+                cid = f"(unavailable: {e})"
+            action = f"DRY RUN — would create {cid} ({fields['C_NAME']})"
+            logger.info(f"rm-customer-sync {action}")
+            with get_db() as conn:
+                store_event(conn, deal_id, None, "RM_CUSTOMER_DRYRUN", "customer", payload, action)
+            sse_notify()
+            return jsonify({"status": "dry-run", "cid": cid,
+                            "would_send": rollmaster.build_customer_form({**fields, "C_CID": cid})}), 200
+
+        cid, resp = rollmaster.create_customer(fields, name=name)
+        action = f"Created Rollmaster customer {cid} ({fields['C_NAME']})"
+        logger.info(f"rm-customer-sync {action}")
+        with get_db() as conn:
+            store_event(conn, deal_id, None, "RM_CUSTOMER_CREATED", "customer", payload, action)
+        sse_notify()
+        return jsonify({"status": "ok", "cid": cid, "response": resp}), 200
+
+    except rollmaster.RollmasterError as e:
+        logger.exception(f"rm-customer-sync rejected by Rollmaster: {e}")
+        with get_db() as conn:
+            store_event(conn, None, None, "RM_CUSTOMER_FAILED", "customer",
+                        request.get_json(silent=True) or {}, f"Rollmaster rejected: {e}")
+        sse_notify()
+        return jsonify({"error": str(e)}), 502
+    except Exception as e:
+        logger.exception(f"rm-customer-sync error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/deploy", methods=["POST"])
 def deploy():
     """GitHub push webhook: verify the HMAC-SHA256 signature, then git-pull and restart the service in a background thread."""
@@ -1039,6 +1242,12 @@ def health():
 # ---------------------------------------------------------------------------
 init_db()
 app.register_blueprint(reports_bp)
+if RM_SYNC_SECRET:
+    # Pull the customer-id list off-thread so the first sync webhook doesn't have
+    # to wait on a multi-minute /customers walk.
+    rollmaster.warm_cid_cache()
+else:
+    logging.warning("RM_SYNC_SECRET not set — /rm-customer-sync will refuse every request")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001)
