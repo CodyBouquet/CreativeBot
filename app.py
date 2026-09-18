@@ -1138,6 +1138,7 @@ def _sync_key_ok():
     return hmac.compare_digest(supplied, RM_SYNC_SECRET)
 
 
+@app.route("/rm-customer-sync/", methods=["POST"])
 @app.route("/rm-customer-sync", methods=["POST"])
 def rm_customer_sync():
     """
