@@ -21,7 +21,10 @@ Columns (.txt full audit):
     SEQUENCE   CAT_SEQUENCE
     VENDOR     catalog CAT_VENDORID
     ON_HAND    sum of current rolls (/productstock ONHAND_FLOAT)
-    RESERVED   assigned/committed to orders (/productstock RESERVED_FLOAT)
+    COMMITTED  sold on open orders, assigned or not (/orderline DMI_WQUANTITY);
+               may exceed ON_HAND when a SKU is oversold against incoming POs
+    RESERVED   the assigned share of that — allocated to specific rolls
+               (/productstock RESERVED_FLOAT)
     AVAIL      available balance = ON_HAND − RESERVED (/productstock AVAILABLE_FLOAT)
     SAFETY     entered safety stock (catalog CAT_SAFTYSTK, or /lowstock fallback)
     REORDER    entered reorder point (catalog CAT_REORDER; often 0/unset)
@@ -225,6 +228,71 @@ def pull_productstock(S, seq):
     return r.json() if r.status_code == 200 else []
 
 
+def pull_open_orders(S, end):
+    """Fetch open sales-order headers from cfg.ORDER_HISTORY_FLOOR through `end` (BMS returns open orders only unless ordstatus is passed)."""
+    return _get(
+        S, "orders",
+        {"company": COMPANY, "startdate": cfg.ORDER_HISTORY_FLOOR, "enddate": end},
+    ).json()
+
+
+def pull_orderline_bulk(S, branch, end):
+    """Fetch every order line for one branch over the history window; [] on non-200. /orderline has no per-SKU filter, so we pull the branch and filter locally."""
+    r = _get(
+        S, "orderline",
+        {"company": COMPANY, "branch": branch,
+         "startdate": cfg.ORDER_HISTORY_FLOOR, "enddate": end},
+        timeout=300,
+    )
+    return r.json() if r.status_code == 200 else []
+
+
+def pull_committed(S, target):
+    """
+    Return {seq: committed qty} for the SKUs in `target` — how much is SOLD on open
+    sales orders, whether or not a roll has been assigned to it.
+
+    This is deliberately wider than the per-roll RESERVED_FLOAT that /productstock
+    reports: reserved counts only the portion already allocated to specific rolls, so
+    a SKU sold heavily but not yet assigned looks untouched there. Committed sums
+    DMI_WQUANTITY (warehouse units — the same units as on hand / reserved, unlike
+    DMI_SQUANTITY, which is in selling units) across every line of every open order.
+
+    Because it counts unassigned demand, committed can exceed on hand: that is the
+    signal — it means the SKU is oversold against current stock and is leaning on
+    incoming POs. It follows that available is NOT on_hand − committed; available
+    still nets out only the assigned portion.
+
+    Open-ness comes from the order header (/orders returns open orders only), which
+    is how the pre-rewrite report scoped the same line pull.
+    """
+    end = datetime.now().strftime("%Y%m%d")
+    open_orders = pull_open_orders(S, end)
+    open_ordnos = {str(o.get("DMO_ORDNO", "")).strip() for o in open_orders}
+    branches = sorted(
+        {str(o.get("DMO_WHSE", "")).strip() for o in open_orders
+         if str(o.get("DMO_WHSE", "")).strip()}
+    )
+    print(
+        f"open orders={len(open_orders)} across branches={branches or '—'}",
+        file=sys.stderr,
+    )
+
+    committed = {}
+    if not branches:
+        return committed
+    with ThreadPoolExecutor(max_workers=len(branches)) as ex:
+        for lines in ex.map(lambda br: pull_orderline_bulk(S, br, end), branches):
+            for ln in lines:
+                seq = str(ln.get("DMI_CAT_SEQUENCE", "")).strip()
+                if seq not in target:
+                    continue
+                if str(ln.get("DMI_ORDNO", "")).strip() not in open_ordnos:
+                    continue
+                committed[seq] = committed.get(seq, 0.0) + _f(ln.get("DMI_WQUANTITY"))
+    return committed
+
+
 # ---- Report build ---------------------------------------------------------
 
 def build_report():
@@ -259,8 +327,9 @@ def build_report():
             "reorder_cur": _f(u.get("reorder")),                 # entered CAT_REORDER
             "vendor":      str(u.get("vendor", "")).strip(),     # catalog CAT_VENDORID
             "on_hand":     0.0,
-            "reserved":    0.0,                                  # assigned/committed to orders
+            "reserved":    0.0,                                  # assigned to rolls
             "available":   0.0,                                  # on_hand − reserved
+            "committed":   0.0,                                  # sold on open orders, assigned or not
             "style":       str(u.get("style", "")).strip(),
             "color":       str(u.get("color", "")).strip(),
         }
@@ -297,6 +366,13 @@ def build_report():
                     items[seq]["color"] = co
     print(f"[{time.time()-t0:5.1f}s] productstock pulled", file=sys.stderr)
 
+    # --- Committed: qty sold on open orders, assigned or not (see pull_committed).
+    # Display-only — the notify policy below still turns on available balance, since
+    # the unassigned share of committed may be covered by stock that isn't here yet.
+    for seq, qty in pull_committed(S, target).items():
+        items[seq]["committed"] = qty
+    print(f"[{time.time()-t0:5.1f}s] committed pulled", file=sys.stderr)
+
     # --- Notify policy (uniform for every SKU, straight off the entered thresholds):
     #   urgent    when available < safety stock (CAT_SAFTYSTK) — critical, red, top.
     #   order_now when available < reorder point (CAT_REORDER), OR below safety — the
@@ -330,7 +406,7 @@ def write_report(rows, path):
     urgent_count = sum(1 for r in rows if r["urgent"])
     hdr = (
         f"{'SEQUENCE':<14} {'VENDOR':<{mv}} "
-        f"{'ON_HAND':>8} {'RESERVED':>9} {'AVAIL':>8} "
+        f"{'ON_HAND':>8} {'COMMITTED':>10} {'RESERVED':>9} {'AVAIL':>8} "
         f"{'SAFETY':>8} {'REORDER':>8} {'NOTIFY':>7} {'STYLE':<{ms}} {'COLOR':<{mc}}"
     )
     with open(path, "w") as w:
@@ -341,14 +417,16 @@ def write_report(rows, path):
         w.write(
             "NOTIFY when available (on_hand − reserved) < reorder point (REORDER); "
             "below safety stock (SAFETY) is critical. Both thresholds are the values "
-            "entered in BMS — nothing is computed.\n"
+            "entered in BMS — nothing is computed. COMMITTED is all open-order qty "
+            "sold (assigned or not) and is shown for context only.\n"
         )
         w.write("=" * len(hdr) + "\n" + hdr + "\n" + "-" * len(hdr) + "\n")
         for r in rows:
             flag = "CRIT" if r["urgent"] else ("YES" if r["order_now"] else "")
             w.write(
                 f"{r['seq']:<14} {r['vendor']:<{mv}} "
-                f"{r['on_hand']:>8.2f} {r['reserved']:>9.2f} {r['available']:>8.2f} "
+                f"{r['on_hand']:>8.2f} {r['committed']:>10.2f} "
+                f"{r['reserved']:>9.2f} {r['available']:>8.2f} "
                 f"{r['safety_cur']:>8.2f} {r['reorder_cur']:>8.2f} {flag:>7} "
                 f"{r['style']:<{ms}} {r['color']:<{mc}}\n"
             )

@@ -19,6 +19,13 @@ BMS_COMPANY = "99"
 # The OR keeps a below-safety SKU visible even when its reorder point is still
 # unset (0) in BMS — a set reorder point is always >= safety stock.
 
+# ---- Committed quantity ----
+# Committed = quantity sold on open sales orders, assigned to a roll or not. It is
+# summed from /orderline, which needs a date window; this is the lower bound on how
+# far back we look for open orders. Anything older than this that is somehow still
+# open would be missed, so keep it comfortably early.
+ORDER_HISTORY_FLOOR = "20240101"
+
 # ---- Stocked-catalog cache (full /catalogitems scan) ----
 # The reorder report evaluates EVERY stocked SKU (CAT_SAFTYSTK > 0), not just the
 # items currently below safety stock. /catalogitems has no per-item filter and is

@@ -66,18 +66,26 @@ def _render_html(rows: list[dict]) -> str:
     """
     Table for the card body — one row per SKU that needs reordering.
 
-    Five columns — Item (style/color with a vendor·sequence subline), On Hand,
-    Available (on hand − reserved), Reorder, and Safety. A SKU is listed when its
-    available balance falls below the reorder point entered in BMS. Rows whose
-    available balance is below safety stock (critical inventory) get a red
-    left-accent, a red available value, and sort to the top of the list.
+    Six columns — Item (style/color with a vendor·sequence subline), On Hand,
+    Committed, Available, Reorder, and Safety. Committed is everything sold on open
+    orders whether or not a roll has been assigned to it, so a SKU that looks healthy
+    on hand but is largely spoken for reads as such. Note that available is NOT
+    on hand − committed: it nets out only the assigned share, so committed exceeding
+    on hand is normal and means the SKU is oversold against incoming stock — those
+    values are shown in red.
+
+    A SKU is listed when its available balance falls below the reorder point entered
+    in BMS. Rows whose available balance is below safety stock (critical inventory)
+    get a red left-accent, a red available value, and sort to the top of the list.
     """
     th  = ("text-align:left; padding:7px 9px; border-bottom:2px solid #e4e4e4; "
            "font-size:11px; letter-spacing:0.5px; color:#999; text-transform:uppercase;")
     thr = th + " text-align:right;"
 
     caption = (
-        'Available balance below the reorder point — order now. Rows below safety '
+        'Available balance below the reorder point — order now. Committed is all '
+        'open-order quantity sold, assigned to a roll or not; where it exceeds on '
+        'hand (red) the SKU is oversold against incoming stock. Rows below safety '
         'stock (<strong>critical</strong>) are red and listed first.'
     )
     head = (
@@ -86,6 +94,7 @@ def _render_html(rows: list[dict]) -> str:
         '<thead><tr>'
         f'<th style="{th}">Item</th>'
         f'<th style="{thr}">On Hand</th>'
+        f'<th style="{thr}">Committed</th>'
         f'<th style="{thr}">Available</th>'
         f'<th style="{thr}">Reorder</th>'
         f'<th style="{thr}">Safety</th>'
@@ -103,6 +112,10 @@ def _render_html(rows: list[dict]) -> str:
         zebra     = "#ffffff" if i % 2 == 0 else "#fafafa"
         accent    = "#d6452c" if urgent else "transparent"
         avail_col = "#d6452c" if urgent else "#222"
+        # Oversold: more sold on open orders than physically on hand. Worth calling
+        # out on its own — it can be true of a SKU that isn't otherwise critical.
+        committed = r.get("committed", 0)
+        comm_col  = "#d6452c" if committed > r.get("on_hand", 0) else "#777"
 
         name = style if not color else f'{style} <span style="color:#999;">· {color}</span>'
         sub  = f'{vendor} · {seq}'
@@ -115,6 +128,7 @@ def _render_html(rows: list[dict]) -> str:
             f'<div style="color:#aaa; font-size:11px; font-family:monospace; '
             f'margin-top:2px;">{sub}</div></td>'
             f'<td style="{tdr}">{r.get("on_hand", 0):.0f}</td>'
+            f'<td style="{tdr} color:{comm_col};">{committed:.0f}</td>'
             f'<td style="{tdr} color:{avail_col}; font-weight:bold;">{r.get("available", 0):.0f}</td>'
             f'<td style="{tdr}">{r.get("reorder_cur", 0):.0f}</td>'
             f'<td style="{tdr}">{r.get("safety_cur", 0):.0f}</td>'
