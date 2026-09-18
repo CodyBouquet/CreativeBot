@@ -472,14 +472,16 @@ def get_extra_field(extra_fields, name):
             return field.get("value")
     return None
 
-def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields=None, template_id=None):
-    """Apply an Arrivy install/repair-task event to the deal: update task state, recalc install dates, and move to Install Complete or back to Ready to Schedule as appropriate. Repair tasks are always phase 'final'. Returns an action summary string."""
+def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields=None):
+    """Apply an Arrivy install/repair-task event to the deal: update task state, recalc install dates, and move to Install Complete or back to Ready to Schedule as appropriate. Returns an action summary string."""
     date          = parse_arrivy_date(object_date)
-    # Repair tasks have no phase option in Arrivy — always treat as "final".
-    if template_id == REPAIR_TEMPLATE_ID:
-        install_phase = "final"
-    else:
-        install_phase = get_extra_field(extra_fields, "Installation Phase")
+    # The repair template carries the same "Installation Phase" dropdown as the install
+    # template (Arrivy requires a value, defaulting to Partial), so repairs are read the
+    # same way: a partial repair holds the deal open exactly like a partial install.
+    # Arrivy sends OBJECT_TEMPLATE_EXTRA_FIELDS as [] on some events (completions
+    # included) — that's no news rather than a cleared phase, so leave it None and let
+    # upsert_task_state's COALESCE keep the phase we already have.
+    install_phase = get_extra_field(extra_fields, "Installation Phase")
     logger.info(f"handle_install: event={event_type} task={task_id} date={date} phase={install_phase!r}")
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED"):
         upsert_task_state(conn, task_id, deal_id, "install", date, install_phase=install_phase)
@@ -511,7 +513,7 @@ def handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields
         # holds it back. Installs on the SAME day hold it back too — UNLESS this task
         # is the "final" phase, the one designated to close the job out. (Phase is
         # read from task_state, which preserves it even if the completion event omits
-        # the extra field; repair tasks are stored as "final".) These checks read
+        # the extra field.) These checks read
         # task_state only, so they don't depend on recalc_install having run yet.
         later = conn.execute(
             "SELECT 1 FROM task_state WHERE deal_id=? AND task_type='install' "
@@ -942,7 +944,7 @@ def arrivy_webhook():
                     elif task_type == "delivery":
                         action = handle_delivery(conn, event_type, deal_id, task_id, object_date)
                     elif task_type == "install":
-                        action = handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields, template_id)
+                        action = handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
                     elif task_type == "inspection":
                         action = handle_inspection(conn, event_type, deal_id, task_id, object_date)
                     # Template was corrected in Arrivy: the task's type changed, so the
