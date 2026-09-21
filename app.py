@@ -1305,6 +1305,27 @@ def rm_customer_sync():
         if str(raw_person).isdigit():
             person_id = int(raw_person)
 
+        # A person that already carries a Rollmaster customer id is an UPDATE of
+        # that record, never a second create. The id itself is never changed.
+        existing_cid = _pd_value(payload, "cid").strip().upper()
+        if existing_cid:
+            params = rollmaster.update_params(existing_cid, fields)
+            if not RM_CUSTOMER_SYNC_ENABLED:
+                action = f"DRY RUN — would update {existing_cid} ({fields['C_NAME']})"
+                logger.info(f"rm-customer-sync {action}")
+                with get_db() as conn:
+                    store_event(conn, deal_id, None, "RM_CUSTOMER_DRYRUN", "customer", payload, action)
+                sse_notify()
+                return jsonify({"status": "dry-run", "action": "update", "cid": existing_cid,
+                                "would_send": params}), 200
+            resp = rollmaster.update_customer(existing_cid, fields)
+            action = f"Updated Rollmaster customer {existing_cid} ({fields['C_NAME']})"
+            logger.info(f"rm-customer-sync {action}")
+            with get_db() as conn:
+                store_event(conn, deal_id, None, "RM_CUSTOMER_UPDATED", "customer", payload, action)
+            sse_notify()
+            return jsonify({"status": "ok", "action": "update", "cid": existing_cid, "response": resp}), 200
+
         if not RM_CUSTOMER_SYNC_ENABLED:
             first, last = rollmaster.split_name(name)
             try:
@@ -1329,7 +1350,7 @@ def rm_customer_sync():
         with get_db() as conn:
             store_event(conn, deal_id, None, "RM_CUSTOMER_CREATED", "customer", payload, action)
         sse_notify()
-        return jsonify({"status": "ok", "cid": cid, "response": resp,
+        return jsonify({"status": "ok", "action": "create", "cid": cid, "response": resp,
                         "pipedrive": _write_cid_to_person(person_id, cid, deal_id)}), 200
 
     except rollmaster.RollmasterError as e:

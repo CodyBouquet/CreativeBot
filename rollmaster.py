@@ -383,6 +383,59 @@ def create_customer(fields, cid=None, name=None, retries=3):
     raise RollmasterError(f"could not create customer after {retries} attempts")
 
 
+# Fields a Pipedrive-driven update may change. Everything else on the record
+# (id, warehouse, salesperson, job type, status, terms…) is account setup that
+# lives in Rollmaster and must survive a contact-detail change in the CRM.
+UPDATABLE_FIELDS = (
+    "C_NAME", "C_NAME_LONG", "C_CONTACT", "C_ADDR1", "C_ADDR2", "C_CITY",
+    "C_STATE", "C_ZIPCD", "C_PHONE", "C_PHONE2", "C_FAX", "C_EMAIL",
+)
+
+
+def update_customer(cid, fields, timeout=120):
+    """
+    Update contact details on an existing Rollmaster customer; returns the response.
+
+    /customer only accepts an update as PATCH with the fields in the QUERY STRING —
+    a form or JSON body is answered with "IMPROPER DATA". It is a partial update:
+    fields left out are untouched (verified live), so only UPDATABLE_FIELDS are
+    sent and C_CID is never changed. Raises RollmasterError when the record does
+    not exist ("CUSTOMER RECORD X DOES NOT EXIST") or the API rejects the call.
+    """
+    cid = (cid or "").strip().upper()
+    if not cid:
+        raise RollmasterError("update_customer needs a cid")
+    params = {"COMPANY": COMPANY, "C_CID": cid}
+    for k in UPDATABLE_FIELDS:
+        if k in fields:
+            params[k] = "" if fields[k] is None else str(fields[k]).strip()
+    r = requests.patch(f"{BASE_URL}/{ALIAS}/customer",
+                       headers=_headers(get_token()), params=params, timeout=timeout)
+    body = r.text[:400]
+    try:
+        data = r.json()
+    except ValueError:
+        data = None
+    if r.status_code != 200:
+        raise RollmasterError(f"PATCH /customer -> HTTP {r.status_code}: {body}")
+    if data is None:
+        raise RollmasterError(f"PATCH /customer -> non-JSON response: {body}")
+    err = api_error(data)
+    if err:
+        raise RollmasterError(f"PATCH /customer -> {err}")
+    logger.info(f"Rollmaster: updated customer {cid}")
+    return data
+
+
+def update_params(cid, fields):
+    """The exact query parameters update_customer would send — for dry-run previews."""
+    params = {"COMPANY": COMPANY, "C_CID": (cid or "").strip().upper()}
+    for k in UPDATABLE_FIELDS:
+        if k in fields:
+            params[k] = "" if fields[k] is None else str(fields[k]).strip()
+    return params
+
+
 def _looks_like_duplicate(message):
     """True when a rejection message reads like the customer id is already taken."""
     m = message.upper()
