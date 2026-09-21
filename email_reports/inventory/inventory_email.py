@@ -21,10 +21,10 @@ Columns (.txt full audit):
     SEQUENCE   CAT_SEQUENCE
     VENDOR     catalog CAT_VENDORID
     ON_HAND    sum of current rolls (/productstock ONHAND_FLOAT)
-    COMMITTED  sold on open orders, assigned or not (/orderline DMI_WQUANTITY);
-               may exceed ON_HAND when a SKU is oversold against incoming POs
-    RESERVED   the assigned share of that — allocated to specific rolls
-               (/productstock RESERVED_FLOAT)
+    COMMITTED  sold on open orders but NOT yet assigned to a roll and NOT on a
+               PO (/orderline DMI_WQUANTITY − DMI_QTYASSIGNED, lines without a
+               DMI_PONO) — demand nothing is covering yet
+    RESERVED   qty assigned to specific rolls (/productstock RESERVED_FLOAT)
     AVAIL      available balance = ON_HAND − RESERVED (/productstock AVAILABLE_FLOAT)
     SAFETY     entered safety stock (catalog CAT_SAFTYSTK, or /lowstock fallback)
     REORDER    entered reorder point (catalog CAT_REORDER; often 0/unset)
@@ -97,6 +97,11 @@ def parse_yardage(*texts):
             except ValueError:
                 continue
     return 0.0
+
+
+def _norm_seq(x):
+    """Catalog sequence as a bare string: /orderline zero-pads it to 13 digits ('0000000684588'), /productstock and the catalog cache don't."""
+    return str(x or "").strip().lstrip("0") or "0"
 
 
 def _parse_iso(s):
@@ -250,18 +255,16 @@ def pull_orderline_bulk(S, branch, end):
 def pull_committed(S, target):
     """
     Return {seq: committed qty} for the SKUs in `target` — how much is SOLD on open
-    sales orders, whether or not a roll has been assigned to it.
+    sales orders that nothing is covering yet: not assigned to a roll, and not on
+    a purchase order.
 
-    This is deliberately wider than the per-roll RESERVED_FLOAT that /productstock
-    reports: reserved counts only the portion already allocated to specific rolls, so
-    a SKU sold heavily but not yet assigned looks untouched there. Committed sums
-    DMI_WQUANTITY (warehouse units — the same units as on hand / reserved, unlike
-    DMI_SQUANTITY, which is in selling units) across every line of every open order.
+    Per open-order line that is (DMI_WQUANTITY − DMI_QTYASSIGNED), skipped entirely
+    when the line carries a PO number (DMI_PONO) — that demand is on order already.
+    DMI_WQUANTITY is in warehouse units, the same as on hand / reserved (unlike
+    DMI_SQUANTITY, which is in selling units).
 
-    Because it counts unassigned demand, committed can exceed on hand: that is the
-    signal — it means the SKU is oversold against current stock and is leaning on
-    incoming POs. It follows that available is NOT on_hand − committed; available
-    still nets out only the assigned portion.
+    A fully assigned SKU therefore shows 0 even with a lot sold, and a positive
+    committed means someone has to find stock or cut a PO for it.
 
     Open-ness comes from the order header (/orders returns open orders only), which
     is how the pre-rewrite report scoped the same line pull.
@@ -278,18 +281,25 @@ def pull_committed(S, target):
         file=sys.stderr,
     )
 
+    target_norm = {_norm_seq(t): t for t in target}
     committed = {}
     if not branches:
         return committed
     with ThreadPoolExecutor(max_workers=len(branches)) as ex:
         for lines in ex.map(lambda br: pull_orderline_bulk(S, br, end), branches):
             for ln in lines:
-                seq = str(ln.get("DMI_CAT_SEQUENCE", "")).strip()
-                if seq not in target:
+                seq = target_norm.get(_norm_seq(ln.get("DMI_CAT_SEQUENCE")))
+                if seq is None:
                     continue
                 if str(ln.get("DMI_ORDNO", "")).strip() not in open_ordnos:
                     continue
-                committed[seq] = committed.get(seq, 0.0) + _f(ln.get("DMI_WQUANTITY"))
+                # On a PO already → covered, not committed.
+                pono = str(ln.get("DMI_PONO", "")).strip()
+                if pono and pono.strip("0"):
+                    continue
+                unassigned = _f(ln.get("DMI_WQUANTITY")) - _f(ln.get("DMI_QTYASSIGNED"))
+                if unassigned > 0:
+                    committed[seq] = committed.get(seq, 0.0) + unassigned
     return committed
 
 
@@ -329,7 +339,7 @@ def build_report():
             "on_hand":     0.0,
             "reserved":    0.0,                                  # assigned to rolls
             "available":   0.0,                                  # on_hand − reserved
-            "committed":   0.0,                                  # sold on open orders, assigned or not
+            "committed":   0.0,                                  # sold, unassigned, not on a PO
             "style":       str(u.get("style", "")).strip(),
             "color":       str(u.get("color", "")).strip(),
         }
@@ -366,9 +376,9 @@ def build_report():
                     items[seq]["color"] = co
     print(f"[{time.time()-t0:5.1f}s] productstock pulled", file=sys.stderr)
 
-    # --- Committed: qty sold on open orders, assigned or not (see pull_committed).
-    # Display-only — the notify policy below still turns on available balance, since
-    # the unassigned share of committed may be covered by stock that isn't here yet.
+    # --- Committed: sold on open orders, not assigned to a roll, not on a PO (see
+    # pull_committed). Display-only — the notify policy below turns on available
+    # balance; a positive committed is its own call to action (find stock or cut a PO).
     for seq, qty in pull_committed(S, target).items():
         items[seq]["committed"] = qty
     print(f"[{time.time()-t0:5.1f}s] committed pulled", file=sys.stderr)
@@ -417,8 +427,8 @@ def write_report(rows, path):
         w.write(
             "NOTIFY when available (on_hand − reserved) < reorder point (REORDER); "
             "below safety stock (SAFETY) is critical. Both thresholds are the values "
-            "entered in BMS — nothing is computed. COMMITTED is all open-order qty "
-            "sold (assigned or not) and is shown for context only.\n"
+            "entered in BMS — nothing is computed. COMMITTED is open-order qty sold "
+            "that is neither assigned to a roll nor on a PO — uncovered demand.\n"
         )
         w.write("=" * len(hdr) + "\n" + hdr + "\n" + "-" * len(hdr) + "\n")
         for r in rows:
