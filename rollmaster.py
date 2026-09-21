@@ -17,6 +17,7 @@ Two things about this API drive the shape of everything below:
     holding the existing id list locally — see load_known_cids().
 """
 import json
+from collections import Counter
 import logging
 import os
 import re
@@ -414,6 +415,12 @@ def find_existing_customer(name, phones=(), email=""):
             hits.setdefault(cid, (c, "email"))
     if not hits:
         return None
+    # An id Rollmaster has handed to two different customers can't be linked:
+    # an update would land on whichever record it resolves to. Human job.
+    dup_ids = {cid for cid, n in Counter(c[0].upper() for c in customers).items() if n > 1}
+    if any(cid in dup_ids for cid in hits):
+        raise AmbiguousMatch([v[0] for v in hits.values()] +
+                             [c for c in customers if c[0].upper() in hits and c[0].upper() in dup_ids and c not in [v[0] for v in hits.values()]])
     if len(hits) == 1:
         (c, how), = hits.values()
         return c[0].upper(), how

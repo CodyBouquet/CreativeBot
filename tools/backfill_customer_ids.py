@@ -13,6 +13,8 @@ phone, email and name, and writes the id where the match is safe:
                 with the most recent invoice is stamped, all listed for review
   name-blank    exact unique full-name match and RM has no phone    -> stamped
   name-differs  exact unique full-name match but RM phone differs   -> review
+  dup-id        the id is assigned to two customers IN ROLLMASTER    -> review;
+                fix the ids in Rollmaster first
   business      the RM name is a company (INC, BUILDERS, HOMES…)    -> review;
                 never linked to a person, whatever else matches
   contact-only  phone/email matches but the name does not           -> review
@@ -163,6 +165,11 @@ def match_all(customers, persons):
         for t in tokens(p["name"]):
             by_token[t].append(p["id"])
 
+    # Rollmaster does not enforce unique ids; a handful are assigned to two
+    # different customers. Such an id can't be a link — an update would land on
+    # whichever record Rollmaster happens to resolve it to.
+    dup_ids = {cid for cid, n in Counter(c["C_CID"].strip().upper() for c in customers).items() if n > 1}
+
     results = []
     for c in customers:
         cid   = c["C_CID"].strip().upper()
@@ -185,7 +192,9 @@ def match_all(customers, persons):
                 pool = set.intersection(*[set(by_token[t]) for t in tk])
                 scored = [(pid, {"name"}, 1.0) for pid in pool if tokens(by_id[pid]["name"]) == tk]
 
-        if looks_like_business(cname):
+        if cid in dup_ids:
+            cls = "dup-id"
+        elif looks_like_business(cname):
             cls = "business"
         elif not scored:
             cls = "no-match"
