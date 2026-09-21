@@ -11,18 +11,17 @@ BMS_ALIAS = "creativecarpets"
 BMS_COMPANY = "99"
 
 # ---- Notify policy ----
-# A stocked SKU (CAT_SAFTYSTK > 0) is evaluated against the thresholds ENTERED IN
-# BMS — nothing is computed. Using available balance = on_hand − reserved
+# A stocked SKU (CAT_SAFTYSTK > 0) is evaluated against the safety stock ENTERED
+# IN BMS — nothing is computed. Using available balance = on_hand − reserved
 # (/productstock AVAILABLE_FLOAT):
-#   NOTIFY when available < reorder point (CAT_REORDER), OR below safety stock.
-#   CRITICAL (red, top of list) when available < safety stock (CAT_SAFTYSTK).
-# The OR keeps a below-safety SKU visible even when its reorder point is still
-# unset (0) in BMS — a set reorder point is always >= safety stock.
+#   NOTIFY when available < safety stock (CAT_SAFTYSTK).
+# CAT_REORDER is the reorder QUANTITY (how much to buy once below safety), not a
+# trigger, and is not used.
 
 # ---- Committed quantity ----
-# Committed = quantity sold on open sales orders, assigned to a roll or not. It is
-# summed from /orderline, which needs a date window; this is the lower bound on how
-# far back we look for open orders. Anything older than this that is somehow still
+# Committed = quantity sold on open sales orders that is not yet assigned to a roll
+# and not on a PO. It is summed from /orderline, which needs a date window; this is
+# the lower bound on how far back we look for open orders. Anything older than this that is somehow still
 # open would be missed, so keep it comfortably early.
 ORDER_HISTORY_FLOOR = "20240101"
 

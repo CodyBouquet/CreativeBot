@@ -18,8 +18,7 @@ def build_section(user, ctx: ReportContext) -> str | None:
     """Return the reorder HTML table (same for every recipient), reusing the cached row pull; None when there's nothing to show.
 
     The pull evaluates every stocked SKU; the email lists only the ones that need
-    attention — available balance below the reorder point, or (critically) below
-    safety stock. Below-safety rows are red and listed first.
+    attention — available balance below the safety stock entered in BMS.
     """
     rows = ctx.get_or_compute("inventory.lowstock_rows", _pull_rows)
 
@@ -27,11 +26,8 @@ def build_section(user, ctx: ReportContext) -> str | None:
     if not display:
         return None
 
-    below_safety = sum(1 for r in display if r.get("urgent"))
     title = "Inventory — Low Stock"
-    badge = f"{len(display)} to reorder"
-    if below_safety:
-        badge += f" · {below_safety} below safety"
+    badge = f"{len(display)} below safety stock"
     return report_card(title, _render_html(display), icon="📦", badge=badge)
 
 
@@ -51,12 +47,10 @@ def _pull_rows() -> list[dict]:
     except Exception:
         log.exception("inventory_email.build_report() failed")
         return []
-    # Match the .txt file's sort order: below-safety (critical) first, then deepest
-    # below the reorder point, then by sequence.
+    # Match the .txt file's sort order: deepest below safety first, then by sequence.
     rows.sort(key=lambda r: (
-        not r.get("urgent"),
         not r.get("order_now"),
-        r.get("available", 0) - r.get("reorder_cur", 0),
+        r.get("available", 0) - r.get("safety_cur", 0),
         r.get("seq", ""),
     ))
     return rows
@@ -66,25 +60,25 @@ def _render_html(rows: list[dict]) -> str:
     """
     Table for the card body — one row per SKU that needs reordering.
 
-    Six columns — Item (style/color with a vendor·sequence subline), On Hand,
-    Committed, Available, Reorder, and Safety. Committed is quantity sold on open
-    orders that is neither assigned to a roll nor on a purchase order — demand
-    nothing is covering yet. Any positive committed is worth a look; where it exceeds
-    what is available it is shown in red, since the stock on hand can't satisfy it.
+    Five columns — Item (style/color with a vendor·sequence subline), On Hand,
+    Committed, Available, and Safety. Committed is quantity sold on open orders
+    that is neither assigned to a roll nor on a purchase order — demand nothing is
+    covering yet. Any positive committed is worth a look; where it exceeds what is
+    available it is shown in red, since the stock on hand can't satisfy it.
 
-    A SKU is listed when its available balance falls below the reorder point entered
-    in BMS. Rows whose available balance is below safety stock (critical inventory)
-    get a red left-accent, a red available value, and sort to the top of the list.
+    A SKU is listed when its available balance falls below the safety stock entered
+    in BMS; the deepest shortfalls come first. Available is shown in red on every
+    row, since every listed row is a shortfall.
     """
     th  = ("text-align:left; padding:7px 9px; border-bottom:2px solid #e4e4e4; "
            "font-size:11px; letter-spacing:0.5px; color:#999; text-transform:uppercase;")
     thr = th + " text-align:right;"
 
     caption = (
-        'Available balance below the reorder point — order now. Committed is '
-        'open-order quantity sold that is not yet assigned to a roll and not on a '
-        'PO; where it exceeds available (red) stock on hand cannot cover it. Rows '
-        'below safety stock (<strong>critical</strong>) are red and listed first.'
+        'Available balance below the safety stock entered in BMS — order now. '
+        'Committed is open-order quantity sold that is not yet assigned to a roll '
+        'and not on a PO; where it exceeds available (red) stock on hand cannot '
+        'cover it. Deepest shortfalls are listed first.'
     )
     head = (
         f'<p style="font-size:12px; color:#888; margin:2px 0 10px;">{caption}</p>'
@@ -94,7 +88,6 @@ def _render_html(rows: list[dict]) -> str:
         f'<th style="{thr}">On Hand</th>'
         f'<th style="{thr}">Committed</th>'
         f'<th style="{thr}">Available</th>'
-        f'<th style="{thr}">Reorder</th>'
         f'<th style="{thr}">Safety</th>'
         '</tr></thead><tbody>'
     )
@@ -106,10 +99,9 @@ def _render_html(rows: list[dict]) -> str:
         vendor = (r.get("vendor") or "").strip() or "—"
         seq    = r.get("seq", "")
 
-        urgent    = r.get("urgent", False)
         zebra     = "#ffffff" if i % 2 == 0 else "#fafafa"
-        accent    = "#d6452c" if urgent else "transparent"
-        avail_col = "#d6452c" if urgent else "#222"
+        accent    = "#d6452c"
+        avail_col = "#d6452c"
         # Uncovered demand the available stock can't satisfy. Worth calling out on
         # its own — it can be true of a SKU that isn't otherwise critical.
         committed = r.get("committed", 0)
@@ -128,7 +120,6 @@ def _render_html(rows: list[dict]) -> str:
             f'<td style="{tdr}">{r.get("on_hand", 0):.0f}</td>'
             f'<td style="{tdr} color:{comm_col};">{committed:.0f}</td>'
             f'<td style="{tdr} color:{avail_col}; font-weight:bold;">{r.get("available", 0):.0f}</td>'
-            f'<td style="{tdr}">{r.get("reorder_cur", 0):.0f}</td>'
             f'<td style="{tdr}">{r.get("safety_cur", 0):.0f}</td>'
             '</tr>'
         )

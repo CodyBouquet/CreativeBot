@@ -101,7 +101,7 @@ def _extract_stocked(rows, items):
             continue
         items[seq] = {
             "safety":  ie._f(it.get("CAT_SAFTYSTK")),    # current safety threshold
-            "reorder": ie._f(it.get("CAT_REORDER")),     # current reorder point
+            "reorder": ie._f(it.get("CAT_REORDER")),     # reorder QUANTITY (how much to buy); cached, not used by the report
             "vendor":   str(it.get("CAT_VENDORID", "")).strip(),
             "prodcode": str(it.get("CAT_PRODCODE", "")).strip(),  # product type (PAD = "18")
             "box":      ie._f(it.get("CAT_UNIT_PER_BOX")) or 1.0,

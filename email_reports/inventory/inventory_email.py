@@ -2,20 +2,18 @@
 BMS stocked-SKU reorder report.
 
 Pulls current stock from the Rollmaster (Broadlume BMS) API and evaluates EVERY
-stocked SKU (CAT_SAFTYSTK > 0) against the thresholds ENTERED IN BMS — nothing is
-computed. The stocked universe comes from the weekly catalog_scan.py cache
+stocked SKU (CAT_SAFTYSTK > 0) against the safety stock ENTERED IN BMS — nothing
+is computed. The stocked universe comes from the weekly catalog_scan.py cache
 (cfg.STOCKED_CATALOG_CACHE), falling back to /lowstock when that cache is
 missing/stale.
 
 Notify policy (per SKU), keyed off available balance = on_hand − reserved
 (the per-roll BMS AVAILABLE_FLOAT, summed across a SKU's rolls):
 
-    urgent    when available < safety stock  (CAT_SAFTYSTK) — CRITICAL: red, top
-    NOTIFY    when available < reorder point  (CAT_REORDER), OR below safety
+    NOTIFY    when available < safety stock (CAT_SAFTYSTK)
 
-The OR keeps a below-safety SKU visible even when its reorder point is still
-unset (0) in BMS — a properly set reorder point is always ≥ safety stock, so this
-reduces to plain "available < reorder" whenever the field is populated.
+(BMS also has CAT_REORDER, but that is the reorder QUANTITY — how much to buy
+once a SKU is below safety — not a trigger, so it plays no part here.)
 
 Columns (.txt full audit):
     SEQUENCE   CAT_SEQUENCE
@@ -27,8 +25,7 @@ Columns (.txt full audit):
     RESERVED   qty assigned to specific rolls (/productstock RESERVED_FLOAT)
     AVAIL      available balance = ON_HAND − RESERVED (/productstock AVAILABLE_FLOAT)
     SAFETY     entered safety stock (catalog CAT_SAFTYSTK, or /lowstock fallback)
-    REORDER    entered reorder point (catalog CAT_REORDER; often 0/unset)
-    NOTIFY     "CRIT" below safety, else "YES" below reorder, else blank
+    NOTIFY     "YES" when available < safety, else blank
 
 Usage:
     ./venv/bin/python inventory_email.py
@@ -209,9 +206,7 @@ def load_stocked_universe(S):
         )
 
     # --- Fallback: the narrower "currently below safety" list. Map it onto the
-    # same dict shape, leaving catalog-only fields blank for downstream code. The
-    # reorder point isn't in /lowstock, so it defaults to 0 (the safety trigger
-    # still fires on this degraded path).
+    # same dict shape, leaving catalog-only fields blank for downstream code.
     universe = {}
     for it in pull_lowstock(S):
         seq = str(it.get("CAT_SEQUENCE", "")).strip()
@@ -219,7 +214,6 @@ def load_stocked_universe(S):
             continue
         universe[seq] = {
             "safety":  _f(it.get("CAT_SAFETY_STOCK")),  # entered safety threshold
-            "reorder": 0.0,
             "vendor":  "",
             "style":   "",
             "color":   "",
@@ -307,15 +301,14 @@ def pull_committed(S, target):
 
 def build_report():
     """
-    Evaluate every stocked SKU against its entered BMS thresholds and return a list
-    of per-item dicts.
+    Evaluate every stocked SKU against its entered BMS safety stock and return a
+    list of per-item dicts.
 
     Pulls the stocked universe (weekly catalog cache, or /lowstock fallback), then
     the live roll stock per SKU (/productstock, in parallel) to get on_hand,
     reserved and available. Available = on_hand − reserved. A SKU is flagged
-    order_now when available drops below its reorder point (or below safety), and
-    urgent when available drops below safety stock. Nothing is computed — the
-    thresholds are the values entered in BMS.
+    order_now when available drops below its safety stock. Nothing is computed —
+    the threshold is the value entered in BMS.
     """
     t0 = time.time()
 
@@ -334,7 +327,6 @@ def build_report():
         seq: {
             "seq":         seq,
             "safety_cur":  _f(u.get("safety")),                  # entered CAT_SAFTYSTK
-            "reorder_cur": _f(u.get("reorder")),                 # entered CAT_REORDER
             "vendor":      str(u.get("vendor", "")).strip(),     # catalog CAT_VENDORID
             "on_hand":     0.0,
             "reserved":    0.0,                                  # assigned to rolls
@@ -383,14 +375,10 @@ def build_report():
         items[seq]["committed"] = qty
     print(f"[{time.time()-t0:5.1f}s] committed pulled", file=sys.stderr)
 
-    # --- Notify policy (uniform for every SKU, straight off the entered thresholds):
-    #   urgent    when available < safety stock (CAT_SAFTYSTK) — critical, red, top.
-    #   order_now when available < reorder point (CAT_REORDER), OR below safety — the
-    #     OR keeps a below-safety SKU visible even when its reorder point is unset (0),
-    #     since a set reorder point is always ≥ safety stock.
+    # --- Notify policy (uniform for every SKU, straight off the entered threshold):
+    #   order_now when available < safety stock (CAT_SAFTYSTK).
     for r in items.values():
-        r["urgent"]    = r["available"] < r["safety_cur"]
-        r["order_now"] = (r["available"] < r["reorder_cur"]) or r["urgent"]
+        r["order_now"] = r["available"] < r["safety_cur"]
 
     return list(items.values())
 
@@ -399,45 +387,42 @@ def write_report(rows, path):
     """
     Write the full stocked-universe audit as a fixed-width text file.
 
-    Sorted below-safety (critical) first, then deepest below reorder, then by
-    sequence. Unlike the email — which lists only SKUs to reorder — this .txt is
-    the complete audit of every stocked SKU, so thresholds set too low stay visible
-    even when nothing needs reordering yet.
+    Sorted below-safety first (deepest below first), then by sequence. Unlike the
+    email — which lists only SKUs to reorder — this .txt is the complete audit of
+    every stocked SKU, so thresholds set too low stay visible even when nothing
+    needs reordering yet.
     """
     rows = sorted(
         rows,
-        key=lambda r: (not r["urgent"], not r["order_now"],
-                       r["available"] - r["reorder_cur"], r["seq"]),
+        key=lambda r: (not r["order_now"], r["available"] - r["safety_cur"], r["seq"]),
     )
     ms = max((len(r["style"])  for r in rows), default=5)
     mc = max((len(r["color"])  for r in rows), default=5)
     mv = max((len(r["vendor"]) for r in rows), default=6)
     notify_count = sum(1 for r in rows if r["order_now"])
-    urgent_count = sum(1 for r in rows if r["urgent"])
     hdr = (
         f"{'SEQUENCE':<14} {'VENDOR':<{mv}} "
         f"{'ON_HAND':>8} {'COMMITTED':>10} {'RESERVED':>9} {'AVAIL':>8} "
-        f"{'SAFETY':>8} {'REORDER':>8} {'NOTIFY':>7} {'STYLE':<{ms}} {'COLOR':<{mc}}"
+        f"{'SAFETY':>8} {'NOTIFY':>7} {'STYLE':<{ms}} {'COLOR':<{mc}}"
     )
     with open(path, "w") as w:
         w.write(
             f"Stocked-SKU reorder report — company {COMPANY}, {len(rows)} SKUs, "
-            f"{notify_count} to reorder ({urgent_count} below safety stock)\n"
+            f"{notify_count} below safety stock\n"
         )
         w.write(
-            "NOTIFY when available (on_hand − reserved) < reorder point (REORDER); "
-            "below safety stock (SAFETY) is critical. Both thresholds are the values "
-            "entered in BMS — nothing is computed. COMMITTED is open-order qty sold "
-            "that is neither assigned to a roll nor on a PO — uncovered demand.\n"
+            "NOTIFY when available (on_hand − reserved) < safety stock (SAFETY), the "
+            "value entered in BMS — nothing is computed. COMMITTED is open-order qty "
+            "sold that is neither assigned to a roll nor on a PO — uncovered demand.\n"
         )
         w.write("=" * len(hdr) + "\n" + hdr + "\n" + "-" * len(hdr) + "\n")
         for r in rows:
-            flag = "CRIT" if r["urgent"] else ("YES" if r["order_now"] else "")
+            flag = "YES" if r["order_now"] else ""
             w.write(
                 f"{r['seq']:<14} {r['vendor']:<{mv}} "
                 f"{r['on_hand']:>8.2f} {r['committed']:>10.2f} "
                 f"{r['reserved']:>9.2f} {r['available']:>8.2f} "
-                f"{r['safety_cur']:>8.2f} {r['reorder_cur']:>8.2f} {flag:>7} "
+                f"{r['safety_cur']:>8.2f} {flag:>7} "
                 f"{r['style']:<{ms}} {r['color']:<{mc}}\n"
             )
 

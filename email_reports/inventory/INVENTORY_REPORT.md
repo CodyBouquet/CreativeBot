@@ -1,9 +1,9 @@
 # Inventory — Low Stock report
 
-Evaluates **every stocked SKU** in Rollmaster (BMS) against the reorder point and
-safety stock **entered in BMS**, and emails the ones that need reordering as a
-card in the daily report digest. Nothing is computed or recommended — the
-thresholds are whatever someone typed into the catalog.
+Evaluates **every stocked SKU** in Rollmaster (BMS) against the safety stock
+**entered in BMS**, and emails the ones that have dropped below it as a card in
+the daily report digest. Nothing is computed or recommended — the threshold is
+whatever someone typed into the catalog.
 
 Two pieces:
 
@@ -28,12 +28,11 @@ Per SKU, using **available** = on hand − reserved (BMS's own per-roll
 
 | Flag | Condition | In the email |
 |---|---|---|
-| **critical** (`urgent`) | available < safety stock (`CAT_SAFTYSTK`) | red left accent, red Available, listed first |
-| **reorder** (`order_now`) | available < reorder point (`CAT_REORDER`), **or** critical | listed |
+| `order_now` | available < safety stock (`CAT_SAFTYSTK`) | listed, deepest shortfall first |
 
-The "or critical" keeps a below-safety SKU visible when its reorder point is
-still unset (0) in BMS. A properly entered reorder point is always ≥ safety
-stock, so once it's populated this reduces to plain "available < reorder".
+That is the whole rule. BMS also has `CAT_REORDER`, but that is the reorder
+**quantity** — how much to buy once a SKU is below safety — not a trigger, so
+the report doesn't use or show it.
 
 Only SKUs with `order_now` appear in the email. The `.txt` audit lists all of
 them.
@@ -47,16 +46,15 @@ them.
 | Committed | `COMMITTED` | `/orderline` | **sold on open orders but not yet assigned to a roll and not on a PO** — demand nothing is covering yet. Per open-order line: `DMI_WQUANTITY − DMI_QTYASSIGNED`; lines with a `DMI_PONO` are skipped entirely. Shown red when it exceeds Available. |
 | — | `RESERVED` | `/productstock` `RESERVED_FLOAT` | assigned to specific rolls |
 | Available | `AVAIL` | `/productstock` `AVAILABLE_FLOAT` | on hand − reserved; what you can pull today |
-| Reorder | `REORDER` | catalog `CAT_REORDER` | entered reorder point (often 0/unset) |
 | Safety | `SAFETY` | catalog `CAT_SAFTYSTK` | entered safety stock |
-| — | `NOTIFY` | | `CRIT` below safety, `YES` below reorder, blank otherwise |
+| — | `NOTIFY` | | `YES` below safety, blank otherwise |
 
-Committed is display-only: the notify flags turn on Available. A positive
+Committed is display-only: the notify flag turns on Available. A positive
 Committed is its own call to action — someone has to find stock for it or cut
 a PO.
 
-Sort order (both outputs): critical first, then deepest below the reorder
-point, then by sequence.
+Sort order (both outputs): deepest below safety stock first, then by
+sequence.
 
 ## Data sources
 
@@ -95,7 +93,7 @@ Quirks worth knowing:
 The report trusts it only when `complete` is true **and** `scanned_at` is
 within `cfg.STOCKED_CATALOG_MAX_AGE_DAYS` (7). Otherwise it logs a warning and
 falls back to `/lowstock`, which is narrower (only SKUs already below safety)
-and has no reorder point or vendor. A partial scan (`complete: false`) is a
+and has no vendor or style information. A partial scan (`complete: false`) is a
 checkpoint: rerunning the scan resumes from `next_page`.
 
 Nothing else is cached; every report run pulls live stock and open orders.
@@ -142,8 +140,10 @@ immediately. Subscribers come from the M365 group synced by `m365_directory.py`.
 - **Available ignores committed.** A SKU can look fine on Available while
   thousands are sold and unassigned. Committed is shown for exactly that
   reason, but it doesn't flag the row.
-- **Nothing is recommended.** Wrong or unset thresholds in BMS produce wrong
-  or missing alerts; the report only reflects what's entered.
+- **Nothing is recommended.** A wrong or unset safety stock in BMS produces a
+  wrong or missing alert; the report only reflects what's entered. The BMS
+  reorder quantity (`CAT_REORDER`) isn't shown, so the email says *what* to
+  order, not *how much*.
 - **Open-order window.** Committed only sees orders dated on or after
   `ORDER_HISTORY_FLOOR`.
 - **Catalog cache staleness.** A SKU stocked since the last weekly scan isn't
