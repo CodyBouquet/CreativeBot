@@ -160,7 +160,7 @@ The default PIN is `0000`. Change it immediately after first login using the PIN
 
 Marks a deal's **Material Received** field as *Costed* once every material line
 on its Rollmaster order (linked by **RM Job #**) is assigned, stocked, or the
-order is labor-only. Clears Costed again only if a NEW material line that is still waiting is added to the order afterwards (optionally filling a second field: `PD_UNCOST_FIELD` / `PD_UNCOST_VALUE` in `.env`). Dry run until
+order is labor-only. Clears Costed again only if a NEW material line that is still waiting is added to the order afterwards (and ticks "Short Material / Add On Material" on the jobsite-material field). Dry run until
 `RM_COSTING_SYNC_ENABLED=1` is in `.env`; results show on the dashboard logs
 page as `RM_MATERIAL_COSTED` / `RM_MATERIAL_DRYRUN`.
 

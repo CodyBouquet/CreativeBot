@@ -22,8 +22,9 @@ unassigned with no PO — means the order is still waiting.
 
 Once a deal is Costed, the sync remembers which material lines the order had.
 If a NEW material line later appears on the order and is waiting (on a PO or
-not yet ordered), Material Received is cleared back to (none) — and, when
-configured, a second field is filled in — so the deal is visibly waiting again.
+not yet ordered), Material Received is cleared back to (none) and "Short
+Material / Add On Material" is ticked on the jobsite-material field, so the
+deal is visibly waiting again and the reason is on it.
 That is the only way Costed is ever cleared: lag on lines that were already
 there when the deal was costed never flips it backwards.
 
@@ -63,10 +64,12 @@ PD_JOB_FIELD   = os.environ.get("PD_RM_JOB_FIELD",   "90775bc3828d314573699aab24
 PD_MAT_FIELD   = os.environ.get("PD_MATERIAL_FIELD", "93b963a5979add976477b833fcab6803ea30bdbe")
 PD_MAT_COSTED  = os.environ.get("PD_MATERIAL_COSTED_OPTION", "29")     # option id of "Costed"
 
-# Optional second field to fill when a deal is un-costed because material was
-# added (key + value from /dealFields; leave blank to only clear Material Received).
-PD_UNCOST_FIELD = os.environ.get("PD_UNCOST_FIELD", "")
-PD_UNCOST_VALUE = os.environ.get("PD_UNCOST_VALUE", "")
+# When a deal is un-costed because material was added, also tick this option
+# on the "Short or Add On / Excess Material on Jobsite" multi-select (option 132
+# = "Short Material / Add On Material"). It is a set field, so the option is
+# ADDED to whatever is already selected, never replacing it. Blank disables.
+PD_UNCOST_FIELD  = os.environ.get("PD_UNCOST_FIELD",  "e4af5d72389c9bba5eaef8edd42c66125f0ad928")
+PD_UNCOST_OPTION = os.environ.get("PD_UNCOST_OPTION", "132")
 
 # Same window the inventory report uses for open orders; anything open but older
 # than this would be invisible to the sync.
@@ -198,12 +201,15 @@ def pd_mark_costed(deal_id):
     pd_update_deal(deal_id, {PD_MAT_FIELD: PD_MAT_COSTED})
 
 
-def pd_clear_costed(deal_id):
-    """Clear Material Received (back to none) and fill the optional second field."""
+def pd_clear_costed(deal):
+    """Clear Material Received (back to none) and add the Short/Add On option to the jobsite-material set field."""
     fields = {PD_MAT_FIELD: None}
-    if PD_UNCOST_FIELD:
-        fields[PD_UNCOST_FIELD] = PD_UNCOST_VALUE
-    pd_update_deal(deal_id, fields)
+    if PD_UNCOST_FIELD and PD_UNCOST_OPTION:
+        current = [v for v in str(deal.get(PD_UNCOST_FIELD) or "").split(",") if v.strip()]
+        if PD_UNCOST_OPTION not in current:
+            current.append(PD_UNCOST_OPTION)
+        fields[PD_UNCOST_FIELD] = ",".join(current)
+    pd_update_deal(deal["id"], fields)
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +311,7 @@ def run(dry_run=False):
             payload["added"] = added_waiting
             if write:
                 try:
-                    pd_clear_costed(deal["id"])
+                    pd_clear_costed(deal)
                 except Exception as e:
                     logger.error(f"deal {deal['id']} (job {job}): {e}")
                     log_event(deal["id"], "RM_MATERIAL_FAILED", payload, f"Could not clear Costed: {e}")
