@@ -20,9 +20,12 @@ An order's material is all in when every material line on it is one of:
 Anything else — a line still on a PO (status O), or a special-order SKU that is
 unassigned with no PO — means the order is still waiting.
 
-The sync only ever SETS Costed. It never clears it: Rollmaster entry can lag a
-physical delivery, and a deal flipping backwards would be worse than one
-flipping late. Deals already marked Costed are left alone.
+Once a deal is Costed, the sync remembers which material lines the order had.
+If a NEW material line later appears on the order and is waiting (on a PO or
+not yet ordered), Material Received is cleared back to (none) — and, when
+configured, a second field is filled in — so the deal is visibly waiting again.
+That is the only way Costed is ever cleared: lag on lines that were already
+there when the deal was costed never flips it backwards.
 
 Runs from cron on the Pi (see SETUP.md). Dry run unless RM_COSTING_SYNC_ENABLED=1
 in .env; every flip (or would-be flip) is written to the events table so it
@@ -59,6 +62,11 @@ ENABLED            = os.environ.get("RM_COSTING_SYNC_ENABLED", "0") == "1"
 PD_JOB_FIELD   = os.environ.get("PD_RM_JOB_FIELD",   "90775bc3828d314573699aab24c6c7fb8c9019ec")
 PD_MAT_FIELD   = os.environ.get("PD_MATERIAL_FIELD", "93b963a5979add976477b833fcab6803ea30bdbe")
 PD_MAT_COSTED  = os.environ.get("PD_MATERIAL_COSTED_OPTION", "29")     # option id of "Costed"
+
+# Optional second field to fill when a deal is un-costed because material was
+# added (key + value from /dealFields; leave blank to only clear Material Received).
+PD_UNCOST_FIELD = os.environ.get("PD_UNCOST_FIELD", "")
+PD_UNCOST_VALUE = os.environ.get("PD_UNCOST_VALUE", "")
 
 # Same window the inventory report uses for open orders; anything open but older
 # than this would be invisible to the sync.
@@ -104,8 +112,9 @@ def load_stocked_seqs():
 
 def rm_material_status(stocked):
     """
-    Return {order_no: (status, detail)} for every open Rollmaster order, where
-    status is 'all_in', 'labor_only' or 'waiting'.
+    Return {order_no: info} for every open Rollmaster order, where info is
+    {"status": 'all_in' | 'labor_only' | 'waiting', "detail": str,
+     "lines": [material line numbers], "waiting": {line number: description}}.
 
     `stocked` is the stocked-SKU set, or None when the catalog cache isn't
     available — in which case an unassigned line is treated as waiting, which
@@ -130,10 +139,11 @@ def rm_material_status(stocked):
                     if str(ln.get("DMI_STATUS", "")).strip() in MATERIAL_LINE_STATUSES
                     and _f(ln.get("DMI_WQUANTITY")) > 0]
         if not material:
-            result[ordno] = ("labor_only", "no material lines")
+            result[ordno] = {"status": "labor_only", "detail": "no material lines", "lines": [], "waiting": {}}
             continue
-        waiting = []
+        waiting = {}
         for ln in material:
+            lnnum = str(ln.get("DMI_LNNUM", "")).strip()
             sold, assigned = _f(ln.get("DMI_WQUANTITY")), _f(ln.get("DMI_QTYASSIGNED"))
             on_po = (str(ln.get("DMI_STATUS", "")).strip() == "O"
                      or bool(str(ln.get("DMI_PONO", "")).strip().strip("0")))
@@ -143,8 +153,12 @@ def rm_material_status(stocked):
             if not on_po and stocked is not None and seq in stocked:
                 continue                                              # stock item, pulled later
             what = (str(ln.get("DMI_STYLE", "")).strip() or seq)[:40]
-            waiting.append(f"{what} ({'on PO ' + str(ln.get('DMI_PONO')).strip() if on_po else 'not ordered'})")
-        result[ordno] = ("waiting", "; ".join(waiting[:4])) if waiting else ("all_in", f"{len(material)} material lines in")
+            waiting[lnnum] = f"{what} ({'on PO ' + str(ln.get('DMI_PONO')).strip() if on_po else 'not ordered'})"
+        lines = [str(ln.get("DMI_LNNUM", "")).strip() for ln in material]
+        if waiting:
+            result[ordno] = {"status": "waiting", "detail": "; ".join(list(waiting.values())[:4]), "lines": lines, "waiting": waiting}
+        else:
+            result[ordno] = {"status": "all_in", "detail": f"{len(material)} material lines in", "lines": lines, "waiting": {}}
     return result
 
 
@@ -170,13 +184,26 @@ def pd_open_deals_with_job():
         time.sleep(0.2)
 
 
-def pd_mark_costed(deal_id):
-    """Set Material Received = Costed on one deal; raises on failure."""
+def pd_update_deal(deal_id, fields):
+    """PUT fields on one deal; raises on failure."""
     r = requests.put(f"{PD_BASE}/deals/{deal_id}", params={"api_token": PIPEDRIVE_API_TOKEN},
-                     json={PD_MAT_FIELD: PD_MAT_COSTED}, timeout=30)
+                     json=fields, timeout=30)
     r.raise_for_status()
     if not r.json().get("success"):
         raise RuntimeError(f"Pipedrive update failed: {r.text[:200]}")
+
+
+def pd_mark_costed(deal_id):
+    """Set Material Received = Costed on one deal."""
+    pd_update_deal(deal_id, {PD_MAT_FIELD: PD_MAT_COSTED})
+
+
+def pd_clear_costed(deal_id):
+    """Clear Material Received (back to none) and fill the optional second field."""
+    fields = {PD_MAT_FIELD: None}
+    if PD_UNCOST_FIELD:
+        fields[PD_UNCOST_FIELD] = PD_UNCOST_VALUE
+    pd_update_deal(deal_id, fields)
 
 
 # ---------------------------------------------------------------------------
@@ -201,29 +228,105 @@ def log_event(deal_id, event_type, payload, action):
 
 
 # ---------------------------------------------------------------------------
+# COSTED BASELINES — which material lines an order had when its deal was costed
+# ---------------------------------------------------------------------------
+def _db():
+    """sqlite connection with the baseline table ensured."""
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS costing_baseline (
+        rm_job TEXT PRIMARY KEY, deal_id INTEGER, lines TEXT NOT NULL, recorded_at TEXT NOT NULL)""")
+    return conn
+
+
+def load_baselines():
+    """{rm_job: set of material line numbers present when the deal was (seen) costed}."""
+    with _db() as conn:
+        return {job: set(json.loads(lines)) for job, lines in conn.execute("SELECT rm_job, lines FROM costing_baseline")}
+
+
+def save_baseline(job, deal_id, lines):
+    """Remember the order's material lines as of now."""
+    with _db() as conn:
+        conn.execute("INSERT OR REPLACE INTO costing_baseline (rm_job, deal_id, lines, recorded_at) VALUES (?, ?, ?, ?)",
+                     (job, deal_id, json.dumps(sorted(set(lines))), datetime.utcnow().isoformat()))
+
+
+def drop_baseline(job):
+    """Forget an order's baseline (deal no longer costed / no longer open)."""
+    with _db() as conn:
+        conn.execute("DELETE FROM costing_baseline WHERE rm_job = ?", (job,))
+
+
+# ---------------------------------------------------------------------------
 def run(dry_run=False):
-    """One pass: compute material status per open order, flip linked deals to Costed. Returns a summary dict."""
+    """
+    One pass over every open deal that carries an RM Job #:
+
+      not Costed, order all in / labor-only  -> mark Costed, record baseline
+      Costed, no baseline yet                -> record baseline (hand-marked deals)
+      Costed, a NEW line is waiting          -> clear Costed (+ optional field)
+      otherwise                              -> nothing
+
+    Returns a summary dict.
+    """
     write = ENABLED and not dry_run
     stocked = load_stocked_seqs()
     if stocked is None:
         logger.warning("stocked-catalog cache missing/incomplete — unassigned stock items will count as waiting")
     status = rm_material_status(stocked)
     deals = pd_open_deals_with_job()
+    baselines = load_baselines()
     summary = Counter()
     for job, deal in deals.items():
-        st = status.get(job)
-        if st is None:
+        info = status.get(job)
+        if info is None:
             summary["deal has job # but order not open"] += 1
             continue
-        kind, detail = st
-        if str(deal.get(PD_MAT_FIELD) or "") == PD_MAT_COSTED:
-            summary["already costed"] += 1
+        costed = str(deal.get(PD_MAT_FIELD) or "") == PD_MAT_COSTED
+        payload = {"deal_id": deal["id"], "title": deal.get("title"), "rm_job": job,
+                   "status": info["status"], "detail": info["detail"]}
+
+        if costed:
+            base = baselines.get(job)
+            if base is None:
+                # First time we see this deal costed (marked by hand, or before
+                # baselines existed): remember today's lines, judge additions later.
+                # Local state only, so it's recorded even on a dry run.
+                save_baseline(job, deal["id"], info["lines"])
+                summary["already costed"] += 1
+                continue
+            added_waiting = {ln: d for ln, d in info["waiting"].items() if ln not in base}
+            if not added_waiting:
+                summary["already costed"] += 1
+                continue
+            what = "; ".join(list(added_waiting.values())[:4])
+            action = f"{'Cleared' if write else 'DRY RUN — would clear'} Costed on deal {deal['id']}: material added to RM job {job} after costing ({what})"
+            payload["added"] = added_waiting
+            if write:
+                try:
+                    pd_clear_costed(deal["id"])
+                except Exception as e:
+                    logger.error(f"deal {deal['id']} (job {job}): {e}")
+                    log_event(deal["id"], "RM_MATERIAL_FAILED", payload, f"Could not clear Costed: {e}")
+                    summary["failed"] += 1
+                    continue
+                drop_baseline(job)
+                summary["cleared costed"] += 1
+                log_event(deal["id"], "RM_MATERIAL_UNCOSTED", payload, action)
+            else:
+                summary["would clear costed"] += 1
+                log_event(deal["id"], "RM_MATERIAL_DRYRUN", payload, action)
+            logger.info(action)
             continue
-        if kind == "waiting":
+
+        # Not costed.
+        if job in baselines:
+            drop_baseline(job)                       # someone cleared it by hand; start fresh
+        if info["status"] == "waiting":
             summary["waiting"] += 1
             continue
-        action = f"{'Marked' if write else 'DRY RUN — would mark'} deal {deal['id']} Costed: RM job {job} {kind} ({detail})"
-        payload = {"deal_id": deal["id"], "title": deal.get("title"), "rm_job": job, "status": kind, "detail": detail}
+        action = f"{'Marked' if write else 'DRY RUN — would mark'} deal {deal['id']} Costed: RM job {job} {info['status']} ({info['detail']})"
         if write:
             try:
                 pd_mark_costed(deal["id"])
@@ -232,12 +335,17 @@ def run(dry_run=False):
                 log_event(deal["id"], "RM_MATERIAL_FAILED", payload, f"Could not mark Costed: {e}")
                 summary["failed"] += 1
                 continue
+            save_baseline(job, deal["id"], info["lines"])
             summary["marked costed"] += 1
             log_event(deal["id"], "RM_MATERIAL_COSTED", payload, action)
         else:
             summary["would mark costed"] += 1
             log_event(deal["id"], "RM_MATERIAL_DRYRUN", payload, action)
         logger.info(action)
+
+    # Orders that closed or lost their deal: forget their baselines.
+    for job in set(baselines) - set(deals):
+        drop_baseline(job)
     logger.info(f"costing sync ({'LIVE' if write else 'dry run'}): {dict(summary)}")
     return dict(summary)
 
