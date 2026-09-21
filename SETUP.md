@@ -155,3 +155,19 @@ Event: Just the push event
 
 ## Default PIN
 The default PIN is `0000`. Change it immediately after first login using the PIN button in the dashboard header.
+
+## Rollmaster → Pipedrive costing sync (`costing_sync.py`)
+
+Marks a deal's **Material Received** field as *Costed* once every material line
+on its Rollmaster order (linked by **RM Job #**) is assigned, stocked, or the
+order is labor-only. Only ever sets Costed, never clears it. Dry run until
+`RM_COSTING_SYNC_ENABLED=1` is in `.env`; results show on the dashboard logs
+page as `RM_MATERIAL_COSTED` / `RM_MATERIAL_DRYRUN`.
+
+Cron on the Pi (every 30 min, business hours):
+```
+*/30 6-18 * * 1-6 cd /home/admin/CreativeBot && /home/admin/CreativeBot/venv/bin/python costing_sync.py 2>&1 | logger -t creativebot-costing
+```
+It relies on the inventory report's weekly catalog scan
+(`email_reports/inventory/.stocked_catalog_cache.json`) to know which SKUs are
+stocked; without it, unassigned stock items count as still waiting.
