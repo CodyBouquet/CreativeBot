@@ -271,10 +271,29 @@ def _compact(row):
     return [str(row.get(k) or "").strip() for k in _CACHE_COLS]
 
 
+def _pull_all_customers(attempts=4, pause=90):
+    """
+    GET /customers, retrying on a gateway timeout.
+
+    The full list takes ~115s to produce and the API gateway in front of
+    Rollmaster gives up at 120s, so the pull fails outright whenever the server
+    is a little slow. A pause before retrying lets whatever was loading it
+    finish; anything other than a 504 is raised at once.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return get("customers", {"company": COMPANY}, timeout=600)
+        except RollmasterError as e:
+            if "HTTP 504" not in str(e) or attempt == attempts:
+                raise
+            logger.warning(f"Rollmaster: /customers timed out at the gateway (attempt {attempt}/{attempts}); retrying in {pause}s")
+            time.sleep(pause)
+
+
 def refresh_known_cids():
     """Pull every customer from /customers and replace the disk cache; returns the id set."""
     t0 = time.time()
-    rows = get("customers", {"company": COMPANY}, timeout=600)
+    rows = _pull_all_customers()
     customers = [_compact(r) for r in rows if str(r.get("C_CID", "")).strip()]
     cids = {c[0].upper() for c in customers}
     _write_cid_cache(cids, customers)
