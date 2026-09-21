@@ -219,28 +219,39 @@ def match_all(customers, persons):
     return results
 
 
-def plan_writes(results):
+def plan_writes(results, strict=False):
     """
     Decide which persons get stamped with which id. Returns (writes, review):
     writes = [(person_id, cid, reason)], review = result rows needing a human.
+
+    strict=True keeps only the cut-and-dry links: phone/email match with an
+    EXACT name, one record to one person. Near-miss names, name-only matches
+    and duplicate groups all go to review instead.
     """
     stampable = defaultdict(list)          # pid -> rows that could stamp it
     review = []
     for r in results:
-        if r["class"] in ("strong", "name-blank"):
+        if r["class"] == "strong" or (r["class"] == "name-blank" and not strict):
             stampable[r["pid"]].append(r)
         else:
             review.append(r)
 
     writes = []
     for pid, rows in stampable.items():
-        if rows[0]["pd_cid"]:
+        if rows[0]["pd_cid"] and any(rows[0]["pd_cid"] != r["cid"] for r in rows):
             for r in rows:
                 review.append({**r, "class": "already-linked"})
             continue
         if len(rows) == 1:
             r = rows[0]
+            if strict and r["sim"] != 1.0:
+                review.append({**r, "class": "name-near-miss"})
+                continue
             writes.append((pid, r["cid"], r["class"]))
+            continue
+        if strict:
+            for r in rows:
+                review.append({**r, "class": "dup-group", "candidates": ", ".join(x["cid"] for x in rows)})
             continue
         # RM-side duplicates: the most recently invoiced active record wins;
         # every record in the group goes on the review list for a later merge.
@@ -277,6 +288,8 @@ def main():
     ap.add_argument("--persons", help="saved Pipedrive persons JSON (else pulled live)")
     ap.add_argument("--plan", help="CSV of every write that would be / was made")
     ap.add_argument("--review", help="CSV of customers needing a human decision")
+    ap.add_argument("--strict", action="store_true",
+                    help="only exact-name phone/email matches, one-to-one; no near-miss names, name-only or dup groups")
     ap.add_argument("--apply", action="store_true", help="actually write Customer IDs to Pipedrive")
     args = ap.parse_args()
 
@@ -289,7 +302,7 @@ def main():
 
     results = match_all(customers, persons)
     print("match classes:", dict(Counter(r["class"] for r in results)))
-    writes, review = plan_writes(results)
+    writes, review = plan_writes(results, strict=args.strict)
     print(f"planned writes: {len(writes)}  ({dict(Counter(w[2] for w in writes))})")
     print(f"review items:   {len(review)}  ({dict(Counter(r['class'] for r in review))})")
 
