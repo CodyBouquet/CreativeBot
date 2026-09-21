@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for, Response
 from dotenv import load_dotenv
+import re
 import requests
 import logging
 import os
@@ -1092,6 +1093,72 @@ def _pd_value(payload, key):
     return ""
 
 
+_US_STATES = {
+    "ALABAMA": "AL", "ALASKA": "AK", "ARIZONA": "AZ", "ARKANSAS": "AR", "CALIFORNIA": "CA",
+    "COLORADO": "CO", "CONNECTICUT": "CT", "DELAWARE": "DE", "FLORIDA": "FL", "GEORGIA": "GA",
+    "HAWAII": "HI", "IDAHO": "ID", "ILLINOIS": "IL", "INDIANA": "IN", "IOWA": "IA",
+    "KANSAS": "KS", "KENTUCKY": "KY", "LOUISIANA": "LA", "MAINE": "ME", "MARYLAND": "MD",
+    "MASSACHUSETTS": "MA", "MICHIGAN": "MI", "MINNESOTA": "MN", "MISSISSIPPI": "MS",
+    "MISSOURI": "MO", "MONTANA": "MT", "NEBRASKA": "NE", "NEVADA": "NV", "NEW HAMPSHIRE": "NH",
+    "NEW JERSEY": "NJ", "NEW MEXICO": "NM", "NEW YORK": "NY", "NORTH CAROLINA": "NC",
+    "NORTH DAKOTA": "ND", "OHIO": "OH", "OKLAHOMA": "OK", "OREGON": "OR", "PENNSYLVANIA": "PA",
+    "RHODE ISLAND": "RI", "SOUTH CAROLINA": "SC", "SOUTH DAKOTA": "SD", "TENNESSEE": "TN",
+    "TEXAS": "TX", "UTAH": "UT", "VERMONT": "VT", "VIRGINIA": "VA", "WASHINGTON": "WA",
+    "WEST VIRGINIA": "WV", "WISCONSIN": "WI", "WYOMING": "WY", "DISTRICT OF COLUMBIA": "DC",
+}
+
+
+def _format_phone(raw):
+    """Rollmaster keys phones as 999-999-9999; reformat a 10-digit (or 1+10) number, else pass through."""
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 11 and digits[0] == "1":
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    return (raw or "").strip()
+
+
+def _street_only(address, city, state, zipcd):
+    """
+    Reduce a Pipedrive formatted address to its street line.
+
+    Pipedrive's address field arrives as "123 Maple St #4, Frankfort, IL 60423, USA";
+    Rollmaster wants only "123 Maple St #4" in C_ADDR1 since city/state/zip have
+    their own fields. Cut at the city when we know it, otherwise at the first
+    comma. An address with no comma is left alone.
+    """
+    addr = (address or "").strip()
+    if "," not in addr:
+        return addr
+    if city:
+        i = addr.upper().find("," + " " + city.upper())
+        if i < 0:
+            i = addr.upper().find("," + city.upper())
+        if i > 0:
+            return addr[:i].strip()
+    return addr.split(",", 1)[0].strip()
+
+
+def _normalize_customer_fields(fields):
+    """
+    Bring mapped values in line with how Rollmaster stores them: street-only
+    ADDR1, 2-letter state, 999-999-9999 phones, upper-case text (email as typed),
+    and no unit number repeated in ADDR2 when ADDR1 already carries it.
+    """
+    f = dict(fields)
+    f["C_ADDR1"] = _street_only(f.get("C_ADDR1"), f.get("C_CITY"), f.get("C_STATE"), f.get("C_ZIPCD"))
+    unit = (f.get("C_ADDR2") or "").strip()
+    if unit and re.search(r"(^|[\s#])" + re.escape(unit) + r"$", f["C_ADDR1"]):
+        f["C_ADDR2"] = ""
+    st = (f.get("C_STATE") or "").strip().upper()
+    f["C_STATE"] = _US_STATES.get(st, st)
+    for k in ("C_PHONE", "C_PHONE2", "C_FAX"):
+        f[k] = _format_phone(f.get(k))
+    for k in ("C_NAME", "C_NAME_LONG", "C_CONTACT", "C_ADDR1", "C_ADDR2", "C_CITY"):
+        f[k] = (f.get(k) or "").strip().upper()
+    return f
+
+
 def map_pipedrive_customer(payload):
     """
     Turn a Pipedrive automation payload into (rollmaster_fields, name_for_cid).
@@ -1138,7 +1205,7 @@ def map_pipedrive_customer(payload):
         if key in rollmaster.CUSTOMER_FIELDS and key != "C_CID" and str(v or "").strip():
             fields[key] = str(v).strip()
 
-    return fields, name
+    return _normalize_customer_fields(fields), name
 
 
 def _cid_write_back_target(deal_id):
