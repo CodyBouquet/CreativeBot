@@ -125,6 +125,10 @@ RM_CUSTOMER_DEFAULTS = {
     # Salesperson every synced customer is filed under (e.g. "HA" = house account).
     "C_SLSID":               os.environ.get("RM_C_SLSID", ""),
 }
+# Pipedrive deal custom field that receives the new Rollmaster customer id. The
+# automation can't capture the webhook response, so the app writes it back itself
+# after a successful create. Blank disables the write-back.
+RM_PD_CID_FIELD = os.environ.get("RM_PD_CID_FIELD", "509740a9dad0eab9c7c83842beefb2eda43ae199")
 # Optional: Pipedrive deal owner → Rollmaster salesperson id (C_SLSID, e.g. "MRB",
 # "AMB"). JSON object in the env var, keyed by owner name or Pipedrive user id. A
 # matching owner overrides RM_C_SLSID; leave it {} to file everyone under the default.
@@ -1137,6 +1141,36 @@ def map_pipedrive_customer(payload):
     return fields, name
 
 
+def _cid_write_back_target(deal_id):
+    """Where the new customer id will be written, or None when nothing is configured for it."""
+    if not (deal_id and RM_PD_CID_FIELD and PIPEDRIVE_API_TOKEN):
+        return None
+    return {"deal_id": deal_id, "field": RM_PD_CID_FIELD}
+
+
+def _write_cid_to_deal(deal_id, cid):
+    """
+    Store a freshly created Rollmaster customer id on the Pipedrive deal.
+
+    The customer already exists in the ERP by the time this runs, so a failure
+    here is logged and reported but never fails the sync call. Returns a short
+    status string for the response body.
+    """
+    if not _cid_write_back_target(deal_id):
+        return "skipped (no deal id or write-back not configured)"
+    try:
+        if pd_update_deal(deal_id, {RM_PD_CID_FIELD: cid}) is None:
+            return f"blocked (historical deal {deal_id})"
+        return f"updated deal {deal_id}"
+    except Exception as e:
+        logger.exception(f"rm-customer-sync: created {cid} but failed to write it to deal {deal_id}")
+        with get_db() as conn:
+            store_event(conn, deal_id, None, "RM_CUSTOMER_WRITEBACK_FAILED", "customer",
+                        {"cid": cid, "field": RM_PD_CID_FIELD}, f"Created {cid} but Pipedrive update failed: {e}")
+        sse_notify()
+        return f"failed: {e}"
+
+
 def _sync_key_ok():
     """True when the request carries the shared secret (X-Sync-Key header or ?key=); always False if none is configured."""
     if not RM_SYNC_SECRET:
@@ -1193,7 +1227,8 @@ def rm_customer_sync():
                 store_event(conn, deal_id, None, "RM_CUSTOMER_DRYRUN", "customer", payload, action)
             sse_notify()
             return jsonify({"status": "dry-run", "cid": cid,
-                            "would_send": rollmaster.build_customer_form({**fields, "C_CID": cid})}), 200
+                            "would_send": rollmaster.build_customer_form({**fields, "C_CID": cid}),
+                            "would_write_back": _cid_write_back_target(deal_id)}), 200
 
         cid, resp = rollmaster.create_customer(fields, name=name)
         action = f"Created Rollmaster customer {cid} ({fields['C_NAME']})"
@@ -1201,7 +1236,8 @@ def rm_customer_sync():
         with get_db() as conn:
             store_event(conn, deal_id, None, "RM_CUSTOMER_CREATED", "customer", payload, action)
         sse_notify()
-        return jsonify({"status": "ok", "cid": cid, "response": resp}), 200
+        return jsonify({"status": "ok", "cid": cid, "response": resp,
+                        "pipedrive": _write_cid_to_deal(deal_id, cid)}), 200
 
     except rollmaster.RollmasterError as e:
         logger.exception(f"rm-customer-sync rejected by Rollmaster: {e}")
