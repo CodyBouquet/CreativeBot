@@ -341,6 +341,16 @@ def pd_update_person(person_id, fields):
     return data["data"]
 
 
+def pd_get_person(person_id):
+    """Fetch a single person from the Pipedrive API; raises if the request or API response fails."""
+    r = requests.get(f"{PD_BASE}/persons/{person_id}", params={"api_token": PIPEDRIVE_API_TOKEN}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("success"):
+        raise Exception(f"Pipedrive get person failed: {data}")
+    return data["data"]
+
+
 def _scrub_token(text):
     """Remove the Pipedrive API token from a message before it reaches a log or the events table."""
     return str(text).replace(PIPEDRIVE_API_TOKEN, "***") if PIPEDRIVE_API_TOKEN else str(text)
@@ -1307,7 +1317,24 @@ def rm_customer_sync():
 
         # A person that already carries a Rollmaster customer id is an UPDATE of
         # that record, never a second create. The id itself is never changed.
+        # Trust the payload's customer_id when sent; otherwise ask Pipedrive for
+        # the person's Customer ID field, so an automation that forgets to send
+        # it (or fires on every edit) can't create duplicates.
         existing_cid = _pd_value(payload, "cid").strip().upper()
+        if not existing_cid and _cid_write_back_target(person_id):
+            try:
+                existing_cid = str(pd_get_person(person_id).get(RM_PD_CID_FIELD) or "").strip().upper()
+                if existing_cid:
+                    logger.info(f"rm-customer-sync: person {person_id} already has Customer ID {existing_cid} in Pipedrive")
+            except Exception as e:
+                # Can't tell — refuse to guess. A create here could be a duplicate.
+                msg = _scrub_token(e)
+                logger.error(f"rm-customer-sync: could not read person {person_id} from Pipedrive: {msg}")
+                with get_db() as conn:
+                    store_event(conn, deal_id, None, "RM_CUSTOMER_FAILED", "customer", payload,
+                                f"Refused: could not check person {person_id} for an existing Customer ID ({msg})")
+                sse_notify()
+                return jsonify({"error": f"could not read person {person_id} from Pipedrive: {msg}"}), 502
         if existing_cid:
             params = rollmaster.update_params(existing_cid, fields)
             if not RM_CUSTOMER_SYNC_ENABLED:
