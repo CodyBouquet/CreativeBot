@@ -1,153 +1,152 @@
-# Inventory Report (`inventory_email.py`)
+# Inventory — Low Stock report
 
-A daily-runnable script that pulls demand + supply data from the Rollmaster
-(Broadlume BMS) API and writes a low-stock reorder report covering every
-stocking item currently below its safety-stock threshold. Output is plain text
-at the path defined by `cfg.OUTPUT_PATH` (default `safety_stock_items.txt`).
+Evaluates **every stocked SKU** in Rollmaster (BMS) against the reorder point and
+safety stock **entered in BMS**, and emails the ones that need reordering as a
+card in the daily report digest. Nothing is computed or recommended — the
+thresholds are whatever someone typed into the catalog.
 
-## Run
+Two pieces:
 
-```bash
-./venv/bin/python inventory_email.py
-```
+| File | Role |
+|---|---|
+| `inventory_email.py` | Pulls live stock for each stocked SKU, applies the notify policy, and returns one row per SKU. Also writes the full `.txt` audit when run by hand. |
+| `catalog_scan.py` | Weekly job that walks the whole `/catalogitems` table (~1M rows) to find the stocked SKUs (`CAT_SAFTYSTK > 0`) and caches them. The report only reads that cache. |
 
-First run takes ~6–8 minutes (most of it the `/invoicelines` walk and the
-catalog scan for box qty). Subsequent runs reuse the box-qty cache and the
-catalog scan is skipped.
+`../modules/inventory.py` renders the rows as the email card; `../scheduler.py`
+sends it.
 
-Credentials live in `.env`:
-```
-BMS_API_KEY=...
-BMS_USERNAME=...
-BMS_PASSWORD=...
-```
+## What "stocked" means
 
-Knobs live in `inventory_email_config.py`. Edit those, not the script.
+A SKU is stocked if its catalog record has `CAT_SAFTYSTK > 0`. That's the whole
+definition. The report never looks at the `/lowstock` list except as a fallback
+when the catalog cache is missing or stale (see Caching).
 
-## Output columns
+## Notify policy
 
-| Column     | Meaning                                                                                |
-|------------|----------------------------------------------------------------------------------------|
-| `SEQUENCE` | `CAT_SEQUENCE` — the Rollmaster item id                                                |
-| `VENDOR`   | `VENDOR` from `/purchaseorderlines` (blank if no PO history)                           |
-| `LT`       | Lead time in days, from `cfg.VENDOR_LEAD_TIMES[vendor]` or `DEFAULT_LEAD_TIME_DAYS`    |
-| `ON_HAND`  | Sum of current rolls (`/productstock` `ONHAND_FLOAT`)                                  |
-| `AVAIL`    | Sum of `AVAILABLE_FLOAT` — what you can pull today (already nets out reserved rolls)   |
-| `UNASN`    | Open sales-order qty not yet allocated to a roll (`DMI_WQUANTITY − DMI_QTYASSIGNED`)   |
-| `ON_PO`    | Open PO qty not yet received (`QTYORD − QTYREC`, `STATUS='O'`)                         |
-| `SOLD_1YR` | `IVL_SQUAN` summed across invoices dated within `DEMAND_WINDOW_DAYS`                   |
-| `PEAK_WK`  | Max single-week `DMI_SQUANTITY` bucketed by `DMH_DATE` ISO week                        |
-| `SIGMA_WK` | Std-dev of weekly invoiced qty across the demand window (zeros included)               |
-| `BOX`      | `CAT_UNIT_PER_BOX` (1 if not sold by box)                                              |
-| `SAF_CUR`  | Currently configured safety stock (`CAT_SAFETY_STOCK` from `/lowstock`)                |
-| `SAF_REC`  | **Recommended** safety = `Z × σ × √(LT/7)`, ceiled to box                              |
-| `ROP_REC`  | **Recommended** reorder point = `daily_demand × LT + SAF_REC`, ceiled to box           |
-| `QTY_REC`  | **Recommended** order qty = `daily_demand × REORDER_PERIOD_DAYS`, ceiled to box        |
-| `STYLE`    | Human-readable style                                                                   |
-| `COLOR`    | Human-readable color                                                                   |
+Per SKU, using **available** = on hand − reserved (BMS's own per-roll
+`AVAILABLE_FLOAT`, summed across the SKU's rolls):
 
-How to read a row: `SAF_CUR` vs `SAF_REC` divergence flags miscalibrated safety
-stocks. `AVAIL + ON_PO < ROP_REC` means you should be reordering — `QTY_REC` is
-the suggested PO size.
+| Flag | Condition | In the email |
+|---|---|---|
+| **critical** (`urgent`) | available < safety stock (`CAT_SAFTYSTK`) | red left accent, red Available, listed first |
+| **reorder** (`order_now`) | available < reorder point (`CAT_REORDER`), **or** critical | listed |
+
+The "or critical" keeps a below-safety SKU visible when its reorder point is
+still unset (0) in BMS. A properly entered reorder point is always ≥ safety
+stock, so once it's populated this reduces to plain "available < reorder".
+
+Only SKUs with `order_now` appear in the email. The `.txt` audit lists all of
+them.
+
+## Columns
+
+| Email | `.txt` | Source | Meaning |
+|---|---|---|---|
+| Item | `STYLE` / `COLOR` / `VENDOR` / `SEQUENCE` | catalog cache, live roll style/color | style · color, with vendor · sequence underneath |
+| On Hand | `ON_HAND` | `/productstock` `ONHAND_FLOAT` summed over rolls | physical stock |
+| Committed | `COMMITTED` | `/orderline` | **sold on open orders but not yet assigned to a roll and not on a PO** — demand nothing is covering yet. Per open-order line: `DMI_WQUANTITY − DMI_QTYASSIGNED`; lines with a `DMI_PONO` are skipped entirely. Shown red when it exceeds Available. |
+| — | `RESERVED` | `/productstock` `RESERVED_FLOAT` | assigned to specific rolls |
+| Available | `AVAIL` | `/productstock` `AVAILABLE_FLOAT` | on hand − reserved; what you can pull today |
+| Reorder | `REORDER` | catalog `CAT_REORDER` | entered reorder point (often 0/unset) |
+| Safety | `SAFETY` | catalog `CAT_SAFTYSTK` | entered safety stock |
+| — | `NOTIFY` | | `CRIT` below safety, `YES` below reorder, blank otherwise |
+
+Committed is display-only: the notify flags turn on Available. A positive
+Committed is its own call to action — someone has to find stock for it or cut
+a PO.
+
+Sort order (both outputs): critical first, then deepest below the reorder
+point, then by sequence.
 
 ## Data sources
 
-| Step                             | Endpoint                                  | Notes                                                          |
-|----------------------------------|-------------------------------------------|----------------------------------------------------------------|
-| Authentication                   | `POST /{alias}/token`                     | `x-api-key` header, `application/x-www-form-urlencoded` body   |
-| Items below safety stock         | `GET /{alias}/lowstock`                   | Single call, returns 53ish items                               |
-| Open sales orders                | `GET /{alias}/orders`                     | `startdate`/`enddate` required even when filtering open        |
-| Open PO supply                   | `GET /{alias}/purchaseorderlines`         | Used for `ON_PO` and `VENDOR` mapping                          |
-| Per-roll inventory               | `GET /{alias}/productstock?catseq=…`      | One call per target seq, parallelized (16 workers)             |
-| Bulk order lines                 | `GET /{alias}/orderline?branch=&dates=…`  | One call per branch, used for `UNASN` and `PEAK_WK`            |
-| Past-year invoice headers        | `GET /{alias}/invoice?branch=&dates=…`    | Paginated, gives `IVC_INVNO → IVC_DATE` map                    |
-| Past-year invoice lines          | `GET /{alias}/invoicelines`               | Paginated whole table, filtered locally by invno + catseq      |
-| Box quantity (cached weekly)     | `GET /{alias}/catalogitems`               | Paginated; cache lives at `.box_qty_cache.json`                |
+| Step | Endpoint | Notes |
+|---|---|---|
+| Authentication | `POST /{alias}/token` | `x-api-key` header, form body, `granttype=application` |
+| Stocked universe | `GET /{alias}/catalogitems` (weekly, via `catalog_scan.py`) | paged 1000 rows at a time, 6 pages concurrently; ~45–60 min; resumable |
+| Fallback universe | `GET /{alias}/lowstock` | only when the cache is missing/partial/stale |
+| Live stock | `GET /{alias}/productstock?catseq=…` | one call per stocked SKU, 16 in parallel |
+| Open orders | `GET /{alias}/orders?startdate&enddate` | returns open orders only; `cfg.ORDER_HISTORY_FLOOR` → today |
+| Open-order lines | `GET /{alias}/orderline?branch&startdate&enddate` | one call per branch that has open orders; filtered locally to stocked SKUs on open orders |
 
-## Formulas
+Quirks worth knowing:
 
-```
-daily_demand   = SOLD_1YR / 365
-weekly_sigma   = stdev([weekly_invoiced_qty for each ISO week in window])
-SAF_REC        = ceil(SERVICE_LEVEL_Z × weekly_sigma × √(LT_days / 7), BOX)
-ROP_REC        = ceil(daily_demand × LT_days + SAF_REC,                BOX)
-QTY_REC        = ceil(daily_demand × REORDER_PERIOD_DAYS,              BOX)
-```
-
-`ceil(value, BOX) = math.ceil(value / BOX) × BOX`. `BOX = 1` for items not sold
-by box, which collapses to a plain integer ceiling.
-
-`SERVICE_LEVEL_Z` corresponds to fill rate:
-
-| Z    | Service level | Stockout frequency        |
-|------|---------------|---------------------------|
-| 1.28 | 90 %          | ~5 weeks/year per item    |
-| 1.65 | 95 %          | ~2.5 weeks/year per item  |
-| 1.88 | 97 %          | ~1.5 weeks/year per item  |
-| 2.33 | 99 %          | ~3.5 days/year per item   |
-
-## Configuration
-
-Everything in `inventory_email_config.py`:
-
-- `BMS_ALIAS`, `BMS_COMPANY` — connection scope (tenant + company id).
-- `SERVICE_LEVEL_Z` — global, applies to every item.
-- `VENDOR_LEAD_TIMES` — dict keyed by `VENDOR` field (e.g. `"ALLSURF": 7`).
-- `DEFAULT_LEAD_TIME_DAYS` — fallback when an item's vendor isn't in the dict
-  or its catalog record has no vendor.
-- `DEMAND_WINDOW_DAYS` — how far back demand history is measured.
-- `ORDER_HISTORY_FLOOR` — earliest date we pull order/orderline history from.
-- `REORDER_PERIOD_DAYS` — drives `QTY_REC`. A higher value = bigger, less
-  frequent POs; lower = smaller, more frequent.
-- `BOX_QTY_CACHE`, `BOX_QTY_CACHE_MAX_AGE_DAYS` — disk cache for box quantities;
-  delete the file to force a fresh catalog scan.
+- `/orderline` and `/lowstock` zero-pad `CAT_SEQUENCE` to 13 digits
+  (`0000000684588`); `/productstock` and the catalog don't. The report
+  normalises before comparing.
+- Order lines with `DMI_STATUS = J` are the ones assigned to a roll; lines
+  with a blank status are unassigned. Service/labor lines (status `S`/`L`/`I`)
+  carry a `DMI_QTYASSIGNED` that is not a quantity — they're never stocked
+  SKUs, so the report never sees them.
+- `/orders` and `/orderline` need `startdate`/`enddate` even for open orders.
 
 ## Caching
 
-- **Box quantities** — refreshed weekly. The catalog scan that populates this
-  takes ~2 min, so the cache makes daily runs ~2 min faster.
-- **Invoice lines** — *not yet cached*. The walk runs in full every time
-  (~6 min). Adding an `IVC_INVNO`-keyed cache would cut subsequent runs to
-  about 60 s; see "Gaps" below.
+**Stocked catalog** — `cfg.STOCKED_CATALOG_CACHE`
+(`.stocked_catalog_cache.json`, gitignored), written by `catalog_scan.py`:
 
-## Known gaps & future work
-
-Listed roughly by impact:
-
-- **No `ORDER_NOW` trigger column.** The report shows recommendations but
-  doesn't flag which items are currently below their reorder point.
-- **Demand trend ignored.** Flat 12-month average understates a growing
-  product and overstates a declining one. Add a recent-90-days × 4 vs
-  trailing-12 ratio column.
-- **Lead-time variability (σ_LT) not modeled.** Real safety formula is
-  `Z × √(LT × σ_demand² + demand² × σ_LT²)`. Needs PO date-vs-receipt
-  history; current vendor lead times are mostly user-supplied estimates.
-- **Pent-up `UNASN` demand uncounted.** Currently informational only;
-  doesn't feed the math. Items chronically out can have understated demand.
-- **Stockout-corrected demand.** Days you were out of stock undercount in
-  `SOLD_1YR`. Would need per-day stock history to correct.
-- **Vendor mapping is fragile.** Items without recent POs have blank
-  `VENDOR`. Fix: pull `CAT_VENDORID` from `/catalogitems` during the box-qty
-  scan and merge it in.
-- **No vendor MOQ.** `QTY_REC` may be below a vendor's minimum order
-  quantity. Add `VENDOR_MIN_ORDER_QTY` to config alongside lead time.
-- **No unit cost.** `CAT_NETCOST` would enable working-capital sorting and
-  dollar-weighted recommendations.
-- **Service level is global.** Z is the same for every item; high-value or
-  customer-promise items might warrant 99 %, slow C-class items 90 %.
-- **No write-back.** The script doesn't push `SAF_REC` to `CAT_SAFTYSTK` in
-  Rollmaster — recommendations are advisory only.
-- **Invoice-lines walk is the main cost.** Caching by `IVC_INVNO` and only
-  fetching new invoices per run would drop daily-run time from ~6 min to
-  under 60 s.
-
-## Scheduling
-
-Not yet wired. When ready:
-
-```cron
-0 6 * * * /home/vm/Dev/CreativeCarpet/CreativeBot/venv/bin/python /home/vm/Dev/CreativeCarpet/CreativeBot/inventory_email.py
+```json
+{ "scanned_at": "<iso8601 or null>", "next_page": 123, "complete": true,
+  "items": { "<CAT_SEQUENCE>": { "safety", "reorder", "vendor", "prodcode",
+                                 "box", "style", "stynum", "color", "desc",
+                                 "roll_sy" } } }
 ```
 
-Current script writes to a file. Email delivery is Phase 2 of
-`EMAIL_REPORTS_PLAN.txt` and is blocked on Azure app registration.
+The report trusts it only when `complete` is true **and** `scanned_at` is
+within `cfg.STOCKED_CATALOG_MAX_AGE_DAYS` (7). Otherwise it logs a warning and
+falls back to `/lowstock`, which is narrower (only SKUs already below safety)
+and has no reorder point or vendor. A partial scan (`complete: false`) is a
+checkpoint: rerunning the scan resumes from `next_page`.
+
+Nothing else is cached; every report run pulls live stock and open orders.
+
+## Configuration — `inventory_email_config.py`
+
+| Key | Purpose |
+|---|---|
+| `BMS_ALIAS`, `BMS_COMPANY` | tenant (`creativecarpets`) and company (`99`) |
+| `ORDER_HISTORY_FLOOR` | earliest order date pulled when summing committed qty (`20240101`); an open order older than this would be missed |
+| `STOCKED_CATALOG_CACHE`, `STOCKED_CATALOG_MAX_AGE_DAYS` | cache path and freshness limit |
+| `CATALOG_SCAN_BATCH` | concurrent pages during the catalog scan (6; 20 timed out) |
+| `OUTPUT_PATH` | where a manual run writes the `.txt` audit |
+
+Credentials come from `.env`: `BMS_API_KEY`, `BMS_USERNAME`, `BMS_PASSWORD`.
+
+## Running
+
+Manual audit (writes `safety_stock_items.txt`):
+
+```bash
+cd CreativeBot
+venv/bin/python -m email_reports.inventory.inventory_email
+```
+
+Rebuild the stocked-SKU cache (weekly cron on the Pi; ~45–60 min):
+
+```bash
+venv/bin/python -m email_reports.inventory.catalog_scan          # resume or start
+venv/bin/python -m email_reports.inventory.catalog_scan --fresh  # ignore checkpoint
+```
+
+Exit status is 0 only for a complete scan.
+
+Email delivery is not run from here. `email_reports/scheduler.py` runs from
+cron every 15 minutes on the Pi, self-gates to one dispatch per day at the time
+set on `/reports/settings`, builds each subscriber's digest (this card plus any
+others they're subscribed to) and sends it through Microsoft Graph. The
+`/reports` dashboard's **Run Now** sends just this card to its subscribers
+immediately. Subscribers come from the M365 group synced by `m365_directory.py`.
+
+## Known gaps
+
+- **Available ignores committed.** A SKU can look fine on Available while
+  thousands are sold and unassigned. Committed is shown for exactly that
+  reason, but it doesn't flag the row.
+- **Nothing is recommended.** Wrong or unset thresholds in BMS produce wrong
+  or missing alerts; the report only reflects what's entered.
+- **Open-order window.** Committed only sees orders dated on or after
+  `ORDER_HISTORY_FLOOR`.
+- **Catalog cache staleness.** A SKU stocked since the last weekly scan isn't
+  evaluated until the next one.
+- **No on-order column.** Open PO quantity per SKU isn't shown; a line on a PO
+  is simply excluded from Committed.
