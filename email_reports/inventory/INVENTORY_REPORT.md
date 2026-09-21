@@ -72,10 +72,10 @@ Quirks worth knowing:
 - `/orderline` and `/lowstock` zero-pad `CAT_SEQUENCE` to 13 digits
   (`0000000684588`); `/productstock` and the catalog don't. The report
   normalises before comparing.
-- Order lines with `DMI_STATUS = J` are the ones assigned to a roll; lines
-  with a blank status are unassigned. Service/labor lines (status `S`/`L`/`I`)
-  carry a `DMI_QTYASSIGNED` that is not a quantity — they're never stocked
-  SKUs, so the report never sees them.
+- Order-line `DMI_STATUS`: `J` = assigned to a roll, `O` = on a PO not yet
+  received, blank = unassigned and not ordered. Labor/sundry/install lines
+  (`L`/`S`/`I`) carry a `DMI_QTYASSIGNED` that is not a quantity — they're
+  never stocked SKUs, so the report never sees them.
 - `/orders` and `/orderline` need `startdate`/`enddate` even for open orders.
 
 ## Caching

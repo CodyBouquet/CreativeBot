@@ -7,8 +7,9 @@ its Rollmaster order is accounted for. The deal is linked to the order by the
 
 An order's material is all in when every material line on it is one of:
 
-    assigned      DMI_QTYASSIGNED covers DMI_WQUANTITY — pulled from stock, or a
-                  PO that has been received (receiving assigns the material)
+    assigned      line status J: DMI_QTYASSIGNED covers DMI_WQUANTITY — pulled
+                  from stock, or a PO that has been received (receiving assigns
+                  the material and flips the line from O to J)
     stocked SKU   unassigned and not on a PO, but the SKU is one we stock
                   (CAT_SAFTYSTK > 0): stock items are deliberately left
                   unassigned until a day or two before install so counts stay
@@ -16,8 +17,8 @@ An order's material is all in when every material line on it is one of:
     labor only    an order with no material lines at all has nothing to wait
                   for and is Costed straight away
 
-Anything else — a special-order SKU that is unassigned with no PO, or on a PO
-not yet received — means the order is still waiting.
+Anything else — a line still on a PO (status O), or a special-order SKU that is
+unassigned with no PO — means the order is still waiting.
 
 The sync only ever SETS Costed. It never clears it: Rollmaster entry can lag a
 physical delivery, and a deal flipping backwards would be worse than one
@@ -68,7 +69,9 @@ ORDER_HISTORY_FLOOR = "20240101"
 STOCKED_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "email_reports", "inventory", ".stocked_catalog_cache.json")
 
-MATERIAL_LINE_STATUSES = {"J", ""}   # J = assigned, blank = unassigned; S/L/I are labor/service
+# Order-line DMI_STATUS: J = assigned to stock/roll, O = on a PO not yet received,
+# blank = unassigned and not ordered. L/S/I are labor, sundry and install lines.
+MATERIAL_LINE_STATUSES = {"J", "O", ""}
 
 
 def _f(x):
@@ -132,9 +135,10 @@ def rm_material_status(stocked):
         waiting = []
         for ln in material:
             sold, assigned = _f(ln.get("DMI_WQUANTITY")), _f(ln.get("DMI_QTYASSIGNED"))
-            if assigned >= sold - 0.01:
+            on_po = (str(ln.get("DMI_STATUS", "")).strip() == "O"
+                     or bool(str(ln.get("DMI_PONO", "")).strip().strip("0")))
+            if assigned >= sold - 0.01 and str(ln.get("DMI_STATUS", "")).strip() != "O":
                 continue                                              # assigned (or received)
-            on_po = bool(str(ln.get("DMI_PONO", "")).strip().strip("0"))
             seq = _norm_seq(ln.get("DMI_CAT_SEQUENCE"))
             if not on_po and stocked is not None and seq in stocked:
                 continue                                              # stock item, pulled later
