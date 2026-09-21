@@ -1176,7 +1176,9 @@ def _sync_key_ok():
     if not RM_SYNC_SECRET:
         return False
     supplied = request.headers.get("X-Sync-Key", "") or request.args.get("key", "")
-    return hmac.compare_digest(supplied, RM_SYNC_SECRET)
+    # Pipedrive's automation builder appends "/" to the whole URL, which lands on
+    # the end of the query-string key ("?key=abc/"), so strip it before comparing.
+    return hmac.compare_digest(supplied.strip().rstrip("/"), RM_SYNC_SECRET)
 
 
 @app.route("/rm-customer-sync/", methods=["POST"])
