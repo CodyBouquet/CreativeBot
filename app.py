@@ -1331,6 +1331,7 @@ def rm_customer_sync():
         # the person's Customer ID field, so an automation that forgets to send
         # it (or fires on every edit) can't create duplicates.
         existing_cid = _pd_value(payload, "cid").strip().upper()
+        matched_how = None
         if not existing_cid and _cid_write_back_target(person_id):
             try:
                 existing_cid = str(pd_get_person(person_id).get(RM_PD_CID_FIELD) or "").strip().upper()
@@ -1345,6 +1346,25 @@ def rm_customer_sync():
                                 f"Refused: could not check person {person_id} for an existing Customer ID ({msg})")
                 sse_notify()
                 return jsonify({"error": f"could not read person {person_id} from Pipedrive: {msg}"}), 502
+        # Legacy customers: a person with no Customer ID may still be an existing
+        # Rollmaster account (everyone from before the sync). Match on phone or
+        # email before creating; several equally good matches is a job for a
+        # human, not a coin toss.
+        if not existing_cid:
+            try:
+                found = rollmaster.find_existing_customer(
+                    name, [fields.get("C_PHONE"), fields.get("C_PHONE2")], fields.get("C_EMAIL"))
+            except rollmaster.AmbiguousMatch as e:
+                action = f"Refused: {fields['C_NAME']} {e}"
+                logger.warning(f"rm-customer-sync {action}")
+                with get_db() as conn:
+                    store_event(conn, deal_id, None, "RM_CUSTOMER_AMBIGUOUS", "customer", payload, action)
+                sse_notify()
+                return jsonify({"error": str(e), "candidates": [c[0] for c in e.candidates]}), 409
+            if found:
+                existing_cid, matched_how = found
+                logger.info(f"rm-customer-sync: {fields['C_NAME']} matched existing customer {existing_cid} by {matched_how}")
+
         if existing_cid:
             params = rollmaster.update_params(existing_cid, fields)
             if not RM_CUSTOMER_SYNC_ENABLED:
@@ -1354,14 +1374,22 @@ def rm_customer_sync():
                     store_event(conn, deal_id, None, "RM_CUSTOMER_DRYRUN", "customer", payload, action)
                 sse_notify()
                 return jsonify({"status": "dry-run", "action": "update", "cid": existing_cid,
-                                "would_send": params}), 200
+                                "matched_by": matched_how, "would_send": params,
+                                "would_write_back": _cid_write_back_target(person_id) if matched_how else None}), 200
             resp = rollmaster.update_customer(existing_cid, fields)
             action = f"Updated Rollmaster customer {existing_cid} ({fields['C_NAME']})"
+            if matched_how:
+                action += f" — matched legacy customer by {matched_how}"
             logger.info(f"rm-customer-sync {action}")
             with get_db() as conn:
                 store_event(conn, deal_id, None, "RM_CUSTOMER_UPDATED", "customer", payload, action)
             sse_notify()
-            return jsonify({"status": "ok", "action": "update", "cid": existing_cid, "response": resp}), 200
+            out = {"status": "ok", "action": "update", "cid": existing_cid, "response": resp}
+            if matched_how:
+                # A legacy match links the person for good by stamping the id on it.
+                out["matched_by"] = matched_how
+                out["pipedrive"]  = _write_cid_to_person(person_id, existing_cid, deal_id)
+            return jsonify(out), 200
 
         if not RM_CUSTOMER_SYNC_ENABLED:
             first, last = rollmaster.split_name(name)

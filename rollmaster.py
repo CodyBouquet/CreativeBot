@@ -224,38 +224,60 @@ def next_free_cid(base, taken):
     return f"{base}{highest + 1}"
 
 
-def _read_cid_cache():
-    """Return (cids, age_hours) from the on-disk cache, or (None, None) if it's missing/unreadable."""
+# Contact details kept per customer in the cache, so a Pipedrive person can be
+# matched to an existing Rollmaster account without a live API call.
+_CACHE_COLS = ("C_CID", "C_NAME", "C_PHONE", "C_PHONE2", "C_EMAIL")
+
+
+def _read_cache():
+    """Return (cids, customers, age_hours) from the on-disk cache, or (None, None, None) if missing/unreadable."""
     try:
         with open(CID_CACHE) as f:
             data = json.load(f)
         cids = set(data.get("cids") or [])
         if not cids:
-            return None, None
+            return None, None, None
         stamped = datetime.fromisoformat(data["fetched_at"])
         age = (datetime.now(timezone.utc) - stamped).total_seconds() / 3600.0
-        return cids, age
+        return cids, data.get("customers") or [], age
     except Exception:
-        return None, None
+        return None, None, None
 
 
-def _write_cid_cache(cids):
-    """Persist the customer-id set to disk with a fetch timestamp."""
+def _read_cid_cache():
+    """Return (cids, age_hours) from the on-disk cache, or (None, None) if it's missing/unreadable."""
+    cids, _, age = _read_cache()
+    return cids, age
+
+
+def _write_cid_cache(cids, customers=None):
+    """
+    Persist the customer-id set (and, when given, the compact customer records)
+    to disk with a fetch timestamp. Called without records it keeps whatever
+    records are already on disk.
+    """
+    if customers is None:
+        _, customers, _ = _read_cache()
     Path(CID_CACHE).parent.mkdir(parents=True, exist_ok=True)
     tmp = f"{CID_CACHE}.tmp"
     with open(tmp, "w") as f:
         json.dump({"fetched_at": datetime.now(timezone.utc).isoformat(),
-                   "cids": sorted(cids)}, f)
+                   "cids": sorted(cids), "customers": customers or []}, f)
     os.replace(tmp, CID_CACHE)   # atomic, so a crash mid-write can't leave a half file
 
 
+def _compact(row):
+    """One customer as a short list in _CACHE_COLS order, values stripped."""
+    return [str(row.get(k) or "").strip() for k in _CACHE_COLS]
+
+
 def refresh_known_cids():
-    """Pull every customer id from /customers and replace the disk cache; returns the id set."""
+    """Pull every customer from /customers and replace the disk cache; returns the id set."""
     t0 = time.time()
     rows = get("customers", {"company": COMPANY}, timeout=600)
-    cids = {str(r.get("C_CID", "")).strip().upper()
-            for r in rows if str(r.get("C_CID", "")).strip()}
-    _write_cid_cache(cids)
+    customers = [_compact(r) for r in rows if str(r.get("C_CID", "")).strip()]
+    cids = {c[0].upper() for c in customers}
+    _write_cid_cache(cids, customers)
     logger.info(f"Rollmaster: cached {len(cids)} customer ids in {time.time()-t0:.1f}s")
     return cids
 
@@ -313,14 +335,87 @@ def warm_cid_cache():
     _refresh_cids_async()
 
 
-def remember_cid(cid):
-    """Add a freshly created id to the disk cache so back-to-back creates don't collide."""
+def remember_cid(cid, fields=None):
+    """
+    Add a freshly created customer to the disk cache so back-to-back creates
+    don't collide and a second webhook for the same person matches it.
+    """
     with _cid_lock:
-        cids, _ = _read_cid_cache()
+        cids, customers, _ = _read_cache()
         if cids is None:
             return
-        cids.add(cid.strip().upper())
-        _write_cid_cache(cids)
+        cid = cid.strip().upper()
+        cids.add(cid)
+        if fields is not None:
+            customers = [c for c in customers if c[0].upper() != cid]
+            customers.append(_compact({**fields, "C_CID": cid}))
+        _write_cid_cache(cids, customers)
+
+
+# ---------------------------------------------------------------------------
+# MATCHING A PERSON TO AN EXISTING CUSTOMER
+# ---------------------------------------------------------------------------
+class AmbiguousMatch(RollmasterError):
+    """More than one existing customer fits the person and nothing tells them apart."""
+    def __init__(self, candidates):
+        self.candidates = candidates
+        super().__init__("matches several customers: " + ", ".join(f"{c[0]} ({c[1]})" for c in candidates))
+
+
+def _digits(s):
+    """Phone as bare digits, minus a leading US 1; '' when not a usable 10-digit number."""
+    d = re.sub(r"\D", "", s or "")
+    if len(d) == 11 and d[0] == "1":
+        d = d[1:]
+    return d if len(d) == 10 else ""
+
+
+def find_existing_customer(name, phones=(), email=""):
+    """
+    Find the Rollmaster customer a Pipedrive person already is, from the cached
+    customer list. Returns (cid, how) or None; raises AmbiguousMatch when several
+    fit and the surname can't settle it.
+
+    Phone (either number on the record) or email must match exactly — a name
+    alone is never enough, since the same name recurs many times. When several
+    customers share a phone (families, landlords) the one whose name carries
+    the person's surname wins.
+    """
+    _, customers, _ = _read_cache()
+    if not customers:
+        return None
+    want_phones = {p for p in (_digits(x) for x in phones) if p}
+    want_email  = (email or "").strip().lower()
+    hits = {}
+    for c in customers:
+        cid, cname, p1, p2, em = c[0].upper(), c[1], c[2], c[3], c[4]
+        if want_phones and ( _digits(p1) in want_phones or _digits(p2) in want_phones):
+            hits.setdefault(cid, (c, "phone"))
+        elif want_email and em.strip().lower() == want_email:
+            hits.setdefault(cid, (c, "email"))
+    if not hits:
+        return None
+    if len(hits) == 1:
+        (c, how), = hits.values()
+        return c[0].upper(), how
+    # Rollmaster flags dead accounts by prefixing the name with INACTIVE; when a
+    # live record also fits, it's the one to keep updating.
+    active = {cid: v for cid, v in hits.items() if not v[0][1].upper().startswith("INACTIVE")}
+    if active:
+        hits = active
+        if len(hits) == 1:
+            (c, how), = hits.values()
+            return c[0].upper(), how + "+active"
+    surname = _letters(split_name(name)[1]) if name else ""
+    if surname:
+        narrowed = {cid: v for cid, v in hits.items()
+                    if surname in {_letters(t) for t in re.split(r"[\s,]+", v[0][1])}}
+        if len(narrowed) == 1:
+            (c, how), = narrowed.values()
+            return c[0].upper(), how + "+surname"
+        if narrowed:
+            hits = narrowed
+    raise AmbiguousMatch([v[0] for v in hits.values()])
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +474,7 @@ def create_customer(fields, cid=None, name=None, retries=3):
                 logger.warning(f"Rollmaster: id in use, retrying as {attempt_cid}")
                 continue
             raise
-        remember_cid(attempt_cid)
+        remember_cid(attempt_cid, fields)
         logger.info(f"Rollmaster: created customer {attempt_cid}")
         return attempt_cid, resp
     raise RollmasterError(f"could not create customer after {retries} attempts")
