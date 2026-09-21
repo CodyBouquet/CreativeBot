@@ -1087,6 +1087,8 @@ _PD_ALIASES = {
     "fax":         ("fax", "fax_number"),
     "address1":    ("address1", "address", "street", "street_address", "address_street",
                     "postal_address", "address_route"),
+    "street_no":   ("street_number", "street_no", "house_number", "address_street_number",
+                    "postal_address_street_number"),
     "address2":    ("address2", "address_2", "unit", "apt", "suite", "address_subpremise"),
     "city":        ("city", "address_locality", "postal_address_locality"),
     "state":       ("state", "address_admin_area_level_1", "postal_address_admin_area_level_1"),
@@ -1211,10 +1213,18 @@ def map_pipedrive_customer(payload):
                or RM_CUSTOMER_DEFAULTS["C_SLSID"]
                or (owner if len(owner) <= 6 else ""))
 
+    # Pipedrive splits an address into "street number" and "street/road name"
+    # subfields; when the automation sends the number separately, put it back
+    # in front of the street unless it's already there.
+    addr1  = _pd_value(payload, "address1")
+    street_no = _pd_value(payload, "street_no")
+    if street_no and not addr1.startswith(street_no):
+        addr1 = f"{street_no} {addr1}".strip()
+
     fields = dict(RM_CUSTOMER_DEFAULTS)
     fields.update({
         "C_NAME":    name,
-        "C_ADDR1":   _pd_value(payload, "address1"),
+        "C_ADDR1":   addr1,
         "C_ADDR2":   _pd_value(payload, "address2"),
         "C_CITY":    _pd_value(payload, "city"),
         "C_STATE":   _pd_value(payload, "state"),
