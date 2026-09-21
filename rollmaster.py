@@ -204,22 +204,24 @@ def cid_base(first, last):
 
 def next_free_cid(base, taken):
     """
-    Return the first unused id for a base, appending 1, 2, 3… on collision
-    (SMIJOH → SMIJOH1 → SMIJOH2), matching how the existing ids were minted.
+    Return the next id for a base: the bare base if unused, otherwise the
+    HIGHEST existing suffix + 1 (SMIJOH, SMIJOH1 → SMIJOH2, SMIJOH4 → SMIJOH5).
 
-    `taken` is the set of ids already in use. Gives up after 999 attempts rather
-    than looping forever on a pathological base.
+    Gaps in the numbering are deliberately not reused: a missing SMIKAT2 between
+    SMIKAT1 and SMIKAT3 is where a deleted or inactive record lives, which the
+    /customers list doesn't show and a create would silently overwrite.
+    `taken` is the set of ids already in use.
     """
     base = base.strip().upper()
     if not base:
         raise RollmasterError("cannot build a customer id from an empty name")
     if base not in taken:
         return base
-    for n in range(1, 1000):
-        candidate = f"{base}{n}"
-        if candidate not in taken:
-            return candidate
-    raise RollmasterError(f"no free customer id for base {base!r} after 999 tries")
+    highest = 0
+    for cid in taken:
+        if cid.startswith(base) and cid[len(base):].isdigit():
+            highest = max(highest, int(cid[len(base):]))
+    return f"{base}{highest + 1}"
 
 
 def _read_cid_cache():
