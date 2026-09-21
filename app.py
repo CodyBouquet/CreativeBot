@@ -122,9 +122,12 @@ RM_CUSTOMER_DEFAULTS = {
     "C_TERR":                os.environ.get("RM_C_TERR", ""),
     "C_PRICE_LEVEL_DEFAULT": os.environ.get("RM_C_PRICE_LEVEL", ""),
     "C_PROMPMGMT_CO":        os.environ.get("RM_C_PROMPMGMT_CO", ""),
+    # Salesperson every synced customer is filed under (e.g. "HA" = house account).
+    "C_SLSID":               os.environ.get("RM_C_SLSID", ""),
 }
-# Pipedrive deal owner → Rollmaster salesperson id (C_SLSID, e.g. "MRB", "AMB").
-# JSON object in the env var, keyed by owner name or Pipedrive user id.
+# Optional: Pipedrive deal owner → Rollmaster salesperson id (C_SLSID, e.g. "MRB",
+# "AMB"). JSON object in the env var, keyed by owner name or Pipedrive user id. A
+# matching owner overrides RM_C_SLSID; leave it {} to file everyone under the default.
 try:
     RM_SALESPERSON_MAP = json.loads(os.environ.get("RM_SALESPERSON_MAP", "{}"))
 except ValueError:
@@ -1102,7 +1105,11 @@ def map_pipedrive_customer(payload):
 
     contact = _pd_value(payload, "contact")
     owner   = _pd_value(payload, "salesperson")
-    slsid  = RM_SALESPERSON_MAP.get(owner, owner if len(owner) <= 6 else "")
+    # Mapped owner > fixed default > a bare code passed in the payload (≤6 chars,
+    # so a full owner name never lands in C_SLSID by accident).
+    slsid   = (RM_SALESPERSON_MAP.get(owner)
+               or RM_CUSTOMER_DEFAULTS["C_SLSID"]
+               or (owner if len(owner) <= 6 else ""))
 
     fields = dict(RM_CUSTOMER_DEFAULTS)
     fields.update({
