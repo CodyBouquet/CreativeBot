@@ -10,10 +10,11 @@ import hmac
 import hashlib
 import subprocess
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from functools import wraps
 import threading
+import time
 import queue
 
 load_dotenv()
@@ -143,7 +144,7 @@ except ValueError:
     logging.warning("RM_SALESPERSON_MAP is not valid JSON — salesperson mapping disabled")
 
 ALLOWED_DASHBOARD_IPS = {"127.0.0.1", "::1", "10.54.10.135"}
-DASHBOARD_ENDPOINTS  = {"landing", "sync_dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout",
+DASHBOARD_ENDPOINTS  = {"landing", "sync_dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout", "api_health",
                         "api_stats", "api_stream", "api_logs", "settings_page",
                         "api_settings", "api_sync_all", "api_users", "api_user_delete", "api_access_log",
                         "reports.reports_home"}
@@ -713,40 +714,48 @@ def landing():
         is_admin=session.get("role") == "admin",
     )
 
+# An event "did something" when its action is a real write (stage move, date
+# set, customer created, deal costed…) rather than a log-only outcome.
+_ACTED_WHERE = (
+    "archived = 0 AND action IS NOT NULL AND action != '' "
+    "AND action NOT LIKE 'Logged%' AND action NOT LIKE 'DRY RUN%' AND action NOT LIKE 'BLOCKED%' "
+    "AND action NOT LIKE 'Could not%' AND action NOT LIKE '%staying put'"
+)
+
+
 @app.route("/sync")
 @login_required
 def sync_dashboard():
-    """Render the sync dashboard with recent events, per-type counts, and active-task/total-event tallies."""
+    """Render the sync dashboard's active-task, total-event and actions-completed tallies.
+
+    The event list itself is not rendered here — the page fetches it from
+    /api/logs so it can refresh without a reload.
+    """
     with get_db() as conn:
-        recent_events = conn.execute(
-            """SELECT * FROM events WHERE archived = 0
-               ORDER BY received_at DESC LIMIT 20"""
-        ).fetchall()
-        event_counts = conn.execute(
-            """SELECT event_type, COUNT(*) as count FROM events
-               WHERE archived = 0 GROUP BY event_type"""
-        ).fetchall()
         active_tasks = conn.execute(
             "SELECT COUNT(*) as count FROM task_state WHERE status = 'active' AND archived = 0"
         ).fetchone()
         total_events = conn.execute(
             "SELECT COUNT(*) as count FROM events WHERE archived = 0"
         ).fetchone()
+        actions_completed = conn.execute(
+            f"SELECT COUNT(*) as count FROM events WHERE {_ACTED_WHERE}"
+        ).fetchone()
     return render_template("dashboard.html",
-                           recent_events=recent_events,
-                           event_counts=event_counts,
                            active_tasks=active_tasks,
                            total_events=total_events,
+                           actions_completed=actions_completed,
                            username=session.get("username", ""),
                            is_admin=session.get("role") == "admin")
 
 @app.route("/api/stats")
 @login_required
 def api_stats():
-    """JSON endpoint: total events, active task count, the 5 most recent events, and DB-disk usage for the dashboard widgets."""
+    """JSON endpoint: total events, active task count, actions completed, the 5 most recent events, and DB-disk usage for the dashboard widgets."""
     with get_db() as conn:
         total  = conn.execute("SELECT COUNT(*) as c FROM events WHERE archived=0").fetchone()["c"]
         active = conn.execute("SELECT COUNT(*) as c FROM task_state WHERE status='active' AND archived=0").fetchone()["c"]
+        acted  = conn.execute(f"SELECT COUNT(*) as c FROM events WHERE {_ACTED_WHERE}").fetchone()["c"]
         recent = conn.execute(
             "SELECT event_type, task_type, deal_id, received_at FROM events WHERE archived=0 ORDER BY received_at DESC LIMIT 5"
         ).fetchall()
@@ -764,9 +773,94 @@ def api_stats():
     return jsonify({
         "total_events": total,
         "active_tasks": active,
+        "actions_completed": acted,
         "recent": [dict(r) for r in recent],
         "disk": disk,
     })
+
+_health_cache = {"at": 0.0, "data": None}
+
+
+def _probe_health():
+    """
+    Live status of each integration, for the dashboard's status cards. Each
+    entry is {"state": ok|warn|error, "detail": str}. The two API probes are
+    real round trips, so callers cache this (see api_health).
+    """
+    with get_db() as conn:
+        last_arrivy = conn.execute(
+            "SELECT received_at FROM events WHERE event_type NOT LIKE 'RM_%' AND event_type != 'BLOCKED' "
+            "ORDER BY received_at DESC LIMIT 1").fetchone()
+        last_rm = conn.execute(
+            "SELECT received_at, event_type FROM events WHERE event_type LIKE 'RM_%' "
+            "ORDER BY received_at DESC LIMIT 1").fetchone()
+        costed_today = conn.execute(
+            "SELECT COUNT(*) AS c FROM events WHERE event_type = 'RM_MATERIAL_COSTED' "
+            "AND received_at >= ?", (datetime.utcnow().strftime("%Y-%m-%dT00:00:00"),)).fetchone()["c"]
+        rm_failed_today = conn.execute(
+            "SELECT COUNT(*) AS c FROM events WHERE event_type LIKE 'RM_%FAILED' "
+            "AND received_at >= ?", (datetime.utcnow().strftime("%Y-%m-%dT00:00:00"),)).fetchone()["c"]
+
+    def local_hhmm(iso):
+        """UTC ISO timestamp -> local HH:MM for the status line."""
+        try:
+            return (datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+                    .astimezone().strftime("%H:%M"))
+        except Exception:
+            return "—"
+
+    # Arrivy: it's a webhook, so "up" means the app is serving; detail is recency.
+    arrivy = {"state": "ok",
+              "detail": f"Listening · last event {local_hhmm(last_arrivy['received_at'])}" if last_arrivy
+                        else "Listening · no events yet"}
+
+    # Pipedrive: a cheap authenticated call.
+    try:
+        r = requests.get(f"{PD_BASE}/users/me", params={"api_token": PIPEDRIVE_API_TOKEN}, timeout=6)
+        if r.ok and r.json().get("success"):
+            pipedrive = {"state": "ok", "detail": f"Connected · {r.json()['data'].get('company_name', '')}".rstrip(" ·")}
+        else:
+            pipedrive = {"state": "error", "detail": f"API answered {r.status_code}"}
+    except Exception as e:
+        pipedrive = {"state": "error", "detail": f"Unreachable: {type(e).__name__}"}
+
+    # Rollmaster: a token (cached up to 30 min in rollmaster.py, so this is
+    # only a round trip when it has expired) plus the customer-id cache's health.
+    try:
+        rollmaster.get_token()
+        cids, age = rollmaster._read_cid_cache()
+        if cids is None:
+            rm = {"state": "warn", "detail": "Connected · customer cache not built yet"}
+        elif age is not None and age > rollmaster.CID_CACHE_MAX_AGE_HOURS * 2:
+            rm = {"state": "warn", "detail": f"Connected · customer cache {age:.0f}h old"}
+        else:
+            bits = [f"Connected · {len(cids):,} customers cached"]
+            if costed_today:
+                bits.append(f"{costed_today} costed today")
+            rm = {"state": "ok", "detail": " · ".join(bits)}
+        if rm_failed_today:
+            rm = {"state": "warn", "detail": rm["detail"] + f" · {rm_failed_today} failed today"}
+    except Exception as e:
+        rm = {"state": "error", "detail": f"Auth failed: {str(e)[:60]}"}
+
+    return {"arrivy": arrivy, "pipedrive": pipedrive, "rollmaster": rm,
+            "checked_at": datetime.now().strftime("%H:%M:%S")}
+
+
+@app.route("/api/health")
+@login_required
+def api_health():
+    """JSON endpoint: integration status for the dashboard, probed at most once a minute."""
+    now = time.time()
+    if _health_cache["data"] is None or now - _health_cache["at"] > 60:
+        try:
+            _health_cache["data"] = _probe_health()
+        except Exception as e:
+            logger.exception("health probe failed")
+            _health_cache["data"] = {"error": str(e)}
+        _health_cache["at"] = now
+    return jsonify(_health_cache["data"])
+
 
 @app.route("/api/stream")
 @login_required
@@ -818,17 +912,65 @@ def api_logs():
         raw = json.loads(row["raw_json"])
         received = row["received_at"] or ""
         logs.append({
-            "id":         row["id"],
-            "time":       received[11:19] if received else "—",
-            "date":       received[:10] if received else "—",
-            "deal_id":    row["deal_id"],
-            "event_type": (row["event_type"] or "—").replace("TASK_", ""),
-            "task_type":  row["task_type"] or "unknown",
-            "task_date":  (raw.get("OBJECT_DATE") or "")[:10] or "—",
-            "title":      raw.get("TITLE") or "—",
-            "action":     row["action"] or "—",
+            "id":          row["id"],
+            "time":        received[11:19] if received else "—",
+            "date":        received[:10] if received else "—",
+            "deal_id":     row["deal_id"],
+            "event_type":  (row["event_type"] or "—").replace("TASK_", ""),
+            "event_label": _event_label(row["event_type"]),
+            "source":      _event_source(row["event_type"]),
+            "task_type":   row["task_type"] or "unknown",
+            "task_date":   (raw.get("OBJECT_DATE") or "")[:10] or "—",
+            "title":       _event_title(row["event_type"], raw),
+            "action":      row["action"] or "—",
         })
     return jsonify({"logs": logs})
+
+
+# Human labels for the non-Arrivy event types the dashboard shows. Arrivy's own
+# types (TASK_CREATED, CREW_ASSIGNED, …) are shown as-is minus the TASK_ prefix.
+_EVENT_LABELS = {
+    "RM_CUSTOMER_CREATED":          "CUSTOMER CREATED",
+    "RM_CUSTOMER_UPDATED":          "CUSTOMER UPDATED",
+    "RM_CUSTOMER_DRYRUN":           "CUSTOMER DRY RUN",
+    "RM_CUSTOMER_FAILED":           "CUSTOMER FAILED",
+    "RM_CUSTOMER_AMBIGUOUS":        "CUSTOMER AMBIGUOUS",
+    "RM_CUSTOMER_WRITEBACK_FAILED": "WRITE-BACK FAILED",
+    "RM_MATERIAL_COSTED":           "COSTED",
+    "RM_MATERIAL_UNCOSTED":         "UN-COSTED",
+    "RM_MATERIAL_DRYRUN":           "COSTING DRY RUN",
+    "RM_MATERIAL_FAILED":           "COSTING FAILED",
+    "BLOCKED":                      "BLOCKED",
+}
+
+
+def _event_label(event_type):
+    """Short display label for an event type."""
+    et = event_type or "—"
+    return _EVENT_LABELS.get(et, et.replace("TASK_", "").replace("_", " "))
+
+
+def _event_source(event_type):
+    """Which integration produced the event: arrivy, rollmaster, or pipedrive."""
+    et = event_type or ""
+    if et.startswith("RM_"):
+        return "rollmaster"
+    if et == "BLOCKED":
+        return "pipedrive"
+    return "arrivy"
+
+
+def _event_title(event_type, raw):
+    """Second line under the action: the Arrivy task title, the synced customer's name, or the deal title."""
+    et = event_type or ""
+    if et.startswith("RM_CUSTOMER"):
+        name = raw.get("name") or " ".join(p for p in (raw.get("first_name"), raw.get("last_name")) if p)
+        return name or "—"
+    if et.startswith("RM_MATERIAL"):
+        job = raw.get("rm_job")
+        title = raw.get("title") or ""
+        return f"RM job {job} · {title}" if job else (title or "—")
+    return raw.get("TITLE") or "—"
 
 # @app.route("/api/clear-db", methods=["POST"])
 # @login_required
@@ -911,7 +1053,16 @@ def api_access_log():
 @app.route("/api/sync-all", methods=["POST"])
 @login_required
 def api_sync_all():
-    """Manual full resync: for every non-archived deal above MIN_DEAL_ID, push install/measure/delivery dates from local task_state back into Pipedrive. Returns synced count + per-deal errors."""
+    """
+    Manual full resync: for every non-archived deal above MIN_DEAL_ID, push
+    install/measure/delivery dates from local task_state back into Pipedrive.
+    Returns synced count + per-deal errors.
+
+    Deliberately not on the dashboard: the kiosk is a touchscreen and this
+    writes to every active deal, which is not something a stray tap should
+    start. Kept as a hand-invoked escape hatch for when a resync is genuinely
+    needed — POST to it from a logged-in session.
+    """
     synced = []
     errors = []
     with get_db() as conn:

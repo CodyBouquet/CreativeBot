@@ -142,7 +142,7 @@ def rm_material_status(stocked):
                     if str(ln.get("DMI_STATUS", "")).strip() in MATERIAL_LINE_STATUSES
                     and _f(ln.get("DMI_WQUANTITY")) > 0]
         if not material:
-            result[ordno] = {"status": "labor_only", "detail": "no material lines", "lines": [], "waiting": {}}
+            result[ordno] = {"status": "labor_only", "detail": "labor only, nothing to receive", "lines": [], "waiting": {}}
             continue
         waiting = {}
         for ln in material:
@@ -161,7 +161,7 @@ def rm_material_status(stocked):
         if waiting:
             result[ordno] = {"status": "waiting", "detail": "; ".join(list(waiting.values())[:4]), "lines": lines, "waiting": waiting}
         else:
-            result[ordno] = {"status": "all_in", "detail": f"{len(material)} material lines in", "lines": lines, "waiting": {}}
+            result[ordno] = {"status": "all_in", "detail": f"all {len(material)} material line{'s' if len(material) != 1 else ''} in", "lines": lines, "waiting": {}}
     return result
 
 
@@ -307,7 +307,7 @@ def run(dry_run=False):
                 summary["already costed"] += 1
                 continue
             what = "; ".join(list(added_waiting.values())[:4])
-            action = f"{'Cleared' if write else 'DRY RUN — would clear'} Costed on deal {deal['id']}: material added to RM job {job} after costing ({what})"
+            action = f"{'Cleared' if write else 'DRY RUN — would clear'} Costed — material added after costing: {what}"
             payload["added"] = added_waiting
             if write:
                 try:
@@ -332,7 +332,7 @@ def run(dry_run=False):
         if info["status"] == "waiting":
             summary["waiting"] += 1
             continue
-        action = f"{'Marked' if write else 'DRY RUN — would mark'} deal {deal['id']} Costed: RM job {job} {info['status']} ({info['detail']})"
+        action = f"{'Marked' if write else 'DRY RUN — would mark'} Costed — {info['detail']}"
         if write:
             try:
                 pd_mark_costed(deal["id"])

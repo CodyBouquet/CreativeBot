@@ -21,6 +21,8 @@
     --danger:  #ff4060;
     --success: #00e890;
     --warn:    #ffaa00;
+    --violet:  #b48cff;   /* Rollmaster customer sync */
+    --magenta: #ff5fb4;   /* Rollmaster costing sync */
   }
 
   html, body {
@@ -158,7 +160,7 @@
   /* SERVICE STATUS */
   .status-row {
     display: grid;
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 12px;
   }
 
@@ -190,9 +192,12 @@
   .status-dot.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
   .status-dot.error { background: var(--danger); box-shadow: 0 0 8px var(--danger); animation: none; }
 
-  .status-info { flex: 1; }
+  .status-info { flex: 1; min-width: 0; }
   .status-name { font-size: 12px; font-weight: 600; letter-spacing: 1px; }
-  .status-detail { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .status-detail { font-size: 10px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .status-card.warn  { border-color: rgba(255,170,0,0.35); }
+  .status-card.error { border-color: rgba(255,64,96,0.45); }
+  .status-card.error .status-detail { color: var(--danger); }
 
   /* EVENTS */
   .section-title {
@@ -243,9 +248,14 @@
   .badge.install  { background: rgba(0,200,255,0.1); color: var(--accent); border: 1px solid var(--accent2); }
   .badge.measure  { background: rgba(0,232,144,0.1); color: var(--success); border: 1px solid rgba(0,232,144,0.3); }
   .badge.delivery { background: rgba(255,170,0,0.1); color: var(--warn); border: 1px solid rgba(255,170,0,0.3); }
+  .badge.customer { background: rgba(180,140,255,0.12); color: var(--violet); border: 1px solid rgba(180,140,255,0.4); }
+  .badge.costing  { background: rgba(255,95,180,0.12); color: var(--magenta); border: 1px solid rgba(255,95,180,0.4); }
   .badge.unknown  { background: rgba(255,255,255,0.05); color: var(--muted); border: 1px solid var(--border); }
 
-  .event-type { color: var(--muted); font-size: 10px; }
+  .event-type { color: var(--muted); font-size: 11px; line-height: 1.3; }
+  .event-type.rollmaster { color: var(--text); }
+  .event-type.failed  { color: var(--danger); font-weight: 600; }
+  .event-type.dryrun  { color: var(--muted); font-style: italic; }
   .deal-id { font-family: 'Share Tech Mono', monospace; color: var(--accent); }
   .event-time { color: var(--muted); font-size: 10px; }
 
@@ -400,13 +410,14 @@
   /* Logs */
   .log-row {
     display: grid;
-    grid-template-columns: 130px 60px 80px 70px 80px 1fr;
-    gap: 8px;
+    grid-template-columns: 118px 62px 126px 84px 76px 1fr;
+    gap: 10px;
     padding: 9px 14px;
     border-bottom: 1px solid var(--border);
     font-size: 11px;
     align-items: start;
   }
+  .log-row > span { min-width: 0; }
 
   .log-row:last-child { border-bottom: none; }
 
@@ -421,14 +432,14 @@
 
   .log-outcome {
     color: var(--text);
-    font-size: 10px;
+    font-size: 11px;
     line-height: 1.4;
     word-break: break-word;
   }
 
   .log-title {
     color: var(--muted);
-    font-size: 9px;
+    font-size: 10px;
     margin-top: 2px;
     white-space: nowrap;
     overflow: hidden;
@@ -470,8 +481,8 @@
       <div class="stat-label">Active Tasks</div>
     </div>
     <div class="stat-card">
-      <div class="stat-value" id="uptime">--</div>
-      <div class="stat-label">Service</div>
+      <div class="stat-value" id="actionsCompleted">{{ actions_completed.count }}</div>
+      <div class="stat-label">Actions Completed</div>
     </div>
     <div class="stat-card">
       <div class="stat-value" id="diskUsage">--</div>
@@ -483,18 +494,25 @@
   <div>
     <div class="section-title">System Status</div>
     <div class="status-row">
-      <div class="status-card">
+      <div class="status-card" id="arrivy-card">
         <div class="status-dot" id="arrivy-dot"></div>
         <div class="status-info">
           <div class="status-name">Arrivy Webhook</div>
-          <div class="status-detail" id="arrivy-status">Listening on /arrivy-webhook</div>
+          <div class="status-detail" id="arrivy-status">Checking…</div>
         </div>
       </div>
-      <div class="status-card">
+      <div class="status-card" id="pd-card">
         <div class="status-dot" id="pd-dot"></div>
         <div class="status-info">
-          <div class="status-name">Pipedrive Sync</div>
-          <div class="status-detail" id="pd-status">Connected</div>
+          <div class="status-name">Pipedrive API</div>
+          <div class="status-detail" id="pd-status">Checking…</div>
+        </div>
+      </div>
+      <div class="status-card" id="rm-card">
+        <div class="status-dot" id="rm-dot"></div>
+        <div class="status-info">
+          <div class="status-name">Rollmaster API</div>
+          <div class="status-detail" id="rm-status">Checking…</div>
         </div>
       </div>
     </div>
@@ -535,11 +553,6 @@
   <div>
     <div class="section-title">Actions</div>
     <div class="actions-grid">
-      <div class="action-card" onclick="runSync(this)">
-        <div class="action-icon">🔄</div>
-        <div class="action-name">Manual Sync</div>
-        <div class="action-desc">Recalc all active tasks to Pipedrive</div>
-      </div>
       <div class="action-card" onclick="window.location.href='/logs'">
         <div class="action-icon">📋</div>
         <div class="action-name">View Logs</div>
@@ -632,15 +645,20 @@
         return;
       }
 
-      const BADGE = { install: 'install', measure: 'measure', delivery: 'delivery' };
+      const BADGE = { install: 'install', measure: 'measure', delivery: 'delivery', inspection: 'install',
+                      customer: 'customer', costing: 'costing' };
       data.logs.forEach(log => {
         const row = document.createElement('div');
         row.className = 'log-row';
         const badge = BADGE[log.task_type] || 'unknown';
+        const label = log.event_label || log.event_type;
+        const cls = ['event-type', log.source || '',
+                     /FAILED|AMBIGUOUS|BLOCKED/.test(label) ? 'failed' : '',
+                     /DRY RUN/.test(label) ? 'dryrun' : ''].join(' ');
         row.innerHTML = `
           <span class="event-time">${escapeHtml(log.date)} ${escapeHtml(log.time)}</span>
           <span class="deal-id">${log.deal_id ? '#' + escapeHtml(log.deal_id) : '—'}</span>
-          <span class="event-type">${escapeHtml(log.event_type)}</span>
+          <span class="${cls}">${escapeHtml(label)}</span>
           <span><span class="badge ${escapeHtml(badge)}">${escapeHtml(log.task_type)}</span></span>
           <span class="event-time">${escapeHtml(log.task_date)}</span>
           <span>
@@ -656,6 +674,30 @@
   refreshLogs();
   setInterval(refreshLogs, 60000);
 
+  // Integration status cards
+  async function refreshHealth() {
+    const cards = { arrivy: ['arrivy-card', 'arrivy-dot', 'arrivy-status'],
+                    pipedrive: ['pd-card', 'pd-dot', 'pd-status'],
+                    rollmaster: ['rm-card', 'rm-dot', 'rm-status'] };
+    try {
+      const res = await fetch('/api/health');
+      const h = await res.json();
+      for (const [key, [card, dot, text]] of Object.entries(cards)) {
+        const st = h[key] || { state: 'error', detail: h.error || 'No data' };
+        document.getElementById(card).className = 'status-card ' + (st.state === 'ok' ? '' : st.state);
+        document.getElementById(dot).className  = 'status-dot ' + (st.state === 'ok' ? '' : st.state);
+        document.getElementById(text).textContent = st.detail;
+      }
+    } catch (e) {
+      for (const [card, dot, text] of Object.values(cards)) {
+        document.getElementById(dot).className = 'status-dot error';
+        document.getElementById(text).textContent = 'Dashboard unreachable';
+      }
+    }
+  }
+  refreshHealth();
+  setInterval(refreshHealth, 60000);
+
   // Auto-refresh stats every 60s
   async function refreshStats() {
     try {
@@ -663,14 +705,14 @@
       const data = await res.json();
       document.getElementById('totalEvents').textContent = data.total_events;
       document.getElementById('activeTasks').textContent = data.active_tasks;
-      document.getElementById('uptime').textContent = '✓';
+      document.getElementById('actionsCompleted').textContent = data.actions_completed;
       if (data.disk) {
         const gb = b => (b / 1073741824).toFixed(1);
         document.getElementById('diskUsage').textContent = data.disk.percent_used + '%';
         document.getElementById('diskLabel').textContent = gb(data.disk.used_bytes) + ' / ' + gb(data.disk.total_bytes) + ' GB';
       }
     } catch (e) {
-      document.getElementById('uptime').textContent = '✗';
+      console.error('Stats fetch failed', e);
     }
   }
   refreshStats();
@@ -754,28 +796,6 @@
       pmSetStatus('ERROR', 'error');
       pmPin = ''; pmUpdateDots();
     }
-  }
-
-  // Manual Sync
-  async function runSync(card) {
-    card.style.pointerEvents = 'none';
-    card.querySelector('.action-desc').textContent = 'Syncing...';
-    try {
-      const res  = await fetch('/api/sync-all', { method: 'POST' });
-      const data = await res.json();
-      if (res.ok) {
-        const msg = data.errors.length
-          ? `Synced ${data.synced}, ${data.errors.length} error(s)`
-          : `Synced ${data.synced} deal${data.synced !== 1 ? 's' : ''}`;
-        showToast(msg, data.errors.length ? 'error' : 'success');
-      } else {
-        showToast('Sync failed', 'error');
-      }
-    } catch (e) {
-      showToast('Connection error', 'error');
-    }
-    card.querySelector('.action-desc').textContent = 'Recalc all active tasks to Pipedrive';
-    card.style.pointerEvents = '';
   }
 
   // Clear DB

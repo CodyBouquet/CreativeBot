@@ -21,6 +21,8 @@
     --danger:  #ff4060;
     --success: #00e890;
     --warn:    #ffaa00;
+    --violet:  #b48cff;   /* Rollmaster customer sync */
+    --magenta: #ff5fb4;   /* Rollmaster costing sync */
   }
 
   html, body { height: 100%; overflow: hidden; }
@@ -238,6 +240,9 @@
   .deal-id { font-family: 'Share Tech Mono', monospace; color: var(--accent); }
   .event-time { color: var(--muted); font-size: 10px; font-family: 'Share Tech Mono', monospace; white-space: nowrap; }
   .event-type { color: var(--muted); font-size: 10px; }
+  .event-type.rollmaster { color: var(--text); }
+  .event-type.failed  { color: var(--danger); font-weight: 600; }
+  .event-type.dryrun  { color: var(--muted); font-style: italic; }
 
   .badge {
     display: inline-block;
@@ -252,6 +257,8 @@
   .badge.install  { background: rgba(0,200,255,0.1); color: var(--accent); border: 1px solid var(--accent2); }
   .badge.measure  { background: rgba(0,232,144,0.1); color: var(--success); border: 1px solid rgba(0,232,144,0.3); }
   .badge.delivery { background: rgba(255,170,0,0.1); color: var(--warn); border: 1px solid rgba(255,170,0,0.3); }
+  .badge.customer { background: rgba(180,140,255,0.12); color: var(--violet); border: 1px solid rgba(180,140,255,0.4); }
+  .badge.costing  { background: rgba(255,95,180,0.12); color: var(--magenta); border: 1px solid rgba(255,95,180,0.4); }
   .badge.unknown  { background: rgba(255,255,255,0.05); color: var(--muted); border: 1px solid var(--border); }
 
   .outcome { color: var(--text); line-height: 1.4; }
@@ -307,16 +314,24 @@
     <option value="measure">Measure</option>
     <option value="delivery">Delivery</option>
     <option value="inspection">Inspection</option>
+    <option value="customer">Customer sync</option>
+    <option value="costing">Costing sync</option>
     <option value="unknown">Unknown</option>
   </select>
-  <select class="filter-input" id="filterEvent" onchange="applyFilters()" style="width:130px">
+  <select class="filter-input" id="filterEvent" onchange="applyFilters()" style="width:150px">
     <option value="">All events</option>
-    <option value="CREATED">Created</option>
-    <option value="UPDATED">Updated</option>
+    <option value="CREATED">Task created</option>
+    <option value="UPDATED">Task updated</option>
     <option value="CANCELLED">Cancelled</option>
     <option value="COMPLETED">Completed</option>
     <option value="DELETED">Deleted</option>
     <option value="BLOCKED">Blocked</option>
+    <option value="RM_CUSTOMER_CREATED">Customer created</option>
+    <option value="RM_CUSTOMER_UPDATED">Customer updated</option>
+    <option value="RM_MATERIAL_COSTED">Costed</option>
+    <option value="RM_MATERIAL_UNCOSTED">Un-costed</option>
+    <option value="__failed">Failures</option>
+    <option value="__dryrun">Dry runs</option>
   </select>
   <span class="count-label" id="countLabel">—</span>
 </div>
@@ -351,7 +366,7 @@
         <th>Event</th>
         <th>Type</th>
         <th>Task Date</th>
-        <th>Task Title</th>
+        <th>Subject</th>
         <th>Action Taken</th>
       </tr>
     </thead>
@@ -400,6 +415,8 @@
     const filtered = allLogs.filter(log => {
       if (deal  && String(log.deal_id) !== deal) return false;
       if (type  && log.task_type !== type)        return false;
+      if (event === '__failed') return /FAILED|AMBIGUOUS|BLOCKED/.test(log.event_type);
+      if (event === '__dryrun') return /DRYRUN/.test(log.event_type);
       if (event && log.event_type !== event)      return false;
       return true;
     });
@@ -412,13 +429,18 @@
       return;
     }
 
-    const BADGE = { install: 'install', measure: 'measure', delivery: 'delivery', inspection: 'install' };
+    const BADGE = { install: 'install', measure: 'measure', delivery: 'delivery', inspection: 'install',
+                    customer: 'customer', costing: 'costing' };
     tbody.innerHTML = filtered.map(log => {
       const badge = BADGE[log.task_type] || 'unknown';
+      const label = log.event_label || log.event_type;
+      const cls = ['event-type', log.source || '',
+                   /FAILED|AMBIGUOUS|BLOCKED/.test(label) ? 'failed' : '',
+                   /DRY RUN/.test(label) ? 'dryrun' : ''].join(' ');
       return `<tr>
         <td class="event-time">${escapeHtml(log.date)} ${escapeHtml(log.time)}</td>
         <td class="deal-id">${log.deal_id ? '#' + escapeHtml(log.deal_id) : '—'}</td>
-        <td class="event-type">${escapeHtml(log.event_type)}</td>
+        <td class="${cls}">${escapeHtml(label)}</td>
         <td><span class="badge ${escapeHtml(badge)}">${escapeHtml(log.task_type)}</span></td>
         <td class="event-time">${escapeHtml(log.task_date)}</td>
         <td>
