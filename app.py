@@ -118,7 +118,10 @@ RM_CUSTOMER_SYNC_ENABLED = os.environ.get("RM_CUSTOMER_SYNC_ENABLED", "0") == "1
 RM_CUSTOMER_DEFAULTS = {
     "C_WHSE":                os.environ.get("RM_C_WHSE", ""),
     "C_STAT":                os.environ.get("RM_C_STAT", ""),
-    "C_CUSTTYPE":            os.environ.get("RM_C_CUSTTYPE", ""),
+    # Job type. Blank makes Rollmaster fall back to N/A, so the agreed default
+    # (R1 = Retail) is the fallback here rather than an empty string — a .env
+    # that forgets RM_C_CUSTTYPE must not quietly file customers under N/A.
+    "C_CUSTTYPE":            os.environ.get("RM_C_CUSTTYPE", "R1"),
     "C_TERRFLAG":            os.environ.get("RM_C_TERRFLAG", ""),
     "C_TERR":                os.environ.get("RM_C_TERR", ""),
     "C_PRICE_LEVEL_DEFAULT": os.environ.get("RM_C_PRICE_LEVEL", ""),
