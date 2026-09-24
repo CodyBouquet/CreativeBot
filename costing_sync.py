@@ -28,6 +28,8 @@ deal is visibly waiting again and the reason is on it.
 That is the only way Costed is ever cleared: lag on lines that were already
 there when the deal was costed never flips it backwards.
 
+Covers every company in RM_COSTING_COMPANIES (default 99 and 2).
+
 Runs from cron on the Pi (see SETUP.md). Dry run unless RM_COSTING_SYNC_ENABLED=1
 in .env; every flip (or would-be flip) is written to the events table so it
 shows on the dashboard logs page as RM_MATERIAL_COSTED / RM_MATERIAL_DRYRUN.
@@ -75,8 +77,14 @@ PD_UNCOST_OPTION = os.environ.get("PD_UNCOST_OPTION", "132")
 # than this would be invisible to the sync.
 ORDER_HISTORY_FLOOR = "20240101"
 
+# Rollmaster companies to sync. Order numbers are prefixed by branch (1xxxx,
+# 2xxxx, 3xxxx), so jobs never collide across companies and the RM Job # alone
+# identifies the order.
+COMPANIES = [c.strip() for c in os.environ.get("RM_COSTING_COMPANIES", f"{rollmaster.COMPANY},2").split(",") if c.strip()]
+
 # The stocked-SKU universe (CAT_SAFTYSTK > 0), built weekly by the inventory
-# report's catalog scan.
+# report's catalog scan. It is company 99's catalog; the other companies stock
+# nothing, so every unassigned line there is special order.
 STOCKED_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "email_reports", "inventory", ".stocked_catalog_cache.json")
 
@@ -113,9 +121,9 @@ def load_stocked_seqs():
         return None
 
 
-def rm_material_status(stocked):
+def rm_material_status(stocked, company):
     """
-    Return {order_no: info} for every open Rollmaster order, where info is
+    Return {order_no: info} for every open order in one Rollmaster company, where info is
     {"status": 'all_in' | 'labor_only' | 'waiting', "detail": str,
      "lines": [material line numbers], "waiting": {line number: description}}.
 
@@ -124,13 +132,13 @@ def rm_material_status(stocked):
     can only delay a flip, never cause a wrong one.
     """
     end = datetime.now().strftime("%Y%m%d")
-    orders = rollmaster.get("orders", {"company": rollmaster.COMPANY,
+    orders = rollmaster.get("orders", {"company": company,
                                        "startdate": ORDER_HISTORY_FLOOR, "enddate": end})
     open_nos = {str(o.get("DMO_ORDNO", "")).strip() for o in orders}
     branches = sorted({str(o.get("DMO_WHSE", "")).strip() for o in orders if str(o.get("DMO_WHSE", "")).strip()})
     lines_by_order = {}
     for br in branches:
-        for ln in rollmaster.get("orderline", {"company": rollmaster.COMPANY, "branch": br,
+        for ln in rollmaster.get("orderline", {"company": company, "branch": br,
                                                "startdate": ORDER_HISTORY_FLOOR, "enddate": end}):
             ordno = str(ln.get("DMI_ORDNO", "")).strip()
             if ordno in open_nos:
@@ -280,7 +288,22 @@ def run(dry_run=False):
     stocked = load_stocked_seqs()
     if stocked is None:
         logger.warning("stocked-catalog cache missing/incomplete — unassigned stock items will count as waiting")
-    status = rm_material_status(stocked)
+    status = {}
+    for company in COMPANIES:
+        # A company that fails (e.g. no API access) just contributes no orders;
+        # its deals are skipped as "order not open", nothing is flipped either way.
+        try:
+            got = rm_material_status(stocked if company == rollmaster.COMPANY else set(), company)
+        except Exception as e:
+            logger.error(f"company {company}: could not read orders: {e}")
+            continue
+        clash = set(got) & set(status)
+        if clash:
+            logger.warning(f"company {company}: order #s also in another company, skipped: {sorted(clash)[:10]}")
+            for ordno in clash:
+                got.pop(ordno)
+                status.pop(ordno, None)
+        status.update(got)
     deals = pd_open_deals_with_job()
     baselines = load_baselines()
     summary = Counter()
