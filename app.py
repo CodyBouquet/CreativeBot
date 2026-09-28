@@ -302,6 +302,45 @@ def archive_deal(conn, deal_id):
     logger.info(f"Archived deal {deal_id}")
 
 # ---------------------------------------------------------------------------
+# ARRIVY
+# ---------------------------------------------------------------------------
+ARRIVY_BASE = "https://app.arrivy.com/api"
+
+def arrivy_deal_id(payload):
+    """
+    Return the Pipedrive deal id an Arrivy webhook refers to, or None.
+
+    OBJECT_EXTERNAL_ID holds the deal id only while Pipedrive is the task's sole
+    integration. Once Arrivy's Microsoft 365 calendar sync attaches, it becomes the
+    Outlook event id and OBJECT_FIELDS.LINKED_EXTERNAL_ID drops out of the payload,
+    but the task itself still carries the deal in linked_external_ref and in its
+    PIPEDRIVE entry of external_integration_info — so ask Arrivy for the task.
+    """
+    for val in (payload.get("OBJECT_EXTERNAL_ID"),
+                (payload.get("OBJECT_FIELDS") or {}).get("LINKED_EXTERNAL_ID")):
+        if str(val or "").strip().isdigit():
+            return int(val)
+    task_id = payload.get("OBJECT_ID")
+    if not task_id:
+        return None
+    try:
+        r = requests.get(f"{ARRIVY_BASE}/tasks/{task_id}", timeout=15,
+                         headers={"X-Auth-Key": ARRIVY_API_KEY, "X-Auth-Token": ARRIVY_AUTH_TOKEN})
+        r.raise_for_status()
+        task = r.json()
+    except Exception as e:
+        logger.warning(f"Arrivy task {task_id} lookup failed: {e}")
+        return None
+    refs = [i.get("external_id") for i in task.get("external_integration_info") or []
+            if i.get("external_type") == "PIPEDRIVE"]
+    refs.append(task.get("linked_external_ref"))
+    for val in refs:
+        if str(val or "").strip().isdigit():
+            logger.info(f"Arrivy task {task_id}: deal {val} resolved from the task (external id was {payload.get('OBJECT_EXTERNAL_ID')!r})")
+            return int(val)
+    return None
+
+# ---------------------------------------------------------------------------
 # PIPEDRIVE
 # ---------------------------------------------------------------------------
 PD_BASE = "https://api.pipedrive.com/v1"
@@ -1141,11 +1180,12 @@ def arrivy_webhook():
         logger.info(f"Arrivy raw payload: {json.dumps(payload)}")
         logger.info(f"Arrivy: {event_type} (raw={raw_event_type}/{sub_type}) | template={template_id} | deal={external_id} | task={task_id}")
 
-        deal_id   = int(external_id) if external_id else None
+        deal_id   = arrivy_deal_id(payload)
         task_type = TEMPLATE_MAP.get(template_id)
 
         with get_db() as conn:
-            # Delete events arrive with no external_id or template_id — look up from DB
+            # Delete events arrive with no external_id or template_id (and the task is
+            # gone from Arrivy) — look up from DB
             if event_type == "TASK_DELETED" and (not deal_id or not task_type):
                 row = get_task_state(conn, task_id)
                 if row:
