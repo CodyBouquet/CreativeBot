@@ -354,6 +354,10 @@ def pd_get_deal(deal_id):
         raise Exception(f"Pipedrive get deal failed: {data}")
     return data["data"]
 
+class DealDeletedError(Exception):
+    """Raised when Pipedrive refuses an update because the deal has been deleted."""
+
+
 def pd_update_deal(deal_id, fields):
     """Update fields on a Pipedrive deal. Historical deals (id <= MIN_DEAL_ID) are blocked and only logged, never written. Returns the updated deal data, or None if blocked."""
     if int(deal_id) <= MIN_DEAL_ID:
@@ -365,6 +369,15 @@ def pd_update_deal(deal_id, fields):
         return None
     r = requests.put(f"{PD_BASE}/deals/{deal_id}",
                      params={"api_token": PIPEDRIVE_API_TOKEN}, json=fields)
+    # Pipedrive answers 400 when the deal has been deleted (e.g. a duplicate whose
+    # Arrivy task lives on). That will never succeed, so say so distinctly.
+    if r.status_code == 400:
+        try:
+            deleted = pd_get_deal(deal_id).get("status") == "deleted"
+        except Exception:
+            deleted = False
+        if deleted:
+            raise DealDeletedError(deal_id)
     r.raise_for_status()
     data = r.json()
     if not data.get("success"):
@@ -1196,34 +1209,40 @@ def arrivy_webhook():
                 return jsonify({"status": "ignored", "reason": "no external id"}), 200
 
             action = None
-            if deal_id > MIN_DEAL_ID:
-                if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED") and task_type:
-                    # Capture what type this task was BEFORE the handler re-files it, so
-                    # we can detect a template correction (e.g. measure → install) below.
-                    prev = get_task_state(conn, task_id)
-                    if task_type == "measure":
-                        action = handle_measure(conn, event_type, deal_id, task_id, object_date)
-                    elif task_type == "delivery":
-                        action = handle_delivery(conn, event_type, deal_id, task_id, object_date)
-                    elif task_type == "install":
-                        action = handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
-                    elif task_type == "inspection":
-                        action = handle_inspection(conn, event_type, deal_id, task_id, object_date)
-                    # Template was corrected in Arrivy: the task's type changed, so the
-                    # field its OLD type owned is now stale. Recompute it from the deal's
-                    # other tasks of that type (measure & inspection share measure_date).
-                    if prev and prev["task_type"] != task_type:
-                        old = prev["task_type"]
-                        if old in ("measure", "inspection"):
-                            recalc_measure(conn, deal_id)
-                        elif old == "delivery":
-                            recalc_delivery(conn, deal_id)
-                        elif old == "install":
-                            recalc_install(conn, deal_id)
+            try:
+                if deal_id > MIN_DEAL_ID:
+                    if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_CANCELLED", "TASK_COMPLETED", "TASK_DELETED", "TASK_RESCHEDULED", "TASK_TEMPLATE_EXTRA_FIELDS_UPDATED") and task_type:
+                        # Capture what type this task was BEFORE the handler re-files it, so
+                        # we can detect a template correction (e.g. measure → install) below.
+                        prev = get_task_state(conn, task_id)
+                        if task_type == "measure":
+                            action = handle_measure(conn, event_type, deal_id, task_id, object_date)
+                        elif task_type == "delivery":
+                            action = handle_delivery(conn, event_type, deal_id, task_id, object_date)
+                        elif task_type == "install":
+                            action = handle_install(conn, event_type, deal_id, task_id, object_date, extra_fields)
+                        elif task_type == "inspection":
+                            action = handle_inspection(conn, event_type, deal_id, task_id, object_date)
+                        # Template was corrected in Arrivy: the task's type changed, so the
+                        # field its OLD type owned is now stale. Recompute it from the deal's
+                        # other tasks of that type (measure & inspection share measure_date).
+                        if prev and prev["task_type"] != task_type:
+                            old = prev["task_type"]
+                            if old in ("measure", "inspection"):
+                                recalc_measure(conn, deal_id)
+                            elif old == "delivery":
+                                recalc_delivery(conn, deal_id)
+                            elif old == "install":
+                                recalc_install(conn, deal_id)
+                    else:
+                        action = "Logged (no action needed)"
                 else:
-                    action = "Logged (no action needed)"
-            else:
-                action = "Logged only (below threshold)"
+                    action = "Logged only (below threshold)"
+            except DealDeletedError:
+                # A deleted deal (typically a duplicate) can never be updated; ack the
+                # event so Arrivy stops retrying it, and leave a note on the dashboard.
+                logger.warning(f"Deal {deal_id} is deleted in Pipedrive — skipped {event_type} for task {task_id}")
+                action = "Skipped — deal is deleted in Pipedrive"
 
             store_event(conn, deal_id, task_id, event_type, task_type, payload, action)
 
