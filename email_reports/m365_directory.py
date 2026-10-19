@@ -74,7 +74,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_key_at      ON report_runs(report_key, ran_a
 def _conn():
     """Open a sqlite connection to DB_PATH (creating the parent dir) with Row access by column name."""
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     return c
 

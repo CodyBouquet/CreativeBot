@@ -302,16 +302,14 @@ def sync_task(task_id, task=None, fetched=False):
             have = {(r["graph_id"], r["day"]): dict(r) for r in c.execute(
                 "SELECT * FROM calendar_events WHERE task_id=?", (task_id,))}
         done = {"created": 0, "updated": 0, "deleted": 0, "failed": 0}
+        backfill = []
         for key, ev in want.items():
             fp = hashlib.sha1(json.dumps(ev, sort_keys=True).encode()).hexdigest()
             row = have.get(key)
             if row and row["fingerprint"] == fp:
                 if row["start_utc"] is None and MODE == "on":   # rows from before read-back existed
-                    with _conn() as c:
-                        c.execute("UPDATE calendar_events SET start_utc=?, end_utc=?, template=?, days=? "
-                                  "WHERE task_id=? AND graph_id=? AND day=?",
-                                  (ev["start"]["dateTime"], ev["end"]["dateTime"], meta.get("template"),
-                                   meta.get("days"), task_id, *key))
+                    backfill.append((ev["start"]["dateTime"], ev["end"]["dateTime"], meta.get("template"),
+                                     meta.get("days"), task_id, *key))
                 continue
             gid, day = key
             if MODE == "dry":
@@ -345,6 +343,10 @@ def sync_task(task_id, task=None, fetched=False):
             except Exception as e:
                 done["failed"] += 1
                 log.warning(f"calendar: task {task_id} {day} for {gid} failed: {str(e)[:200]}")
+        if backfill:   # one short transaction, not a commit per row
+            with _conn() as c:
+                c.executemany("UPDATE calendar_events SET start_utc=?, end_utc=?, template=?, days=? "
+                              "WHERE task_id=? AND graph_id=? AND day=?", backfill)
         for key, row in have.items():
             if key in want:
                 continue

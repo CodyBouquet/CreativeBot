@@ -180,13 +180,18 @@ def sse_notify():
 def get_db():
     """Open a sqlite connection to DB_PATH (creating the parent dir), with Row access by column name."""
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    # 30s: wait out another thread's write (calendar sweep, costing cron) rather than
+    # failing a webhook with "database is locked".
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     """Create all tables/indexes if absent and run in-place migrations (legacy PIN → users, current_date → task_date, new columns). Idempotent; called at startup."""
     with get_db() as conn:
+        # WAL: readers never wait on a writer and commits are far cheaper on the SD
+        # card. The mode is stored in the file, so every other process gets it too.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS events (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -8,7 +8,7 @@ Add to crontab with: crontab -e
 """
 
 import os
-import shutil
+import sqlite3
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -32,7 +32,14 @@ def run_backup():
 
     date_str    = datetime.now().strftime("%Y-%m-%d")
     backup_file = backup_dir / f"sync_{date_str}.db"
-    shutil.copy2(db_path, backup_file)
+    # sqlite's backup API, not a file copy: the DB runs in WAL mode, so recent
+    # writes can still be sitting in sync.db-wal where a copy would miss them.
+    src = sqlite3.connect(db_path, timeout=60)
+    dst = sqlite3.connect(backup_file)
+    with dst:
+        src.backup(dst)
+    dst.close()
+    src.close()
     logger.info(f"Backup: {backup_file} ({backup_file.stat().st_size / 1024:.1f} KB)")
 
     cutoff = datetime.now() - timedelta(days=KEEP_DAYS)
