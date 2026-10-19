@@ -31,11 +31,10 @@ webhook then carries either on to Pipedrive and the other assignees'
 calendars. Any other change (no permission, other task types, multi-day
 jobs) is put back to what Arrivy says.
 
-Notes: the event body carries the task's Arrivy Details between two marker
-lines. On Measures and Inspections anyone mapped may edit that text in
-Outlook; the read-back pushes it to Arrivy's Details (and so to every other
-assignee's copy). On other task types the notes are shown read-only. If the
-markers are missing or mangled the edit is ignored, never guessed at.
+Notes: the event body is the task's Arrivy Details and nothing else. On
+Measures and Inspections anyone mapped may edit it in Outlook; the read-back
+pushes the whole body to Arrivy's Details (and so to every other assignee's
+copy). On other task types the body is shown but edits aren't synced.
 
 M365_CALENDAR_SYNC: "off" (default), "dry" (log what it would do, write
 nothing), "on".
@@ -81,11 +80,6 @@ TEMPLATE_LABELS = {
 }
 # Templates an Outlook reschedule may write back to Arrivy (Measure, Inspection).
 READBACK_TEMPLATES = {5627485400596480, 5546469558321152}
-# Lines framing the editable notes in the event body (plain text so they
-# survive Outlook's HTML→text conversion on every client).
-NOTES_START = "===== NOTES (edits here sync to Arrivy) ====="
-NOTES_START_RO = "===== NOTES (from Arrivy) ====="
-NOTES_END = "===== END NOTES ====="
 # Arrivy statuses whose task no longer happens.
 GONE_STATUSES = {"CANCELLED", "CANCEL"}
 
@@ -247,18 +241,10 @@ def event_body(task, day_index, day_count, crew_names):
     address = (task.get("customer_address") or ", ".join(p for p in (
         task.get("customer_address_line_1"), task.get("customer_city"),
         task.get("customer_state"), task.get("customer_zipcode")) if p) or "").strip()
-    deal = _deal_id(task)
-    # Customer name is in the subject and the address in the location, so the
-    # body skips them.
-    rows = [("Arrivy", task.get("title") or ""), ("Assigned", ", ".join(sorted(crew_names)))]
-    parts = [f"<b>{html.escape(k)}:</b> {html.escape(str(v))}<br>" for k, v in rows if v]
-    if deal:
-        parts.append(f'<b>Pipedrive:</b> <a href="https://app.pipedrive.com/deal/{deal}">deal {deal}</a><br>')
-    editable = task.get("template") in READBACK_TEMPLATES
+    # The body is the Arrivy notes and nothing else: the name is in the subject,
+    # the address in the location.
     notes = (task.get("details") or "").strip()
-    parts.append("<br>" + html.escape(NOTES_START if editable else NOTES_START_RO) + "<br>")
-    parts.append(html.escape(notes).replace("\n", "<br>") + "<br>" if notes else "<br>")
-    parts.append(html.escape(NOTES_END) + "<br>")
+    parts = [html.escape(notes).replace("\n", "<br>")]
     return {
         "subject": subject[:255],
         "body": {"contentType": "HTML", "content": "".join(parts)},
@@ -463,13 +449,8 @@ def notes_key(text):
 
 
 def notes_from_body(text):
-    """The editable notes from an event body read as text, or None when the markers aren't intact."""
-    if not text or NOTES_START not in text:
-        return None
-    after = text.split(NOTES_START, 1)[1]
-    if NOTES_END not in after:
-        return None
-    return norm_notes(after.split(NOTES_END, 1)[0])
+    """The notes from an event body read as text — the whole body."""
+    return norm_notes(text or "")
 
 
 def push_notes(task_id, notes):
