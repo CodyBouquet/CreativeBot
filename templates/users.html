@@ -575,6 +575,18 @@
     </div>
 
     <div class="add-card">
+      <div class="section-title" style="margin:0">Outlook Calendar</div>
+      <div class="field-label">Can reschedule measures &amp; inspections from Outlook</div>
+      <div class="role-toggle">
+        <button class="role-opt" id="eCalYes" onclick="setEditCal(true)">Allowed</button>
+        <button class="role-opt" id="eCalNo"  onclick="setEditCal(false)">Not Allowed</button>
+      </div>
+      <div class="field-label" style="margin:0;text-transform:none;letter-spacing:0">
+        Moving one of their synced measures or inspections in Outlook updates Arrivy (and Pipedrive). Anything else they change there is put back.
+      </div>
+    </div>
+
+    <div class="add-card">
       <div class="section-title" style="margin:0">Pi UI Access</div>
       <div class="role-toggle">
         <button class="role-opt" id="ePiYes" onclick="setEditPi(true)">Allowed</button>
@@ -780,7 +792,7 @@
         return `<div class="user-row tappable" onclick="openSheet(${u.id})">
           <span class="user-name">
             <span class="main username-cell">${esc(name)}</span>
-            <span class="sub">${esc(u.username)}${u.rm_branch ? ' · Branch ' + esc(u.rm_branch) : ''}${u.rm_sales_id ? ' · RM ' + esc(u.rm_sales_id) : ''}</span>
+            <span class="sub">${esc(u.username)}${u.cal_can_reschedule ? ' · Outlook reschedule' : ''}${u.rm_branch ? ' · Branch ' + esc(u.rm_branch) : ''}${u.rm_sales_id ? ' · RM ' + esc(u.rm_sales_id) : ''}</span>
           </span>
           <span class="chips">
             ${chip('M365', u.m365_graph_id, 'm365')}${chip('AR', u.arrivy_entity_id, 'arrivy')}${chip('PD', u.pipedrive_user_id, 'pipedrive')}${chip('RM', u.rm_sales_id, 'rm')}
@@ -852,7 +864,7 @@
     { el: 'pickPipedrive', field: 'pipedrive_user_id', system: 'pipedrive', err: 'errPipedrive' },
     { el: 'pickRm',        field: 'rm_sales_id',       system: 'rm',        err: 'errRm' },
   ];
-  let editing = null, ePi = false, eRole = 'user', ePin = '', eBranch = '';
+  let editing = null, ePi = false, eRole = 'user', ePin = '', eBranch = '', eCal = false;
 
   function normName(n) {
     return String(n || '').replace(/^\s*\d+\s*[.)-]\s*/, '').toLowerCase().replace(/[^a-z]/g, ' ').split(/\s+/).filter(Boolean).join(' ');
@@ -905,6 +917,7 @@
     PICKERS.forEach(p => fillPicker(p, editing[p.field]));
     eBranch = editing.rm_branch || '';
     renderBranch();
+    setEditCal(!!editing.cal_can_reschedule);
     ePin = '';
     renderEPin();
     setEditRole(editing.role);
@@ -931,6 +944,12 @@
     document.getElementById('ePiYes').classList.toggle('selected', on);
     document.getElementById('ePiNo').classList.toggle('selected', !on);
     document.getElementById('ePiBlock').style.display = on ? '' : 'none';
+  }
+
+  function setEditCal(on) {
+    eCal = on;
+    document.getElementById('eCalYes').classList.toggle('selected', on);
+    document.getElementById('eCalNo').classList.toggle('selected', !on);
   }
 
   function setEditRole(r) {
@@ -980,7 +999,7 @@
   }
 
   async function saveSheet() {
-    const body = { rm_branch: eBranch, pi_access: ePi };
+    const body = { rm_branch: eBranch, pi_access: ePi, cal_can_reschedule: eCal };
     PICKERS.forEach(p => body[p.field] = document.getElementById(p.el).value);
     if (ePi) {
       body.role = eRole;

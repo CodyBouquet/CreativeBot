@@ -22,6 +22,15 @@ start time to end time), so a three-day install doesn't block nights.
 State: calendar_events(task_id, graph_id, day) → Outlook event id + a
 fingerprint of what was written, so unchanged events aren't re-sent.
 
+Outlook → Arrivy: every READBACK_MINUTES the synced events are read back
+from Outlook (poll_outlook). A time change made by someone with "Can
+reschedule from Outlook" on the Users page, on a single-day Measure or
+Inspection, is pushed to Arrivy as a reschedule — Arrivy's own webhook then
+carries it on to Pipedrive and the other assignees' calendars. Any other
+change (no permission, other task types, multi-day jobs, an event deleted in
+Outlook) is put back to what Arrivy says. Deleting in Outlook never cancels
+a job.
+
 M365_CALENDAR_SYNC: "off" (default), "dry" (log what it would do, write
 nothing), "on".
 """
@@ -51,6 +60,7 @@ ARRIVY_BASE   = "https://app.arrivy.com/api"
 GRAPH_BASE    = "https://graph.microsoft.com/v1.0"
 SWEEP_MINUTES = int(os.environ.get("M365_CALENDAR_SWEEP_MINUTES", "30"))
 SWEEP_DAYS    = int(os.environ.get("M365_CALENDAR_SWEEP_DAYS", "60"))
+READBACK_MINUTES = int(os.environ.get("M365_CALENDAR_READBACK_MINUTES", "2"))
 LOCAL_TZ      = "America/Chicago"
 
 # Arrivy template → what the event is called. Unlisted templates use the task title.
@@ -63,6 +73,8 @@ TEMPLATE_LABELS = {
     6631019675910144: "Pickup",
     538634486456320:  "Customer Pickup",
 }
+# Templates an Outlook reschedule may write back to Arrivy (Measure, Inspection).
+READBACK_TEMPLATES = {5627485400596480, 5546469558321152}
 # Arrivy statuses whose task no longer happens.
 GONE_STATUSES = {"CANCELLED", "CANCEL"}
 
@@ -72,6 +84,8 @@ _pending: set[int] = set()
 _pending_lock = threading.Lock()
 _task_locks: dict[int, threading.Lock] = {}
 _started = False
+# Set by app.py: on_event(deal_id, task_id, event_type, payload, action) logs to the dashboard.
+on_event = None
 
 
 # ---- DB ---------------------------------------------------------------------
@@ -99,6 +113,11 @@ def init_schema():
             );
             CREATE INDEX IF NOT EXISTS idx_cal_day ON calendar_events(day);
         """)
+        # What was last written (UTC) and the task's shape, for reading Outlook changes back.
+        cols = {r[1] for r in c.execute("PRAGMA table_info(calendar_events)")}
+        for col in ("start_utc TEXT", "end_utc TEXT", "template INTEGER", "days INTEGER"):
+            if col.split()[0] not in cols:
+                c.execute(f"ALTER TABLE calendar_events ADD COLUMN {col}")
 
 
 def _mapped_people(entity_ids):
@@ -268,6 +287,7 @@ def sync_task(task_id, task=None, fetched=False):
         if not fetched:
             task = fetch_task(task_id)
         want = {}   # (graph_id, day) → event resource
+        meta = {}
         if task:
             people = _mapped_people(task.get("entity_ids"))
             slots = task_slots(task) if people else []
@@ -277,6 +297,7 @@ def sync_task(task_id, task=None, fetched=False):
                     ev["start"] = {"dateTime": s.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"}
                     ev["end"]   = {"dateTime": e.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"}
                     want[(gid, day)] = {k: v for k, v in ev.items() if v is not None}
+            meta = {"template": task.get("template"), "days": len(slots)}
         with _conn() as c:
             have = {(r["graph_id"], r["day"]): dict(r) for r in c.execute(
                 "SELECT * FROM calendar_events WHERE task_id=?", (task_id,))}
@@ -285,6 +306,12 @@ def sync_task(task_id, task=None, fetched=False):
             fp = hashlib.sha1(json.dumps(ev, sort_keys=True).encode()).hexdigest()
             row = have.get(key)
             if row and row["fingerprint"] == fp:
+                if row["start_utc"] is None and MODE == "on":   # rows from before read-back existed
+                    with _conn() as c:
+                        c.execute("UPDATE calendar_events SET start_utc=?, end_utc=?, template=?, days=? "
+                                  "WHERE task_id=? AND graph_id=? AND day=?",
+                                  (ev["start"]["dateTime"], ev["end"]["dateTime"], meta.get("template"),
+                                   meta.get("days"), task_id, *key))
                 continue
             gid, day = key
             if MODE == "dry":
@@ -306,10 +333,14 @@ def sync_task(task_id, task=None, fetched=False):
                     r.raise_for_status()
                     event_id = r.json()["id"]
                 with _conn() as c:
-                    c.execute("INSERT INTO calendar_events (task_id, graph_id, day, event_id, fingerprint, updated_at) "
-                              "VALUES (?,?,?,?,?,?) ON CONFLICT(task_id, graph_id, day) DO UPDATE SET "
-                              "event_id=excluded.event_id, fingerprint=excluded.fingerprint, updated_at=excluded.updated_at",
-                              (task_id, gid, day, event_id, fp, datetime.utcnow().isoformat()))
+                    c.execute("INSERT INTO calendar_events (task_id, graph_id, day, event_id, fingerprint, updated_at, "
+                              "start_utc, end_utc, template, days) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                              "ON CONFLICT(task_id, graph_id, day) DO UPDATE SET event_id=excluded.event_id, "
+                              "fingerprint=excluded.fingerprint, updated_at=excluded.updated_at, "
+                              "start_utc=excluded.start_utc, end_utc=excluded.end_utc, "
+                              "template=excluded.template, days=excluded.days",
+                              (task_id, gid, day, event_id, fp, datetime.utcnow().isoformat(),
+                               ev["start"]["dateTime"], ev["end"]["dateTime"], meta.get("template"), meta.get("days")))
                 done["updated" if row else "created"] += 1
             except Exception as e:
                 done["failed"] += 1
@@ -368,6 +399,131 @@ def sweep(days_back=1, days_ahead=None):
     return totals
 
 
+# ---- Outlook → Arrivy ---------------------------------------------------------
+
+def _record(task, action, event_type="CAL_OUTLOOK"):
+    """Log a read-back outcome to the app log and the dashboard."""
+    log.info(f"calendar read-back: {action}")
+    if on_event:
+        try:
+            deal = _deal_id(task) if task else None
+            on_event(int(deal) if deal else None, int(task["id"]) if task else None, event_type,
+                     {"source": "outlook", "TITLE": (task or {}).get("title")}, action)
+        except Exception:
+            log.exception("calendar: dashboard log failed")
+
+
+def _batch_get(paths):
+    """GET many Graph paths via /$batch (20 per call); returns {path: (status, body)}."""
+    out = {}
+    for i in range(0, len(paths), 20):
+        chunk = paths[i:i + 20]
+        r = _graph("POST", "/$batch", json={"requests": [
+            {"id": str(n), "method": "GET", "url": p} for n, p in enumerate(chunk)]})
+        r.raise_for_status()
+        for resp in r.json().get("responses", []):
+            out[chunk[int(resp["id"])]] = (resp.get("status"), resp.get("body") or {})
+    return out
+
+
+def _utc(graph_dt):
+    """Graph {'dateTime': '2026-10-20T17:00:00.0000000', 'timeZone': 'UTC'} → 'YYYY-MM-DDTHH:MM:SS'."""
+    return (graph_dt or {}).get("dateTime", "")[:19]
+
+
+def _can_reschedule(graph_id):
+    with _conn() as c:
+        row = c.execute("SELECT COALESCE(display_name, username) AS name, cal_can_reschedule FROM users "
+                        "WHERE m365_graph_id=?", (graph_id,)).fetchone()
+    return (row["name"], bool(row["cal_can_reschedule"])) if row else (graph_id, False)
+
+
+def push_reschedule(task_id, start_utc, end_utc):
+    """Move an Arrivy task to new times (UTC 'YYYY-MM-DDTHH:MM:SS'); returns the updated task."""
+    task = fetch_task(task_id)
+    tz = _zone(task.get("start_datetime_timezone")) if task else _zone(None)
+    s = datetime.fromisoformat(start_utc).replace(tzinfo=timezone.utc).astimezone(tz)
+    e = datetime.fromisoformat(end_utc).replace(tzinfo=timezone.utc).astimezone(tz)
+    r = requests.put(f"{ARRIVY_BASE}/tasks/{task_id}", headers=_arrivy_headers(), timeout=30,
+                     json={"start_datetime": s.isoformat(), "end_datetime": e.isoformat(),
+                           "duration": int((e - s).total_seconds() // 60)})
+    if r.status_code >= 400:
+        raise RuntimeError(f"Arrivy PUT /tasks/{task_id} -> HTTP {r.status_code}: {r.text[:200]}")
+    return r.json() if r.content else {}
+
+
+def _put_back(row, task, why):
+    """Undo an Outlook-side change by rewriting the event from Arrivy on the next reconcile."""
+    with _conn() as c:
+        c.execute("UPDATE calendar_events SET fingerprint='' WHERE task_id=? AND graph_id=? AND day=?",
+                  (row["task_id"], row["graph_id"], row["day"]))
+    sync_task(row["task_id"])
+    _record(task, why, "CAL_OUTLOOK_REVERTED")
+
+
+def poll_outlook():
+    """Read the synced, upcoming events back from Outlook and act on any changes (see module doc)."""
+    if MODE != "on":
+        return None
+    with _conn() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM calendar_events WHERE day >= ? AND start_utc IS NOT NULL",
+            (date.today().isoformat(),))]
+    if not rows:
+        return {"checked": 0}
+    paths = {f"/users/{r['graph_id']}/events/{r['event_id']}?$select=start,end,isCancelled": r for r in rows}
+    results = _batch_get(list(paths))
+    moved = reverted = recreated = 0
+    for path, row in paths.items():
+        status, body = results.get(path, (None, {}))
+        if status == 404 or (status == 200 and body.get("isCancelled")):
+            # Deleted in Outlook: never cancels the job — put the event back.
+            with _conn() as c:
+                c.execute("UPDATE calendar_events SET fingerprint='' WHERE task_id=? AND graph_id=? AND day=?",
+                          (row["task_id"], row["graph_id"], row["day"]))
+            sync_task(row["task_id"])
+            recreated += 1
+            continue
+        if status != 200:
+            continue
+        new_s, new_e = _utc(body.get("start")), _utc(body.get("end"))
+        if (new_s, new_e) == (row["start_utc"], row["end_utc"]) or not new_s or not new_e:
+            continue
+        task = fetch_task(row["task_id"])
+        who, allowed = _can_reschedule(row["graph_id"])
+        label = (TEMPLATE_LABELS.get(row["template"]) or "task")
+        if not task:
+            continue   # task deleted in Arrivy; the next reconcile removes the event
+        if not allowed:
+            _put_back(row, task, f"{who} moved {label} {row['task_id']} in Outlook but can't reschedule from Outlook — put back")
+            reverted += 1
+        elif row["template"] not in READBACK_TEMPLATES or (row["days"] or 1) > 1:
+            _put_back(row, task, f"{who} moved {label} {row['task_id']} in Outlook — only single-day measures and inspections can be rescheduled there — put back")
+            reverted += 1
+        elif new_e <= new_s:
+            _put_back(row, task, f"{who} gave {label} {row['task_id']} an end before its start in Outlook — put back")
+            reverted += 1
+        else:
+            try:
+                push_reschedule(row["task_id"], new_s, new_e)
+            except Exception as e:
+                _put_back(row, task, f"Arrivy refused {who}'s Outlook reschedule of {label} {row['task_id']}: {str(e)[:160]} — put back")
+                reverted += 1
+                continue
+            with _conn() as c:   # Outlook already shows the new time; don't treat it as a change again
+                c.execute("UPDATE calendar_events SET start_utc=?, end_utc=? WHERE task_id=? AND graph_id=? AND day=?",
+                          (new_s, new_e, row["task_id"], row["graph_id"], row["day"]))
+            tz = _zone(task.get("start_datetime_timezone"))
+            fmt = lambda u: datetime.fromisoformat(u).replace(tzinfo=timezone.utc).astimezone(tz).strftime("%a %m/%d %I:%M %p")
+            _record(task, f"{who} rescheduled {label} {row['task_id']} from Outlook to {fmt(new_s)}–{fmt(new_e)[-8:]} — updated in Arrivy",
+                    "CAL_OUTLOOK_RESCHEDULED")
+            enqueue(row["task_id"])   # bring every other assignee's copy along
+            moved += 1
+    if moved or reverted or recreated:
+        log.info(f"calendar read-back: checked {len(rows)}, rescheduled {moved}, put back {reverted}, recreated {recreated}")
+    return {"checked": len(rows), "rescheduled": moved, "reverted": reverted, "recreated": recreated}
+
+
 # ---- Background workers ------------------------------------------------------
 
 def enqueue(task_id):
@@ -403,6 +559,16 @@ def _sweeper():
         time.sleep(SWEEP_MINUTES * 60)
 
 
+def _reader():
+    time.sleep(90)
+    while True:
+        try:
+            poll_outlook()
+        except Exception:
+            log.exception("calendar read-back crashed")
+        time.sleep(READBACK_MINUTES * 60)
+
+
 def start():
     """Start the worker and sweeper threads (once per process). No-op when off."""
     global _started
@@ -412,4 +578,6 @@ def start():
     init_schema()
     threading.Thread(target=_worker, name="calendar-worker", daemon=True).start()
     threading.Thread(target=_sweeper, name="calendar-sweeper", daemon=True).start()
+    if MODE == "on":
+        threading.Thread(target=_reader, name="calendar-reader", daemon=True).start()
     log.info(f"calendar sync started ({MODE}); sweep every {SWEEP_MINUTES} min, {SWEEP_DAYS} days ahead")

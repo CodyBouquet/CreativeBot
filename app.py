@@ -230,7 +230,8 @@ def init_db():
                 arrivy_entity_id  TEXT,
                 pipedrive_user_id TEXT,
                 rm_sales_id       TEXT,
-                rm_branch         TEXT
+                rm_branch         TEXT,
+                cal_can_reschedule INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS access_log (
@@ -283,6 +284,8 @@ def init_db():
         u_cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
         if "rm_branch" not in u_cols:
             conn.execute("ALTER TABLE users ADD COLUMN rm_branch TEXT")
+        if "cal_can_reschedule" not in u_cols:   # may move Measures/Inspections from Outlook (calendar_sync)
+            conn.execute("ALTER TABLE users ADD COLUMN cal_can_reschedule INTEGER NOT NULL DEFAULT 0")
         # An external account maps to at most one person (NULLs don't collide).
         conn.executescript("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_users_m365      ON users(m365_graph_id);
@@ -894,7 +897,8 @@ def _probe_health():
     """
     with get_db() as conn:
         last_arrivy = conn.execute(
-            "SELECT received_at FROM events WHERE event_type NOT LIKE 'RM_%' AND event_type != 'BLOCKED' "
+            "SELECT received_at FROM events WHERE event_type NOT LIKE 'RM_%' AND event_type NOT LIKE 'CAL_%' "
+            "AND event_type != 'BLOCKED' "
             "ORDER BY received_at DESC LIMIT 1").fetchone()
         last_rm = conn.execute(
             "SELECT received_at, event_type FROM events WHERE event_type LIKE 'RM_%' "
@@ -1046,6 +1050,8 @@ _EVENT_LABELS = {
     "RM_MATERIAL_DRYRUN":           "COSTING DRY RUN",
     "RM_MATERIAL_FAILED":           "COSTING FAILED",
     "BLOCKED":                      "BLOCKED",
+    "CAL_OUTLOOK_RESCHEDULED":      "OUTLOOK RESCHEDULE",
+    "CAL_OUTLOOK_REVERTED":         "OUTLOOK PUT BACK",
 }
 
 
@@ -1101,7 +1107,7 @@ def users():
 _USER_SELECT = """
     SELECT u.id, u.username, u.display_name, u.role, u.created_at, u.pi_access,
            u.pin IS NOT NULL AS has_pin, u.m365_graph_id, u.arrivy_entity_id,
-           u.pipedrive_user_id, u.rm_sales_id, u.rm_branch,
+           u.pipedrive_user_id, u.rm_sales_id, u.rm_branch, u.cal_can_reschedule,
            m.display_name AS m365_name, m.email AS m365_email, m.active AS m365_active
     FROM users u LEFT JOIN m365_users m ON m.graph_id = u.m365_graph_id
 """
@@ -1117,6 +1123,8 @@ def _user_changes(data):
         out["role"] = data["role"]
     if "pi_access" in data:
         out["pi_access"] = 1 if data["pi_access"] else 0
+    if "cal_can_reschedule" in data:
+        out["cal_can_reschedule"] = 1 if data["cal_can_reschedule"] else 0
     pin = str(data.get("pin") or "").strip()
     if pin:
         if not pin.isdigit() or len(pin) != 4:
@@ -2003,7 +2011,14 @@ def health():
 # ---------------------------------------------------------------------------
 init_db()
 app.register_blueprint(reports_bp)
-calendar_sync.start()   # Arrivy → M365 calendars; no-op unless M365_CALENDAR_SYNC is dry/on
+def _calendar_event(deal_id, task_id, event_type, payload, action):
+    """calendar_sync's dashboard hook: log an Outlook read-back outcome like any other event."""
+    with get_db() as conn:
+        store_event(conn, deal_id, task_id, event_type, "calendar", payload, action)
+    sse_notify()
+
+calendar_sync.on_event = _calendar_event
+calendar_sync.start()   # Arrivy ⇄ M365 calendars; no-op unless M365_CALENDAR_SYNC is dry/on
 if RM_SYNC_SECRET:
     # Pull the customer-id list off-thread so the first sync webhook doesn't have
     # to wait on a multi-minute /customers walk.
