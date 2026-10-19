@@ -820,12 +820,12 @@
       })).json();
       renderUsers();
       const c = preview.created.length, u = preview.updated.length;
-      if (!c && !u) { alert('Everyone found in M365, Arrivy and Pipedrive is already mapped.'); return; }
+      if (!c && !u) { alert('Everyone in the M365 group is already on the list and mapped as far as names and emails allow.'); return; }
       const lines = [];
       if (u) lines.push(`Fill in missing links for ${u} existing user${u > 1 ? 's' : ''}:`,
                         ...preview.updated.slice(0, 8).map(x => `  ${x.username} (${x.links.map(shortSys).join(', ')})`),
                         ...(u > 8 ? [`  …and ${u - 8} more`] : []));
-      if (c) lines.push(`Add ${c} mapping-only ${c > 1 ? 'people' : 'person'} (no Pi access):`,
+      if (c) lines.push(`Add ${c} M365 group member${c > 1 ? 's' : ''} (no Pi access):`,
                         ...preview.created.slice(0, 12).map(x => `  ${x.name} (${x.links.map(shortSys).join(', ')})`),
                         ...(c > 12 ? [`  …and ${c - 12} more`] : []));
       lines.push('', 'Nothing already mapped is changed. Continue?');

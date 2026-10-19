@@ -1243,9 +1243,10 @@ def api_user_import():
     Admin JSON endpoint: match people across M365, Arrivy and Pipedrive (email,
     then name) and fill in the mappings, then attach each person's Rollmaster
     sales rep (and branch, when the rep works out of just one). Existing users
-    only get links they don't have yet — nothing is overwritten; unmatched
-    people are added as mapping-only users without Pi access. Rollmaster reps
-    are only attached, never added as people. {"apply": false} previews the plan.
+    only get links they don't have yet — nothing is overwritten. Only members
+    of the M365 group become new people (mapping-only, no Pi access); Arrivy,
+    Pipedrive and Rollmaster accounts are attached to them, never added on
+    their own. {"apply": false} previews the plan.
     """
     apply = bool((request.get_json(silent=True) or {}).get("apply"))
     dir_data = user_directory.directory()
@@ -1271,8 +1272,8 @@ def api_user_import():
                 continue
             nm = user_directory.norm_name(c["name"])
             match = next((u for u in users if any(u[f] and u[f] == c.get(f) for f in links)), None) \
-                or next((u for u in users if nm and nm in (user_directory.norm_name(u["display_name"]),
-                                                          user_directory.norm_name(u["username"]))), None)
+                or next((u for u in users if nm and all(not u[f] for f in want)  # a name match never displaces a link
+                         and nm in (user_directory.norm_name(u["display_name"]), user_directory.norm_name(u["username"]))), None)
             if match:
                 fill = {f: v for f, v in want.items() if not match[f]}
                 if not fill:
@@ -1286,7 +1287,7 @@ def api_user_import():
                 match.update(fill)
                 if "m365_graph_id" in fill:
                     match["m365_email"] = match["m365_email"] or c["email"]
-            else:
+            elif c.get("m365_graph_id"):
                 username = user_directory.username_for(c["name"], taken)
                 taken.add(username)
                 new_user = {"id": None, "username": username, "display_name": c["name"], "m365_email": c["email"],
