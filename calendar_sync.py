@@ -259,9 +259,6 @@ def event_body(task, day_index, day_count, crew_names):
     parts.append("<br>" + html.escape(NOTES_START if editable else NOTES_START_RO) + "<br>")
     parts.append(html.escape(notes).replace("\n", "<br>") + "<br>" if notes else "<br>")
     parts.append(html.escape(NOTES_END) + "<br>")
-    parts.append("<br><i>Synced from Arrivy by CreativeBot — "
-                 + ("only edits to the notes are kept; other changes are overwritten." if editable
-                    else "changes made here are overwritten.") + "</i>")
     return {
         "subject": subject[:255],
         "body": {"contentType": "HTML", "content": "".join(parts)},
