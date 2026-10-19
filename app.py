@@ -138,7 +138,7 @@ RM_CUSTOMER_DEFAULTS = {
 RM_PD_CID_FIELD = os.environ.get("RM_PD_CID_FIELD", "509740a9dad0eab9c7c83842beefb2eda43ae199")
 # A new customer is filed under its Pipedrive owner's Rollmaster salesperson id
 # (C_SLSID), taken from the Users page mapping (Pipedrive user → RM sales id) —
-# see _resolve_salesperson. RM_SALESPERSON_MAP is an optional env override, a JSON
+# see _resolve_owner_defaults. RM_SALESPERSON_MAP is an optional env override, a JSON
 # object keyed by owner name or Pipedrive user id; it wins over the Users page.
 # Owners with no mapping fall back to RM_C_SLSID.
 try:
@@ -151,6 +151,17 @@ except ValueError:
 # not the Rollmaster warehouse, which is always 1); any number already assigned
 # to someone is offered too.
 RM_BRANCHES = [b.strip() for b in os.environ.get("RM_BRANCHES", "1,2,3").split(",") if b.strip()]
+
+# Rollmaster tax code (C_TAXID) a NEW customer gets from its Pipedrive owner's
+# branch on the Users page. JSON {branch: code}; codes are Rollmaster's /taxcode
+# keys (USE = Illinois use tax, USE-IN = Indiana use tax). A branch not listed
+# leaves C_TAXID blank, as before.
+try:
+    RM_BRANCH_TAX_CODES = {str(k): v for k, v in json.loads(
+        os.environ.get("RM_BRANCH_TAX_CODES", '{"1": "USE", "3": "USE-IN"}')).items()}
+except ValueError:
+    RM_BRANCH_TAX_CODES = {"1": "USE", "3": "USE-IN"}
+    logging.warning("RM_BRANCH_TAX_CODES is not valid JSON — using the built-in branch tax codes")
 
 ALLOWED_DASHBOARD_IPS = {"127.0.0.1", "::1", "10.54.10.135"}
 DASHBOARD_ENDPOINTS  = {"landing", "sync_dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout", "api_health",
@@ -1699,7 +1710,7 @@ def map_pipedrive_customer(payload):
     owner   = _pd_value(payload, "salesperson")
     # Fixed default > a bare code passed in the payload (≤6 chars, so a full owner
     # name never lands in C_SLSID by accident). A new customer's owner mapping is
-    # applied later, by _resolve_salesperson.
+    # applied later, by _resolve_owner_defaults.
     slsid   = (RM_CUSTOMER_DEFAULTS["C_SLSID"]
                or (owner if len(owner) <= 6 else ""))
 
@@ -1737,42 +1748,47 @@ def map_pipedrive_customer(payload):
     return _normalize_customer_fields(fields), name
 
 
-def _salesperson_for_owner(owner_id=None, owner_name=""):
-    """Rollmaster salesperson id for a Pipedrive owner: RM_SALESPERSON_MAP first, then
-    the Users page mapping (by Pipedrive user id, else by name). '' when unmapped."""
-    for key in (str(owner_id or ""), owner_name):
-        if key and RM_SALESPERSON_MAP.get(key):
-            return RM_SALESPERSON_MAP[key]
+def _owner_user(owner_id=None, owner_name=""):
+    """The Users-page person behind a Pipedrive owner — by Pipedrive user id, else by
+    name — as {rm_sales_id, rm_branch}, or None when nobody is mapped."""
     with get_db() as conn:
         if owner_id:
-            row = conn.execute("SELECT rm_sales_id FROM users WHERE pipedrive_user_id=? AND rm_sales_id IS NOT NULL",
+            row = conn.execute("SELECT rm_sales_id, rm_branch FROM users WHERE pipedrive_user_id=?",
                                (str(owner_id),)).fetchone()
             if row:
-                return row["rm_sales_id"]
+                return dict(row)
         nm = user_directory.norm_name(owner_name)
         if nm:
             for row in conn.execute(
-                    "SELECT u.display_name, u.username, m.display_name AS m365_name, u.rm_sales_id FROM users u "
-                    "LEFT JOIN m365_users m ON m.graph_id = u.m365_graph_id WHERE u.rm_sales_id IS NOT NULL"):
+                    "SELECT u.display_name, u.username, m.display_name AS m365_name, u.rm_sales_id, u.rm_branch "
+                    "FROM users u LEFT JOIN m365_users m ON m.graph_id = u.m365_graph_id"):
                 if nm in {user_directory.norm_name(row[k]) for k in ("display_name", "username", "m365_name")}:
-                    return row["rm_sales_id"]
-    return ""
+                    return {"rm_sales_id": row["rm_sales_id"], "rm_branch": row["rm_branch"]}
+    return None
 
 
-def _resolve_salesperson(payload, fields, deal_id, person_id):
+def _resolve_owner_defaults(payload, fields, deal_id, person_id):
     """
-    Set fields["C_SLSID"] for a NEW customer (updates never touch the salesperson)
-    and return a short note on where it came from, for the event log.
+    For a NEW customer (updates never touch either), file it under its Pipedrive
+    owner: C_SLSID = the owner's Rollmaster sales rep, C_TAXID = the tax code for
+    the owner's branch (RM_BRANCH_TAX_CODES). Returns a short note for the event log.
 
-    A code sent in the payload stands. Otherwise the owner is the one the payload
+    A value sent in the payload stands. Otherwise the owner is the one the payload
     names, else the deal's owner, else the person's owner, read from Pipedrive.
-    An owner with no mapping — or a Pipedrive lookup that fails — leaves the
-    RM_C_SLSID default in place rather than holding up the create.
+    RM_SALESPERSON_MAP still overrides the rep. An unmapped owner — or a Pipedrive
+    lookup that fails — keeps the defaults rather than holding up the create.
     """
     keys = {str(k).strip().lower() for k in (payload or {})}
-    if keys & {"c_slsid", "slsid"}:
-        return f"salesperson {fields['C_SLSID']} (from payload)"
-    owner_id, owner_name = None, _pd_value(payload, "salesperson")
+    sls_given = bool(keys & {"c_slsid", "slsid"})
+    tax_given = bool(keys & {"c_taxid", "taxid"})
+
+    def note(sls_why, tax_why):
+        return (f"salesperson {fields['C_SLSID'] or '(none)'} ({sls_why}), "
+                f"tax {fields.get('C_TAXID') or '(none)'} ({tax_why})")
+
+    if sls_given and tax_given:
+        return note("from payload", "from payload")
+    owner_id, owner_name = None, _pd_value(payload, "salesperson") if not sls_given else ""
     if owner_name.isdigit():
         owner_id, owner_name = owner_name, ""
     if not owner_id and not owner_name:
@@ -1789,15 +1805,35 @@ def _resolve_salesperson(payload, fields, deal_id, person_id):
                 owner_id = owner
         except Exception as e:
             logger.warning(f"rm-customer-sync: could not read the Pipedrive owner: {_scrub_token(e)}")
-            return f"salesperson {fields['C_SLSID'] or '(none)'} (default — Pipedrive owner lookup failed)"
+            return note("from payload" if sls_given else "default — Pipedrive owner lookup failed",
+                        "from payload" if tax_given else "default — Pipedrive owner lookup failed")
     who = owner_name or (f"user {owner_id}" if owner_id else "")
     if not who:
-        return f"salesperson {fields['C_SLSID'] or '(none)'} (default — no owner)"
-    code = _salesperson_for_owner(owner_id, owner_name)
-    if code:
-        fields["C_SLSID"] = code
-        return f"salesperson {code} ({who})"
-    return f"salesperson {fields['C_SLSID'] or '(none)'} (default — {who} has no RM sales id on the Users page)"
+        return note("from payload" if sls_given else "default — no owner",
+                    "from payload" if tax_given else "default — no owner")
+    user = _owner_user(owner_id, owner_name) or {}
+
+    sls_why = "from payload"
+    if not sls_given:
+        code = next((RM_SALESPERSON_MAP[k] for k in (str(owner_id or ""), owner_name)
+                     if k and RM_SALESPERSON_MAP.get(k)), None) or user.get("rm_sales_id")
+        if code:
+            fields["C_SLSID"] = code
+            sls_why = who
+        else:
+            sls_why = f"default — {who} has no RM sales rep on the Users page"
+    tax_why = "from payload"
+    if not tax_given:
+        branch = user.get("rm_branch")
+        tax = RM_BRANCH_TAX_CODES.get(str(branch)) if branch else None
+        if tax:
+            fields["C_TAXID"] = tax
+            tax_why = f"{who}, branch {branch}"
+        elif branch:
+            tax_why = f"default — no tax code set for branch {branch}"
+        else:
+            tax_why = f"default — {who} has no branch on the Users page"
+    return note(sls_why, tax_why)
 
 
 def _cid_write_back_target(person_id):
@@ -1944,7 +1980,7 @@ def rm_customer_sync():
                 out["pipedrive"]  = _write_cid_to_person(person_id, existing_cid, deal_id)
             return jsonify(out), 200
 
-        sls_note = _resolve_salesperson(payload, fields, deal_id, person_id)
+        sls_note = _resolve_owner_defaults(payload, fields, deal_id, person_id)
         if not RM_CUSTOMER_SYNC_ENABLED:
             first, last = rollmaster.split_name(name)
             try:
