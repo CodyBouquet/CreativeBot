@@ -31,6 +31,12 @@ webhook then carries either on to Pipedrive and the other assignees'
 calendars. Any other change (no permission, other task types, multi-day
 jobs) is put back to what Arrivy says.
 
+Notes: the event body carries the task's Arrivy Details between two marker
+lines. On Measures and Inspections anyone mapped may edit that text in
+Outlook; the read-back pushes it to Arrivy's Details (and so to every other
+assignee's copy). On other task types the notes are shown read-only. If the
+markers are missing or mangled the edit is ignored, never guessed at.
+
 M365_CALENDAR_SYNC: "off" (default), "dry" (log what it would do, write
 nothing), "on".
 """
@@ -75,6 +81,11 @@ TEMPLATE_LABELS = {
 }
 # Templates an Outlook reschedule may write back to Arrivy (Measure, Inspection).
 READBACK_TEMPLATES = {5627485400596480, 5546469558321152}
+# Lines framing the editable notes in the event body (plain text so they
+# survive Outlook's HTML→text conversion on every client).
+NOTES_START = "===== NOTES (edits here sync to Arrivy) ====="
+NOTES_START_RO = "===== NOTES (from Arrivy) ====="
+NOTES_END = "===== END NOTES ====="
 # Arrivy statuses whose task no longer happens.
 GONE_STATUSES = {"CANCELLED", "CANCEL"}
 
@@ -115,7 +126,7 @@ def init_schema():
         """)
         # What was last written (UTC) and the task's shape, for reading Outlook changes back.
         cols = {r[1] for r in c.execute("PRAGMA table_info(calendar_events)")}
-        for col in ("start_utc TEXT", "end_utc TEXT", "template INTEGER", "days INTEGER"):
+        for col in ("start_utc TEXT", "end_utc TEXT", "template INTEGER", "days INTEGER", "notes TEXT"):
             if col.split()[0] not in cols:
                 c.execute(f"ALTER TABLE calendar_events ADD COLUMN {col}")
 
@@ -236,19 +247,21 @@ def event_body(task, day_index, day_count, crew_names):
     address = (task.get("customer_address") or ", ".join(p for p in (
         task.get("customer_address_line_1"), task.get("customer_city"),
         task.get("customer_state"), task.get("customer_zipcode")) if p) or "").strip()
-    phone = task.get("customer_mobile_number") or task.get("customer_phone") or ""
     deal = _deal_id(task)
-    rows = [
-        ("Customer", customer), ("Phone", phone), ("Address", address),
-        ("Arrivy", task.get("title") or ""), ("Assigned", ", ".join(sorted(crew_names))),
-    ]
+    # Customer name is in the subject and the address in the location, so the
+    # body skips them.
+    rows = [("Arrivy", task.get("title") or ""), ("Assigned", ", ".join(sorted(crew_names)))]
     parts = [f"<b>{html.escape(k)}:</b> {html.escape(str(v))}<br>" for k, v in rows if v]
     if deal:
         parts.append(f'<b>Pipedrive:</b> <a href="https://app.pipedrive.com/deal/{deal}">deal {deal}</a><br>')
+    editable = task.get("template") in READBACK_TEMPLATES
     notes = (task.get("details") or "").strip()
-    if notes:
-        parts.append("<br>" + html.escape(notes).replace("\n", "<br>"))
-    parts.append("<br><i>Synced from Arrivy by CreativeBot — changes made here are overwritten.</i>")
+    parts.append("<br>" + html.escape(NOTES_START if editable else NOTES_START_RO) + "<br>")
+    parts.append(html.escape(notes).replace("\n", "<br>") + "<br>" if notes else "<br>")
+    parts.append(html.escape(NOTES_END) + "<br>")
+    parts.append("<br><i>Synced from Arrivy by CreativeBot — "
+                 + ("only edits to the notes are kept; other changes are overwritten." if editable
+                    else "changes made here are overwritten.") + "</i>")
     return {
         "subject": subject[:255],
         "body": {"contentType": "HTML", "content": "".join(parts)},
@@ -332,13 +345,14 @@ def sync_task(task_id, task=None, fetched=False):
                     event_id = r.json()["id"]
                 with _conn() as c:
                     c.execute("INSERT INTO calendar_events (task_id, graph_id, day, event_id, fingerprint, updated_at, "
-                              "start_utc, end_utc, template, days) VALUES (?,?,?,?,?,?,?,?,?,?) "
+                              "start_utc, end_utc, template, days, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
                               "ON CONFLICT(task_id, graph_id, day) DO UPDATE SET event_id=excluded.event_id, "
                               "fingerprint=excluded.fingerprint, updated_at=excluded.updated_at, "
                               "start_utc=excluded.start_utc, end_utc=excluded.end_utc, "
-                              "template=excluded.template, days=excluded.days",
+                              "template=excluded.template, days=excluded.days, notes=excluded.notes",
                               (task_id, gid, day, event_id, fp, datetime.utcnow().isoformat(),
-                               ev["start"]["dateTime"], ev["end"]["dateTime"], meta.get("template"), meta.get("days")))
+                               ev["start"]["dateTime"], ev["end"]["dateTime"], meta.get("template"),
+                               meta.get("days"), None))   # notes: re-read from Outlook as the new baseline
                 done["updated" if row else "created"] += 1
             except Exception as e:
                 done["failed"] += 1
@@ -416,12 +430,14 @@ def _record(task, action, event_type="CAL_OUTLOOK"):
 
 
 def _batch_get(paths):
-    """GET many Graph paths via /$batch (20 per call); returns {path: (status, body)}."""
+    """GET many Graph paths via /$batch (20 per call); returns {path: (status, body)}.
+    Bodies come back as plain text (Prefer header), which is what notes are read from."""
     out = {}
     for i in range(0, len(paths), 20):
         chunk = paths[i:i + 20]
         r = _graph("POST", "/$batch", json={"requests": [
-            {"id": str(n), "method": "GET", "url": p} for n, p in enumerate(chunk)]})
+            {"id": str(n), "method": "GET", "url": p,
+             "headers": {"Prefer": 'outlook.body-content-type="text"'}} for n, p in enumerate(chunk)]})
         r.raise_for_status()
         for resp in r.json().get("responses", []):
             out[chunk[int(resp["id"])]] = (resp.get("status"), resp.get("body") or {})
@@ -431,6 +447,40 @@ def _batch_get(paths):
 def _utc(graph_dt):
     """Graph {'dateTime': '2026-10-20T17:00:00.0000000', 'timeZone': 'UTC'} → 'YYYY-MM-DDTHH:MM:SS'."""
     return (graph_dt or {}).get("dateTime", "")[:19]
+
+
+def norm_notes(text):
+    """Notes as compared across Arrivy and Outlook: no nbsp, no trailing spaces, at most one blank line."""
+    lines = [ln.replace("\xa0", " ").rstrip() for ln in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    out = []
+    for ln in lines:
+        if ln == "" and (not out or out[-1] == ""):
+            continue
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
+def notes_key(text):
+    """What counts as a change: the non-blank lines, trimmed (Outlook clients add blank lines and spaces)."""
+    return "\n".join(ln.strip() for ln in norm_notes(text).split("\n") if ln.strip())
+
+
+def notes_from_body(text):
+    """The editable notes from an event body read as text, or None when the markers aren't intact."""
+    if not text or NOTES_START not in text:
+        return None
+    after = text.split(NOTES_START, 1)[1]
+    if NOTES_END not in after:
+        return None
+    return norm_notes(after.split(NOTES_END, 1)[0])
+
+
+def push_notes(task_id, notes):
+    """Replace an Arrivy task's Details with notes edited in Outlook."""
+    r = requests.put(f"{ARRIVY_BASE}/tasks/{task_id}", headers=_arrivy_headers(), timeout=30,
+                     json={"details": notes})
+    if r.status_code >= 400:
+        raise RuntimeError(f"Arrivy PUT /tasks/{task_id} -> HTTP {r.status_code}: {r.text[:200]}")
 
 
 def _can_reschedule(graph_id):
@@ -483,9 +533,11 @@ def poll_outlook():
             (date.today().isoformat(),))]
     if not rows:
         return {"checked": 0}
-    paths = {f"/users/{r['graph_id']}/events/{r['event_id']}?$select=start,end,isCancelled": r for r in rows}
+    paths = {f"/users/{r['graph_id']}/events/{r['event_id']}?$select=start,end,isCancelled"
+             + (",body" if r["template"] in READBACK_TEMPLATES else ""): r for r in rows}
     results = _batch_get(list(paths))
-    moved = reverted = recreated = cancelled = 0
+    moved = reverted = recreated = cancelled = noted = 0
+    notes_done = set()
     for path, row in paths.items():
         status, body = results.get(path, (None, {}))
         if status == 404 or (status == 200 and body.get("isCancelled")):
@@ -522,6 +574,33 @@ def poll_outlook():
             continue
         if status != 200:
             continue
+        edited = notes_from_body((body.get("body") or {}).get("content")) \
+            if row["template"] in READBACK_TEMPLATES and row["task_id"] not in notes_done else None
+        if edited is not None and row["notes"] is None:
+            # First look since the event was written: what Outlook shows is the baseline.
+            with _conn() as c:
+                c.execute("UPDATE calendar_events SET notes=? WHERE task_id=? AND graph_id=? AND day=?",
+                          (edited, row["task_id"], row["graph_id"], row["day"]))
+        elif edited is not None:
+            if notes_key(edited) != notes_key(row["notes"]):
+                who, _ = _can_reschedule(row["graph_id"])
+                label = TEMPLATE_LABELS.get(row["template"]) or "task"
+                task = fetch_task(row["task_id"])
+                if task and str(task.get("status") or "").upper() not in GONE_STATUSES:
+                    try:
+                        push_notes(row["task_id"], notes_key(edited))   # without the blank lines Outlook adds
+                        notes_done.add(row["task_id"])   # other copies still show the old text this round
+                        _record(task, f"{who} edited the notes on {label} {row['task_id']} in Outlook — updated in Arrivy",
+                                "CAL_OUTLOOK_NOTES")
+                        if (_utc(body.get("start")), _utc(body.get("end"))) == (row["start_utc"], row["end_utc"]):
+                            sync_task(row["task_id"])   # rewrite every copy now, so none can push stale notes back
+                        else:
+                            enqueue(row["task_id"])     # the time edit below is handled first
+                        noted += 1
+                    except Exception as e:
+                        _put_back(row, task, f"Arrivy refused {who}'s Outlook notes on {label} {row['task_id']}: {str(e)[:160]} — put back")
+                        reverted += 1
+                        continue
         new_s, new_e = _utc(body.get("start")), _utc(body.get("end"))
         if (new_s, new_e) == (row["start_utc"], row["end_utc"]) or not new_s or not new_e:
             continue
@@ -555,10 +634,10 @@ def poll_outlook():
                     "CAL_OUTLOOK_RESCHEDULED")
             enqueue(row["task_id"])   # bring every other assignee's copy along
             moved += 1
-    if moved or reverted or recreated or cancelled:
+    if moved or reverted or recreated or cancelled or noted:
         log.info(f"calendar read-back: checked {len(rows)}, rescheduled {moved}, cancelled {cancelled}, "
-                 f"put back {reverted}, recreated {recreated}")
-    return {"checked": len(rows), "rescheduled": moved, "cancelled": cancelled,
+                 f"notes {noted}, put back {reverted}, recreated {recreated}")
+    return {"checked": len(rows), "rescheduled": moved, "cancelled": cancelled, "notes": noted,
             "reverted": reverted, "recreated": recreated}
 
 
