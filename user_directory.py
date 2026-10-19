@@ -10,7 +10,7 @@ don't break it:
     m365_graph_id      → m365_users.graph_id (local copy of the M365 group)
     arrivy_entity_id   → Arrivy /entities id
     pipedrive_user_id  → Pipedrive /users id
-    rm_sales_id        → Rollmaster salesperson code (C_SLSID, e.g. "MRB")
+    rm_sales_id        → Rollmaster sales rep initials (/salesreps, = C_SLSID, e.g. "MRB")
     rm_branch          → branch number they work out of (not the RM warehouse)
 
 rm_sales_id is also kept on m365_users, where the sales reports read it, so a
@@ -24,6 +24,7 @@ import time
 
 import requests
 
+import rollmaster
 from email_reports import m365_directory
 
 log = logging.getLogger(__name__)
@@ -71,6 +72,17 @@ def _pipedrive_people():
     } for u in data["data"]]
 
 
+def _rm_people():
+    """Rollmaster sales reps as [{id (initials), name, email, active, branches}]. The
+    house account is listed (it's a valid code) but marked so matching skips it."""
+    out = []
+    for r in rollmaster.get_salesreps():
+        name = r["name"].title() if r["name"].isupper() else r["name"]
+        out.append({"id": r["initials"], "name": name, "email": r["email"], "active": r["active"],
+                    "branches": r["branches"], "house": r["initials"] == "HA" or "HOUSE" in r["name"].upper()})
+    return out
+
+
 def _m365_people():
     """Active members of the M365 group, from the local copy (refreshed by m365_directory.sync_users)."""
     return [{
@@ -84,7 +96,7 @@ def _m365_people():
 def directory(refresh=False):
     """
     Every person each system knows about, for the mapping dropdowns:
-    {m365: [...], arrivy: [...], pipedrive: [...], errors: {system: msg}}.
+    {m365: [...], arrivy: [...], pipedrive: [...], rm: [...], errors: {system: msg}}.
 
     Cached for CACHE_SECONDS; refresh=True also re-pulls the M365 group first.
     A system that can't be reached comes back empty with its error, so one
@@ -99,7 +111,7 @@ def directory(refresh=False):
         except Exception as e:
             log.warning(f"M365 group sync failed: {e}")
             errors["m365"] = f"Sync failed: {str(e)[:80]}"
-    for key, fn in (("m365", _m365_people), ("arrivy", _arrivy_people), ("pipedrive", _pipedrive_people)):
+    for key, fn in (("m365", _m365_people), ("arrivy", _arrivy_people), ("pipedrive", _pipedrive_people), ("rm", _rm_people)):
         try:
             out[key] = sorted(fn(), key=lambda p: (not p["active"], norm_name(p["name"])))
         except Exception as e:
@@ -119,6 +131,16 @@ def norm_name(name):
     return " ".join(re.sub(r"[^a-z]", " ", name.lower()).split())
 
 
+def name_key(name):
+    """Looser key for names that differ in middle names/initials: first + last word.
+    'MARK W COSTIGAN' / 'Mark Costigan' → 'mark costigan'. Suffixes stay, so
+    'Mark Bouquet Jr' and 'Mark Bouquet Sr' never collide."""
+    words = norm_name(name).split()
+    suffix = [w for w in words[1:] if w in ("jr", "sr", "ii", "iii", "iv")]
+    words = [w for w in words if w not in suffix and len(w) > 1]
+    return " ".join(([words[0], words[-1]] if len(words) > 1 else words) + suffix)
+
+
 def username_for(name, taken):
     """A unique lowercase username ('dave_ackman', 'dave_ackman2') for an imported person."""
     base = (norm_name(name).replace(" ", "_") or "user")[:28]
@@ -131,8 +153,11 @@ def username_for(name, taken):
 def match_people(dir_data):
     """
     Group the people in every system into one cluster per human: same email
-    first, else same normalized name. Inactive Pipedrive/Arrivy accounts are
-    left out. Returns [{name, email, m365_graph_id, arrivy_entity_id, pipedrive_user_id}].
+    first, else same normalized name. Inactive accounts are left out.
+    Returns [{name, email, m365_graph_id, arrivy_entity_id, pipedrive_user_id}].
+
+    Rollmaster reps are attached afterwards by attach_rm_reps — they only ever
+    join a person found elsewhere, never start one.
     """
     clusters = []
     by_email, by_name = {}, {}
@@ -161,3 +186,22 @@ def match_people(dir_data):
         if not c["name"]:
             c["name"] = c["email"].split("@")[0]
     return clusters
+
+
+def rm_rep_for(name, email, reps):
+    """The active Rollmaster rep (not the house account) for a person: same email,
+    else same name, else same first+last name — and only when exactly one rep
+    fits, so two similar names are left for a human."""
+    reps = [r for r in reps if r["active"] and not r.get("house")]
+    if email:
+        hits = [r for r in reps if r["email"] and r["email"] == email.lower()]
+        if len(hits) == 1:
+            return hits[0]
+    for key in (norm_name, name_key):
+        k = key(name)
+        hits = [r for r in reps if k and key(r["name"]) == k]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            return None
+    return None

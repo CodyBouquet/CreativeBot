@@ -132,6 +132,39 @@ def get(path, params, timeout=300):
     return data
 
 
+# Companies whose sales reps are offered on the Users page. Reps are set up per
+# company and branch, under the same initials everywhere.
+SALESREP_COMPANIES = [c.strip() for c in os.environ.get("RM_SALESREP_COMPANIES", f"{COMPANY},2").split(",") if c.strip()]
+# Placeholder rows /salesreps returns that aren't people.
+_NOT_A_REP = {"*!*"}
+
+
+def get_salesreps():
+    """
+    Every Rollmaster sales rep across SALESREP_COMPANIES, one entry per initials:
+    [{initials, name, email, active, branches}]. A rep counts as active when any
+    of their branch rows is; the company-99 row's name wins (company 2 sometimes
+    files a rep under a parent's name, e.g. MRB as plain "MARK BOUQUET").
+    """
+    reps = {}
+    for company in SALESREP_COMPANIES:
+        for row in get("salesreps", {"company": company}, timeout=60):
+            ini = str(row.get("SAL_INITIALS") or "").strip().upper()
+            if not ini or ini in _NOT_A_REP:
+                continue
+            rep = reps.setdefault(ini, {"initials": ini, "name": "", "email": "", "active": False, "branches": set()})
+            if not rep["name"]:
+                rep["name"] = " ".join(str(row.get("SAL_NAME") or "").split())
+            rep["email"] = rep["email"] or str(row.get("SLC_EMAIL") or "").strip().lower()
+            if str(row.get("SLC_INACTIVE") or "").upper() != "Y":
+                rep["active"] = True
+                if str(row.get("BRANCH") or "").strip():
+                    rep["branches"].add(str(row["BRANCH"]).strip())
+    for rep in reps.values():
+        rep["branches"] = sorted(rep["branches"], key=lambda b: (len(b), b))
+    return sorted(reps.values(), key=lambda r: r["initials"])
+
+
 def post_form(path, fields, timeout=120):
     """
     POST multipart/form-data to a BMS endpoint (the shape /customer expects) and

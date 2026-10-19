@@ -1227,20 +1227,13 @@ def api_user_update(user_id):
 @app.route("/api/users/directory")
 @admin_required
 def api_user_directory():
-    """Admin JSON endpoint: people in M365, Arrivy and Pipedrive for the mapping pickers,
-    plus the Rollmaster salesperson ids already in use. ?refresh=1 re-pulls (incl. the M365 group)."""
+    """Admin JSON endpoint: people in M365, Arrivy, Pipedrive and Rollmaster (sales reps) for the
+    mapping pickers, plus branch numbers. ?refresh=1 re-pulls (incl. the M365 group)."""
     data = dict(user_directory.directory(refresh=request.args.get("refresh") == "1"))
     with get_db() as conn:
-        codes = {r[0] for r in conn.execute(
-            "SELECT rm_sales_id FROM users WHERE rm_sales_id IS NOT NULL "
-            "UNION SELECT rm_sales_id FROM m365_users WHERE rm_sales_id IS NOT NULL")}
-    codes.update(v for v in RM_SALESPERSON_MAP.values() if v)
-    if RM_CUSTOMER_DEFAULTS["C_SLSID"]:
-        codes.add(RM_CUSTOMER_DEFAULTS["C_SLSID"])
-    data["rm_codes"] = sorted(codes)
-    with get_db() as conn:
         used = {r[0] for r in conn.execute("SELECT DISTINCT rm_branch FROM users WHERE rm_branch IS NOT NULL")}
-    data["branches"] = sorted(set(RM_BRANCHES) | used, key=int)
+    rep_branches = {b for r in data.get("rm", []) for b in r.get("branches", [])}
+    data["branches"] = sorted(set(RM_BRANCHES) | used | rep_branches, key=int)
     return jsonify(data)
 
 @app.route("/api/users/import", methods=["POST"])
@@ -1248,18 +1241,30 @@ def api_user_directory():
 def api_user_import():
     """
     Admin JSON endpoint: match people across M365, Arrivy and Pipedrive (email,
-    then name) and fill in the mappings. Existing users only get links they
-    don't have yet — nothing is overwritten; unmatched people are added as
-    mapping-only users without Pi access. {"apply": false} previews the plan.
+    then name) and fill in the mappings, then attach each person's Rollmaster
+    sales rep (and branch, when the rep works out of just one). Existing users
+    only get links they don't have yet — nothing is overwritten; unmatched
+    people are added as mapping-only users without Pi access. Rollmaster reps
+    are only attached, never added as people. {"apply": false} previews the plan.
     """
     apply = bool((request.get_json(silent=True) or {}).get("apply"))
-    clusters = user_directory.match_people(user_directory.directory())
+    dir_data = user_directory.directory()
+    clusters = user_directory.match_people(dir_data)
+    reps = dir_data.get("rm", [])
     links = ("m365_graph_id", "arrivy_entity_id", "pipedrive_user_id")
-    created, updated = [], []
+    created, updated = {}, {}   # username → plan entry
     with get_db() as conn:
-        users = [dict(r) for r in conn.execute("SELECT * FROM users")]
+        users = [dict(r) for r in conn.execute(
+            "SELECT u.*, m.email AS m365_email, m.display_name AS m365_name "
+            "FROM users u LEFT JOIN m365_users m ON m.graph_id = u.m365_graph_id")]
         taken = {u["username"] for u in users}
         linked = {(f, u[f]) for u in users for f in links if u[f]}
+
+        def note(u, fields, is_new=False):
+            book = created if is_new else updated
+            entry = book.setdefault(u["username"], {"username": u["username"], "name": u.get("display_name") or u["username"], "links": []})
+            entry["links"] = sorted(set(entry["links"]) | set(fields))
+
         for c in clusters:
             want = {f: c[f] for f in links if c.get(f) and (f, c[f]) not in linked}
             if not want:
@@ -1272,25 +1277,51 @@ def api_user_import():
                 fill = {f: v for f, v in want.items() if not match[f]}
                 if not fill:
                     continue
-                updated.append({"username": match["username"], "links": sorted(fill)})
+                note(match, fill)
                 if apply:
                     conn.execute(f"UPDATE users SET {', '.join(f'{k}=?' for k in fill)} WHERE id=?",
                                  (*fill.values(), match["id"]))
                     if "m365_graph_id" in fill:
                         _sync_rm_sales_id(conn, match["id"], adopt=True)
                 match.update(fill)
+                if "m365_graph_id" in fill:
+                    match["m365_email"] = match["m365_email"] or c["email"]
             else:
                 username = user_directory.username_for(c["name"], taken)
                 taken.add(username)
-                created.append({"username": username, "name": c["name"], "links": sorted(want)})
+                new_user = {"id": None, "username": username, "display_name": c["name"], "m365_email": c["email"],
+                            "m365_name": None, "rm_sales_id": None, "rm_branch": None, **{f: want.get(f) for f in links}}
+                note(new_user, want, is_new=True)
                 if apply:
-                    cur = conn.execute(
+                    new_user["id"] = conn.execute(
                         "INSERT INTO users (username, display_name, role, pi_access, created_at, "
                         "m365_graph_id, arrivy_entity_id, pipedrive_user_id) VALUES (?,?,?,?,?,?,?,?)",
                         (username, c["name"], "user", 0, datetime.utcnow().isoformat(),
-                         *(want.get(f) for f in links)))
-                    _sync_rm_sales_id(conn, cur.lastrowid, adopt=True)
+                         *(want.get(f) for f in links))).lastrowid
+                    _sync_rm_sales_id(conn, new_user["id"], adopt=True)
+                users.append(new_user)
             linked.update(want.items())
+
+        # Rollmaster reps: one person per rep, and never over a code someone already has.
+        used = {u["rm_sales_id"] for u in users if u["rm_sales_id"]}
+        for u in users:
+            if u["rm_sales_id"]:
+                continue
+            names = [n for n in (u.get("display_name"), u.get("m365_name"), u["username"].replace("_", " ")) if n]
+            rep = next((r for r in (user_directory.rm_rep_for(n, u.get("m365_email"), reps) for n in names) if r), None)
+            if not rep or rep["id"] in used:
+                continue
+            used.add(rep["id"])
+            fill = {"rm_sales_id": rep["id"]}
+            if not u["rm_branch"] and len(rep["branches"]) == 1:
+                fill["rm_branch"] = rep["branches"][0]
+            note(u, fill, is_new=u["username"] in created)
+            if apply:
+                conn.execute(f"UPDATE users SET {', '.join(f'{k}=?' for k in fill)} WHERE id=?",
+                             (*fill.values(), u["id"]))
+                _sync_rm_sales_id(conn, u["id"], adopt=False)
+            u.update(fill)
+    created, updated = list(created.values()), list(updated.values())
     if apply:
         logger.info(f"User import: {len(created)} created, {len(updated)} updated")
     return jsonify({"applied": apply, "created": created, "updated": updated})

@@ -564,15 +564,11 @@
         <select class="picker" id="pickArrivy" onchange="pickChanged(this)"></select>
         <div class="map-label">Pipedrive<span class="err" id="errPipedrive"></span></div>
         <select class="picker" id="pickPipedrive" onchange="pickChanged(this)"></select>
+        <div class="map-label">Rollmaster<br>Sales Rep<span class="err" id="errRm"></span></div>
+        <select class="picker" id="pickRm" onchange="pickChanged(this)"></select>
         <div class="map-label">Branch</div>
         <div class="rm-codes" id="branchCodes"></div>
-        <div class="map-label">Rollmaster<br>Sales ID</div>
-        <div>
-          <div class="text-display" id="rmDisplay" style="margin-bottom:8px">&#8203;</div>
-          <div class="rm-codes" id="rmCodes"></div>
-        </div>
       </div>
-      <div class="keyboard" id="rmKeyboard"></div>
       <div class="form-actions">
         <button class="btn" onclick="suggestMatches()">Suggest Matches</button>
       </div>
@@ -730,7 +726,7 @@
 
   // ── Load users ─────────────────────────────────────────────────────────────
   let USERS = [];
-  let DIR   = null;   // {m365, arrivy, pipedrive, rm_codes, errors}
+  let DIR   = null;   // {m365, arrivy, pipedrive, rm, branches, errors}
 
   function dirName(system, id) {
     if (!id) return '';
@@ -762,9 +758,11 @@
     const el = document.getElementById('usersList');
     const withPi = USERS.filter(u => u.pi_access).length;
     const unmapped = USERS.filter(u => !u.m365_graph_id && !u.arrivy_entity_id && !u.pipedrive_user_id && !u.rm_sales_id).length;
+    const noRep = USERS.filter(u => u.pipedrive_user_id && !u.rm_sales_id).length;
     const noBranch = USERS.filter(u => !u.rm_branch).length;
     document.getElementById('usersSummary').textContent =
       `${USERS.length} people · ${withPi} with Pi access` + (unmapped ? ` · ${unmapped} unmapped` : '')
+      + (noRep ? ` · ${noRep} Pipedrive users without an RM rep` : '')
       + (noBranch ? ` · ${noBranch} no branch` : '');
 
     if (USERS.length === 0) {
@@ -785,7 +783,7 @@
             <span class="sub">${esc(u.username)}${u.rm_branch ? ' · Branch ' + esc(u.rm_branch) : ''}${u.rm_sales_id ? ' · RM ' + esc(u.rm_sales_id) : ''}</span>
           </span>
           <span class="chips">
-            ${chip('M365', u.m365_graph_id, 'm365')}${chip('AR', u.arrivy_entity_id, 'arrivy')}${chip('PD', u.pipedrive_user_id, 'pipedrive')}<span class="chip ${u.rm_sales_id ? 'on' : ''}">RM</span>
+            ${chip('M365', u.m365_graph_id, 'm365')}${chip('AR', u.arrivy_entity_id, 'arrivy')}${chip('PD', u.pipedrive_user_id, 'pipedrive')}${chip('RM', u.rm_sales_id, 'rm')}
           </span>
           <span>${badge}</span>
           <span><button class="del-btn" onclick="event.stopPropagation();deleteUser(${u.id},'${esc(u.username)}')" ${canDel ? '' : 'disabled title="Admin users cannot be deleted"'}>✕</button></span>
@@ -843,7 +841,8 @@
   }
 
   function shortSys(f) {
-    return { m365_graph_id: 'M365', arrivy_entity_id: 'Arrivy', pipedrive_user_id: 'Pipedrive' }[f] || f;
+    return { m365_graph_id: 'M365', arrivy_entity_id: 'Arrivy', pipedrive_user_id: 'Pipedrive',
+             rm_sales_id: 'RM rep', rm_branch: 'branch' }[f] || f;
   }
 
   // ── Edit sheet ─────────────────────────────────────────────────────────────
@@ -851,11 +850,20 @@
     { el: 'pickM365',      field: 'm365_graph_id',     system: 'm365',      err: 'errM365' },
     { el: 'pickArrivy',    field: 'arrivy_entity_id',  system: 'arrivy',    err: 'errArrivy' },
     { el: 'pickPipedrive', field: 'pipedrive_user_id', system: 'pipedrive', err: 'errPipedrive' },
+    { el: 'pickRm',        field: 'rm_sales_id',       system: 'rm',        err: 'errRm' },
   ];
-  let editing = null, ePi = false, eRole = 'user', ePin = '', eRm = '', eBranch = '';
+  let editing = null, ePi = false, eRole = 'user', ePin = '', eBranch = '';
 
   function normName(n) {
     return String(n || '').replace(/^\s*\d+\s*[.)-]\s*/, '').toLowerCase().replace(/[^a-z]/g, ' ').split(/\s+/).filter(Boolean).join(' ');
+  }
+
+  // First + last word, suffixes kept: 'MARK W COSTIGAN' ~ 'Mark Costigan' (mirrors user_directory.name_key).
+  function nameKey(n) {
+    let w = normName(n).split(' ').filter(Boolean);
+    const suf = w.slice(1).filter(x => ['jr', 'sr', 'ii', 'iii', 'iv'].includes(x));
+    w = w.filter(x => !suf.includes(x) && x.length > 1);
+    return (w.length > 1 ? [w[0], w[w.length - 1]] : w).concat(suf).join(' ');
   }
 
   function fillPicker(p, current) {
@@ -869,8 +877,10 @@
       opts += `<option value="${esc(current)}">Unknown account (${esc(current)})</option>`;
     }
     opts += people.map(x => {
-      const extra = [x.type, x.active ? '' : 'inactive', takenBy[x.id] ? '→ ' + takenBy[x.id] : ''].filter(Boolean).join(' · ');
-      return `<option value="${esc(x.id)}">${esc(x.name)}${extra ? ' (' + esc(extra) + ')' : ''}</option>`;
+      const branches = x.branches && x.branches.length ? 'branch ' + x.branches.join(', ') : '';
+      const extra = [x.type, branches, x.active ? '' : 'inactive', takenBy[x.id] ? '→ ' + takenBy[x.id] : ''].filter(Boolean).join(' · ');
+      const label = p.system === 'rm' ? `${x.id} — ${x.name}` : x.name;
+      return `<option value="${esc(x.id)}">${esc(label)}${extra ? ' (' + esc(extra) + ')' : ''}</option>`;
     }).join('');
     sel.innerHTML = opts;
     sel.value = current || '';
@@ -878,7 +888,13 @@
     document.getElementById(p.err).textContent = (DIR && DIR.errors[p.system]) ? 'unreachable' : '';
   }
 
-  function pickChanged(sel) { sel.classList.toggle('set', !!sel.value); }
+  function pickChanged(sel) {
+    sel.classList.toggle('set', !!sel.value);
+    if (sel.id === 'pickRm' && editing && sel.value && !eBranch) {
+      const rep = ((DIR && DIR.rm) || []).find(x => x.id === sel.value);
+      if (rep && rep.branches && rep.branches.length === 1) { eBranch = rep.branches[0]; renderBranch(); }
+    }
+  }
 
   async function openSheet(id) {
     editing = USERS.find(u => u.id === id);
@@ -887,8 +903,6 @@
     document.getElementById('sheetTitle').textContent = (editing.display_name || editing.m365_name || editing.username).toUpperCase();
     document.getElementById('sheetSub').textContent = editing.username + (editing.m365_email ? ' · ' + editing.m365_email : '');
     PICKERS.forEach(p => fillPicker(p, editing[p.field]));
-    eRm = editing.rm_sales_id || '';
-    renderRm();
     eBranch = editing.rm_branch || '';
     renderBranch();
     ePin = '';
@@ -929,17 +943,6 @@
     for (let i = 0; i < 4; i++) document.getElementById('ep' + i).classList.toggle('filled', i < ePin.length);
   }
 
-  function renderRm() {
-    const el = document.getElementById('rmDisplay');
-    el.textContent = eRm || '​';
-    el.classList.toggle('has-text', !!eRm);
-    const codes = new Set((DIR && DIR.rm_codes) || []);
-    if (eRm) codes.add(eRm);
-    document.getElementById('rmCodes').innerHTML = [...codes].sort().map(c =>
-      `<button class="rm-code ${c === eRm ? 'selected' : ''}" onclick="rmPick('${esc(c)}')">${esc(c)}</button>`
-    ).join('') + (eRm ? `<button class="rm-code" onclick="rmPick('')">Clear</button>` : '');
-  }
-
   function renderBranch() {
     const all = new Set((DIR && DIR.branches) || ['1', '2', '3']);
     if (eBranch) all.add(eBranch);
@@ -949,8 +952,6 @@
   }
 
   function branchPick(b) { eBranch = (eBranch === b) ? '' : b; renderBranch(); }
-
-  function rmPick(c) { eRm = (eRm === c) ? '' : c; renderRm(); }
 
   function suggestMatches() {
     // Fill empty pickers with the account whose email or name matches what's already mapped.
@@ -968,15 +969,18 @@
       const sel = document.getElementById(p.el);
       if (sel.value) return;
       const taken = new Set(USERS.filter(u => u.id !== editing.id).map(u => u[p.field]).filter(Boolean));
-      const people = ((DIR && DIR[p.system]) || []).filter(x => x.active && !taken.has(x.id));
-      const hit = people.find(x => x.email && emails.has(x.email)) || people.find(x => names.has(normName(x.name)));
+      const people = ((DIR && DIR[p.system]) || []).filter(x => x.active && !x.house && !taken.has(x.id));
+      const keys = new Set([...names].map(nameKey));
+      const only = arr => arr.length === 1 ? arr[0] : null;
+      const hit = people.find(x => x.email && emails.has(x.email)) || people.find(x => names.has(normName(x.name)))
+        || only(people.filter(x => keys.has(nameKey(x.name))));
       if (hit) { sel.value = hit.id; pickChanged(sel); filled++; }
     });
     setSheetStatus(filled ? `FILLED ${filled} — REVIEW, THEN SAVE` : 'NO NEW MATCHES FOUND', filled ? 'success' : '');
   }
 
   async function saveSheet() {
-    const body = { rm_sales_id: eRm, rm_branch: eBranch, pi_access: ePi };
+    const body = { rm_branch: eBranch, pi_access: ePi };
     PICKERS.forEach(p => body[p.field] = document.getElementById(p.el).value);
     if (ePi) {
       body.role = eRole;
@@ -1003,20 +1007,14 @@
     await deleteUser(u.id, u.username);
   }
 
-  // Build the sheet's keypads once.
+  // Build the sheet's PIN pad once.
   (function () {
     const np = ['1','2','3','4','5','6','7','8','9'].map(d => `<button class="nkey" onclick="ePress('${d}')">${d}</button>`).join('')
       + `<button class="nkey nzero" onclick="ePress('0')">0</button><button class="nkey ndel" onclick="ePin=ePin.slice(0,-1);renderEPin()">⌫</button>`;
     document.getElementById('eNumpad').innerHTML = np;
-    const rows = ['1234567890', 'QWERTYUIOP', 'ASDFGHJKL', 'ZXCVBNM'];
-    document.getElementById('rmKeyboard').innerHTML = rows.map((r, i) =>
-      '<div class="kb-row">' + [...r].map(ch => `<button class="kb-key small" onclick="rmType('${ch}')">${ch}</button>`).join('')
-      + (i === rows.length - 1 ? `<button class="kb-key small kb-wide" onclick="eRm=eRm.slice(0,-1);renderRm()">⌫</button>` : '')
-      + '</div>').join('');
   })();
 
   function ePress(d) { if (ePin.length < 4) { ePin += d; renderEPin(); } }
-  function rmType(ch) { if (eRm.length < 6) { eRm += ch; renderRm(); } }
 
   // ── Load access log ────────────────────────────────────────────────────────
   async function loadAccessLog() {
