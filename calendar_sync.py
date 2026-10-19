@@ -123,7 +123,8 @@ def init_schema():
         """)
         # What was last written (UTC) and the task's shape, for reading Outlook changes back.
         cols = {r[1] for r in c.execute("PRAGMA table_info(calendar_events)")}
-        for col in ("start_utc TEXT", "end_utc TEXT", "template INTEGER", "days INTEGER", "notes TEXT"):
+        for col in ("start_utc TEXT", "end_utc TEXT", "template INTEGER", "days INTEGER", "notes TEXT",
+                    "notes_written TEXT"):
             if col.split()[0] not in cols:
                 c.execute(f"ALTER TABLE calendar_events ADD COLUMN {col}")
 
@@ -296,7 +297,8 @@ def sync_task(task_id, task=None, fetched=False):
                     ev["start"] = {"dateTime": s.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"}
                     ev["end"]   = {"dateTime": e.strftime("%Y-%m-%dT%H:%M:%S"), "timeZone": "UTC"}
                     want[(gid, day)] = {k: v for k, v in ev.items() if v is not None}
-            meta = {"template": task.get("template"), "days": len(slots)}
+            meta = {"template": task.get("template"), "days": len(slots),
+                    "notes_written": norm_notes(task.get("details"))}
         with _conn() as c:
             have = {(r["graph_id"], r["day"]): dict(r) for r in c.execute(
                 "SELECT * FROM calendar_events WHERE task_id=?", (task_id,))}
@@ -306,9 +308,9 @@ def sync_task(task_id, task=None, fetched=False):
             fp = hashlib.sha1(json.dumps(ev, sort_keys=True).encode()).hexdigest()
             row = have.get(key)
             if row and row["fingerprint"] == fp:
-                if row["start_utc"] is None and MODE == "on":   # rows from before read-back existed
+                if (row["start_utc"] is None or row.get("notes_written") is None) and MODE == "on":   # older rows
                     backfill.append((ev["start"]["dateTime"], ev["end"]["dateTime"], meta.get("template"),
-                                     meta.get("days"), task_id, *key))
+                                     meta.get("days"), meta.get("notes_written"), task_id, *key))
                 continue
             gid, day = key
             if MODE == "dry":
@@ -331,22 +333,24 @@ def sync_task(task_id, task=None, fetched=False):
                     event_id = r.json()["id"]
                 with _conn() as c:
                     c.execute("INSERT INTO calendar_events (task_id, graph_id, day, event_id, fingerprint, updated_at, "
-                              "start_utc, end_utc, template, days, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                              "start_utc, end_utc, template, days, notes, notes_written) "
+                              "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
                               "ON CONFLICT(task_id, graph_id, day) DO UPDATE SET event_id=excluded.event_id, "
                               "fingerprint=excluded.fingerprint, updated_at=excluded.updated_at, "
                               "start_utc=excluded.start_utc, end_utc=excluded.end_utc, "
-                              "template=excluded.template, days=excluded.days, notes=excluded.notes",
+                              "template=excluded.template, days=excluded.days, notes=excluded.notes, "
+                              "notes_written=excluded.notes_written",
                               (task_id, gid, day, event_id, fp, datetime.utcnow().isoformat(),
                                ev["start"]["dateTime"], ev["end"]["dateTime"], meta.get("template"),
-                               meta.get("days"), None))   # notes: re-read from Outlook as the new baseline
+                               meta.get("days"), None, meta.get("notes_written")))
                 done["updated" if row else "created"] += 1
             except Exception as e:
                 done["failed"] += 1
                 log.warning(f"calendar: task {task_id} {day} for {gid} failed: {str(e)[:200]}")
         if backfill:   # one short transaction, not a commit per row
             with _conn() as c:
-                c.executemany("UPDATE calendar_events SET start_utc=?, end_utc=?, template=?, days=? "
-                              "WHERE task_id=? AND graph_id=? AND day=?", backfill)
+                c.executemany("UPDATE calendar_events SET start_utc=?, end_utc=?, template=?, days=?, "
+                              "notes_written=? WHERE task_id=? AND graph_id=? AND day=?", backfill)
         for key, row in have.items():
             if key in want:
                 continue
@@ -512,13 +516,40 @@ def _would_write(row, status, body):
         return "cancel" if editable and _can_reschedule(row["graph_id"])[1] else None
     if status != 200:
         return None
-    if row["template"] in READBACK_TEMPLATES and row["notes"] is not None:
+    if row["template"] in READBACK_TEMPLATES:
+        ref = _notes_reference(row, body)
         edited = notes_from_body((body.get("body") or {}).get("content"))
-        if notes_key(edited) != notes_key(row["notes"]):
+        if ref is not None and notes_key(edited) != notes_key(ref):
             return "notes"
     new = (_utc(body.get("start")), _utc(body.get("end")))
     if all(new) and new != (row["start_utc"], row["end_utc"]) and editable and _can_reschedule(row["graph_id"])[1]:
         return "reschedule"
+    return None
+
+
+USER_EDIT_GRACE_SECONDS = 20   # Exchange stamps our own write a second or two after we send it
+
+
+def _edited_after_write(row, body):
+    """True when Outlook says the event changed after our last write to it — i.e. a person edited it."""
+    lm = (body.get("lastModifiedDateTime") or "")[:19]
+    if not lm or not row.get("updated_at"):
+        return False
+    try:
+        return (datetime.fromisoformat(lm) - datetime.fromisoformat(row["updated_at"][:19])).total_seconds() \
+            > USER_EDIT_GRACE_SECONDS
+    except ValueError:
+        return False
+
+
+def _notes_reference(row, body):
+    """What the notes should be compared against: the Outlook baseline once we have one; before that,
+    what we wrote — but only if a person has touched the event (otherwise any difference is just how
+    Outlook rendered our text, and becomes the baseline)."""
+    if row["notes"] is not None:
+        return row["notes"]
+    if row.get("notes_written") is not None and _edited_after_write(row, body):
+        return row["notes_written"]
     return None
 
 
@@ -541,7 +572,7 @@ def poll_outlook():
             (date.today().isoformat(),))]
     if not rows:
         return {"checked": 0}
-    paths = {f"/users/{r['graph_id']}/events/{r['event_id']}?$select=start,end,isCancelled"
+    paths = {f"/users/{r['graph_id']}/events/{r['event_id']}?$select=start,end,isCancelled,lastModifiedDateTime"
              + (",body" if r["template"] in READBACK_TEMPLATES else ""): r for r in rows}
     results = _batch_get(list(paths))
     # Events rewritten while we were reading are skipped this round (next pass sees them fresh).
@@ -605,15 +636,16 @@ def poll_outlook():
             continue
         edited = notes_from_body((body.get("body") or {}).get("content")) \
             if row["template"] in READBACK_TEMPLATES and row["task_id"] not in notes_done else None
-        if edited is not None and row["notes"] is None:
-            # First look since the event was written: what Outlook shows is the baseline —
-            # unless a rewrite landed after we read it, in which case the next pass takes it.
+        ref = _notes_reference(row, body) if edited is not None else None
+        if edited is not None and ref is None:
+            # First look since the event was written and nobody has touched it: what Outlook
+            # shows is the baseline — unless a rewrite landed after we read it (next pass takes it).
             with _conn() as c:
                 c.execute("UPDATE calendar_events SET notes=? WHERE task_id=? AND graph_id=? AND day=? "
                           "AND notes IS NULL AND updated_at=?",
                           (edited, row["task_id"], row["graph_id"], row["day"], row["updated_at"]))
         elif edited is not None:
-            if notes_key(edited) != notes_key(row["notes"]) and _unchanged_since_read(row):
+            if notes_key(edited) != notes_key(ref) and _unchanged_since_read(row):
                 who, _ = _can_reschedule(row["graph_id"])
                 label = TEMPLATE_LABELS.get(row["template"]) or "task"
                 task = fetch_task(row["task_id"])
