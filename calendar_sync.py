@@ -66,6 +66,9 @@ GRAPH_BASE    = "https://graph.microsoft.com/v1.0"
 SWEEP_MINUTES = int(os.environ.get("M365_CALENDAR_SWEEP_MINUTES", "30"))
 SWEEP_DAYS    = int(os.environ.get("M365_CALENDAR_SWEEP_DAYS", "60"))
 READBACK_MINUTES = int(os.environ.get("M365_CALENDAR_READBACK_MINUTES", "2"))
+# Circuit breaker: more Outlook→Arrivy writes than this in one read-back means
+# something systematic is wrong (not people editing), so none are sent.
+MAX_ARRIVY_WRITES_PER_POLL = int(os.environ.get("M365_CALENDAR_MAX_WRITES", "3"))
 LOCAL_TZ      = "America/Chicago"
 
 # Arrivy template → what the event is called. Unlisted templates use the task title.
@@ -501,6 +504,24 @@ def _put_back(row, task, why):
     _record(task, why, "CAL_OUTLOOK_REVERTED")
 
 
+def _would_write(row, status, body):
+    """Which Arrivy write this event's Outlook state would cause ('cancel', 'notes',
+    'reschedule'), or None. Mirrors poll_outlook's rules without touching anything."""
+    editable = row["template"] in READBACK_TEMPLATES and (row["days"] or 1) <= 1
+    if status == 404 or (status == 200 and body.get("isCancelled")):
+        return "cancel" if editable and _can_reschedule(row["graph_id"])[1] else None
+    if status != 200:
+        return None
+    if row["template"] in READBACK_TEMPLATES and row["notes"] is not None:
+        edited = notes_from_body((body.get("body") or {}).get("content"))
+        if notes_key(edited) != notes_key(row["notes"]):
+            return "notes"
+    new = (_utc(body.get("start")), _utc(body.get("end")))
+    if all(new) and new != (row["start_utc"], row["end_utc"]) and editable and _can_reschedule(row["graph_id"])[1]:
+        return "reschedule"
+    return None
+
+
 def poll_outlook():
     """Read the synced, upcoming events back from Outlook and act on any changes (see module doc)."""
     if MODE != "on":
@@ -514,6 +535,25 @@ def poll_outlook():
     paths = {f"/users/{r['graph_id']}/events/{r['event_id']}?$select=start,end,isCancelled"
              + (",body" if r["template"] in READBACK_TEMPLATES else ""): r for r in rows}
     results = _batch_get(list(paths))
+    pending = [(row, kind) for path, row in paths.items()
+               if (kind := _would_write(row, *results.get(path, (None, {}))))]
+    if len(pending) > MAX_ARRIVY_WRITES_PER_POLL:
+        # Too many at once to be people editing: send nothing to Arrivy, put every
+        # one of those events back from Arrivy (which also resets its baseline).
+        tasks = sorted({row["task_id"] for row, _ in pending})
+        with _conn() as c:
+            c.executemany("UPDATE calendar_events SET fingerprint='', notes=NULL WHERE task_id=?",
+                          [(t,) for t in tasks])
+        for t in tasks:
+            sync_task(t)
+        kinds = ", ".join(f"{k} {sum(1 for _, x in pending if x == k)}" for k in ("notes", "reschedule", "cancel")
+                          if any(x == k for _, x in pending))
+        log.warning(f"calendar read-back: {len(pending)} Outlook changes in one pass ({kinds}) — "
+                    f"over the limit of {MAX_ARRIVY_WRITES_PER_POLL}; nothing sent to Arrivy, events put back")
+        _record(None, f"Outlook read-back paused: {len(pending)} changes at once ({kinds}) is more than people make "
+                      f"in {READBACK_MINUTES} min — nothing sent to Arrivy, {len(tasks)} events put back from Arrivy",
+                "CAL_OUTLOOK_PAUSED")
+        return {"checked": len(rows), "paused": len(pending)}
     moved = reverted = recreated = cancelled = noted = 0
     notes_done = set()
     for path, row in paths.items():
@@ -671,6 +711,10 @@ def start():
         return
     _started = True
     init_schema()
+    # Re-read every notes baseline from Outlook before trusting it: the body layout
+    # (or how it's read) may have changed with this deploy.
+    with _conn() as c:
+        c.execute("UPDATE calendar_events SET notes=NULL")
     threading.Thread(target=_worker, name="calendar-worker", daemon=True).start()
     threading.Thread(target=_sweeper, name="calendar-sweeper", daemon=True).start()
     if MODE == "on":
