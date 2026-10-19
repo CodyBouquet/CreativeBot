@@ -451,8 +451,9 @@ def norm_notes(text):
 
 
 def notes_key(text):
-    """What counts as a change: the non-blank lines, trimmed (Outlook clients add blank lines and spaces)."""
-    return "\n".join(ln.strip() for ln in norm_notes(text).split("\n") if ln.strip())
+    """What counts as a change: the words on each non-blank line. Outlook shows the body as HTML,
+    which collapses runs of spaces and tabs and adds blank lines, so none of that is an edit."""
+    return "\n".join(" ".join(ln.split()) for ln in norm_notes(text).split("\n") if ln.strip())
 
 
 def notes_from_body(text):
