@@ -19,8 +19,9 @@ import queue
 
 load_dotenv()
 
-from email_reports import bp as reports_bp
+from email_reports import bp as reports_bp, m365_directory
 import rollmaster
+import user_directory
 
 app = Flask(__name__)
 _secret = os.environ.get("FLASK_SECRET_KEY", "")
@@ -134,19 +135,27 @@ RM_CUSTOMER_DEFAULTS = {
 # customer id. The automation can't capture the webhook response, so the app
 # writes it back itself after a successful create. Blank disables the write-back.
 RM_PD_CID_FIELD = os.environ.get("RM_PD_CID_FIELD", "509740a9dad0eab9c7c83842beefb2eda43ae199")
-# Optional: Pipedrive deal owner → Rollmaster salesperson id (C_SLSID, e.g. "MRB",
-# "AMB"). JSON object in the env var, keyed by owner name or Pipedrive user id. A
-# matching owner overrides RM_C_SLSID; leave it {} to file everyone under the default.
+# A new customer is filed under its Pipedrive owner's Rollmaster salesperson id
+# (C_SLSID), taken from the Users page mapping (Pipedrive user → RM sales id) —
+# see _resolve_salesperson. RM_SALESPERSON_MAP is an optional env override, a JSON
+# object keyed by owner name or Pipedrive user id; it wins over the Users page.
+# Owners with no mapping fall back to RM_C_SLSID.
 try:
     RM_SALESPERSON_MAP = json.loads(os.environ.get("RM_SALESPERSON_MAP", "{}"))
 except ValueError:
     RM_SALESPERSON_MAP = {}
     logging.warning("RM_SALESPERSON_MAP is not valid JSON — salesperson mapping disabled")
 
+# Branch numbers offered on the Users page (the branch a person works out of —
+# not the Rollmaster warehouse, which is always 1); any number already assigned
+# to someone is offered too.
+RM_BRANCHES = [b.strip() for b in os.environ.get("RM_BRANCHES", "1,2,3").split(",") if b.strip()]
+
 ALLOWED_DASHBOARD_IPS = {"127.0.0.1", "::1", "10.54.10.135"}
 DASHBOARD_ENDPOINTS  = {"landing", "sync_dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout", "api_health",
                         "api_stats", "api_stream", "api_logs", "settings_page",
                         "api_settings", "api_sync_all", "api_users", "api_user_delete", "api_access_log",
+                        "api_user_update", "api_user_directory", "api_user_import",
                         "reports.reports_home"}
 
 # SSE client queues
@@ -206,12 +215,21 @@ def init_db():
                 value TEXT NOT NULL
             );
 
+            -- One row per person. pin is NULL for mapping-only people (no Pi access);
+            -- the link columns are ids in each system (see user_directory.py).
             CREATE TABLE IF NOT EXISTS users (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                username   TEXT    NOT NULL UNIQUE,
-                pin        TEXT    NOT NULL UNIQUE,
-                role       TEXT    NOT NULL DEFAULT 'user',
-                created_at TEXT    NOT NULL
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                username          TEXT    NOT NULL UNIQUE,
+                pin               TEXT    UNIQUE,
+                role              TEXT    NOT NULL DEFAULT 'user',
+                created_at        TEXT    NOT NULL,
+                display_name      TEXT,
+                pi_access         INTEGER NOT NULL DEFAULT 1,
+                m365_graph_id     TEXT,
+                arrivy_entity_id  TEXT,
+                pipedrive_user_id TEXT,
+                rm_sales_id       TEXT,
+                rm_branch         TEXT
             );
 
             CREATE TABLE IF NOT EXISTS access_log (
@@ -237,6 +255,39 @@ def init_db():
                 )
             except Exception:
                 pass
+        # Migrate: users table from PIN-only logins to the people directory. The
+        # old table had pin NOT NULL, which SQLite can't relax in place — rebuild.
+        u_cols = {r[1]: r for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if u_cols["pin"][3]:  # notnull flag
+            conn.executescript("""
+                CREATE TABLE users_new (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username          TEXT    NOT NULL UNIQUE,
+                    pin               TEXT    UNIQUE,
+                    role              TEXT    NOT NULL DEFAULT 'user',
+                    created_at        TEXT    NOT NULL,
+                    display_name      TEXT,
+                    pi_access         INTEGER NOT NULL DEFAULT 1,
+                    m365_graph_id     TEXT,
+                    arrivy_entity_id  TEXT,
+                    pipedrive_user_id TEXT,
+                    rm_sales_id       TEXT,
+                    rm_branch         TEXT
+                );
+                INSERT INTO users_new (id, username, pin, role, created_at)
+                    SELECT id, username, pin, role, created_at FROM users;
+                DROP TABLE users;
+                ALTER TABLE users_new RENAME TO users;
+            """)
+        u_cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "rm_branch" not in u_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN rm_branch TEXT")
+        # An external account maps to at most one person (NULLs don't collide).
+        conn.executescript("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_m365      ON users(m365_graph_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_arrivy    ON users(arrivy_entity_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_pipedrive ON users(pipedrive_user_id);
+        """)
         # Migrate: rename current_date → task_date if needed
         cols = [r[1] for r in conn.execute("PRAGMA table_info(task_state)").fetchall()]
         if "current_date" in cols and "task_date" not in cols:
@@ -250,6 +301,7 @@ def init_db():
         ev_cols = [r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()]
         if "action" not in ev_cols:
             conn.execute("ALTER TABLE events ADD COLUMN action TEXT")
+    m365_directory.init_schema()  # /api/users joins m365_users
     logger.info(f"Database initialised at {DB_PATH}")
 
 def get_setting(key):
@@ -714,7 +766,7 @@ def verify_pin():
     data    = request.get_json(force=True)
     entered = data.get("pin", "")
     with get_db() as conn:
-        user = conn.execute("SELECT * FROM users WHERE pin=?", (entered,)).fetchone()
+        user = conn.execute("SELECT * FROM users WHERE pin=? AND pi_access=1", (entered,)).fetchone()
     if user:
         session["authenticated"] = True
         session["username"]       = user["username"]
@@ -1045,34 +1097,203 @@ def users():
     """Render the admin-only user management page."""
     return render_template("users.html", username=session.get("username", ""))
 
+_USER_SELECT = """
+    SELECT u.id, u.username, u.display_name, u.role, u.created_at, u.pi_access,
+           u.pin IS NOT NULL AS has_pin, u.m365_graph_id, u.arrivy_entity_id,
+           u.pipedrive_user_id, u.rm_sales_id, u.rm_branch,
+           m.display_name AS m365_name, m.email AS m365_email, m.active AS m365_active
+    FROM users u LEFT JOIN m365_users m ON m.graph_id = u.m365_graph_id
+"""
+
+def _user_changes(data):
+    """Validate the editable user fields present in a request body. Returns (changes, error)."""
+    out = {}
+    if "display_name" in data:
+        out["display_name"] = str(data["display_name"] or "").strip()[:64] or None
+    if "role" in data:
+        if data["role"] not in ("admin", "user"):
+            return None, "Role must be admin or user"
+        out["role"] = data["role"]
+    if "pi_access" in data:
+        out["pi_access"] = 1 if data["pi_access"] else 0
+    pin = str(data.get("pin") or "").strip()
+    if pin:
+        if not pin.isdigit() or len(pin) != 4:
+            return None, "PIN must be 4 digits"
+        out["pin"] = pin
+    for f in user_directory.LINK_FIELDS:
+        if f in data:
+            out[f] = str(data[f] or "").strip() or None
+    if "rm_branch" in data:
+        out["rm_branch"] = str(data["rm_branch"] or "").strip() or None
+        if out["rm_branch"] and not (out["rm_branch"].isdigit() and len(out["rm_branch"]) <= 3):
+            return None, "Branch must be a number"
+    if out.get("rm_sales_id"):
+        out["rm_sales_id"] = out["rm_sales_id"].upper()
+        if len(out["rm_sales_id"]) > 6:
+            return None, "Rollmaster salesperson id is at most 6 characters"
+    return out, None
+
+def _user_conflict(conn, user_id, changes):
+    """Error message if a new PIN or external link already belongs to someone else, else None."""
+    checks = [("pin", "PIN already in use")] + [
+        (f, f"{label} is already mapped to") for f, label in (
+            ("m365_graph_id", "That M365 account"), ("arrivy_entity_id", "That Arrivy person"),
+            ("pipedrive_user_id", "That Pipedrive user"))]
+    for field, msg in checks:
+        if changes.get(field):
+            row = conn.execute(f"SELECT username FROM users WHERE {field}=? AND id IS NOT ?",
+                               (changes[field], user_id)).fetchone()
+            if row:
+                return msg if field == "pin" else f"{msg} {row['username']}"
+    return None
+
+def _sync_rm_sales_id(conn, user_id, adopt):
+    """Keep rm_sales_id equal on users and the linked m365_users row (the sales reports read the latter).
+    adopt=True (the M365 link just changed) takes M365's value when the user has none."""
+    u = conn.execute("SELECT m365_graph_id, rm_sales_id FROM users WHERE id=?", (user_id,)).fetchone()
+    if not u or not u["m365_graph_id"]:
+        return
+    m = conn.execute("SELECT rm_sales_id FROM m365_users WHERE graph_id=?", (u["m365_graph_id"],)).fetchone()
+    if adopt and m and m["rm_sales_id"] and not u["rm_sales_id"]:
+        conn.execute("UPDATE users SET rm_sales_id=? WHERE id=?", (m["rm_sales_id"], user_id))
+    else:
+        conn.execute("UPDATE m365_users SET rm_sales_id=? WHERE graph_id=?",
+                     (u["rm_sales_id"], u["m365_graph_id"]))
+
 @app.route("/api/users", methods=["GET", "POST"])
 @admin_required
 def api_users():
-    """Admin JSON endpoint: GET lists users; POST creates a user (requires username + unique 4-digit PIN, role admin/user)."""
+    """Admin JSON endpoint: GET lists users with their system mappings; POST creates one.
+    A user with Pi access needs a unique 4-digit PIN; a mapping-only user (pi_access false) doesn't."""
     if request.method == "GET":
         with get_db() as conn:
-            rows = conn.execute(
-                "SELECT id, username, role, created_at FROM users ORDER BY created_at"
-            ).fetchall()
+            rows = conn.execute(_USER_SELECT + " ORDER BY u.pi_access DESC, LOWER(COALESCE(u.display_name, u.username))").fetchall()
         return jsonify({"users": [dict(r) for r in rows]})
     data     = request.get_json(force=True)
     username = (data.get("username") or "").strip()
-    pin      = (data.get("pin") or "").strip()
-    role     = data.get("role", "user")
-    if not username or not pin.isdigit() or len(pin) != 4:
-        return jsonify({"error": "Username and 4-digit PIN required"}), 400
-    if role not in ("admin", "user"):
-        role = "user"
+    changes, err = _user_changes({"role": "user", "pi_access": True, **data})
+    if err:
+        return jsonify({"error": err}), 400
+    if not username:
+        return jsonify({"error": "Username required"}), 400
+    if changes["pi_access"] and not changes.get("pin"):
+        return jsonify({"error": "A 4-digit PIN is required for Pi access"}), 400
     try:
         with get_db() as conn:
-            conn.execute(
-                "INSERT INTO users (username, pin, role, created_at) VALUES (?,?,?,?)",
-                (username, pin, role, datetime.utcnow().isoformat())
-            )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-    logger.info(f"User created: {username} ({role})")
+            conflict = _user_conflict(conn, None, changes)
+            if conflict:
+                return jsonify({"error": conflict}), 400
+            cols = ["username", "created_at", *changes]
+            cur = conn.execute(
+                f"INSERT INTO users ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                (username, datetime.utcnow().isoformat(), *changes.values()))
+            _sync_rm_sales_id(conn, cur.lastrowid, adopt="m365_graph_id" in changes)
+    except sqlite3.IntegrityError as e:
+        return jsonify({"error": "Username already exists" if "username" in str(e) else str(e)}), 400
+    logger.info(f"User created: {username} ({changes['role']}, pi_access={changes['pi_access']})")
     return jsonify({"status": "ok"}), 201
+
+@app.route("/api/users/<int:user_id>", methods=["PATCH"])
+@admin_required
+def api_user_update(user_id):
+    """Admin JSON endpoint: change a user's role, Pi access, PIN, display name, branch or system mappings.
+    Turning Pi access on needs a PIN (existing or in this request); admins can't lock themselves out."""
+    changes, err = _user_changes(request.get_json(force=True))
+    if err:
+        return jsonify({"error": err}), 400
+    if not changes:
+        return jsonify({"status": "ok"}), 200
+    with get_db() as conn:
+        user = conn.execute("SELECT username, pin, role, pi_access FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        if user["username"] == session.get("username") and (
+                changes.get("pi_access") == 0 or changes.get("role") == "user"):
+            return jsonify({"error": "You can't remove your own admin or Pi access"}), 400
+        if changes.get("pi_access", user["pi_access"]) and not (changes.get("pin") or user["pin"]):
+            return jsonify({"error": "Set a 4-digit PIN to give Pi access"}), 400
+        conflict = _user_conflict(conn, user_id, changes)
+        if conflict:
+            return jsonify({"error": conflict}), 400
+        conn.execute(f"UPDATE users SET {', '.join(f'{k}=?' for k in changes)} WHERE id=?",
+                     (*changes.values(), user_id))
+        if "rm_sales_id" in changes or "m365_graph_id" in changes:
+            _sync_rm_sales_id(conn, user_id, adopt="m365_graph_id" in changes and "rm_sales_id" not in changes)
+    logger.info(f"User updated: {user['username']} {sorted(k for k in changes if k != 'pin')}"
+                + (" +pin" if "pin" in changes else ""))
+    return jsonify({"status": "ok"}), 200
+
+@app.route("/api/users/directory")
+@admin_required
+def api_user_directory():
+    """Admin JSON endpoint: people in M365, Arrivy and Pipedrive for the mapping pickers,
+    plus the Rollmaster salesperson ids already in use. ?refresh=1 re-pulls (incl. the M365 group)."""
+    data = dict(user_directory.directory(refresh=request.args.get("refresh") == "1"))
+    with get_db() as conn:
+        codes = {r[0] for r in conn.execute(
+            "SELECT rm_sales_id FROM users WHERE rm_sales_id IS NOT NULL "
+            "UNION SELECT rm_sales_id FROM m365_users WHERE rm_sales_id IS NOT NULL")}
+    codes.update(v for v in RM_SALESPERSON_MAP.values() if v)
+    if RM_CUSTOMER_DEFAULTS["C_SLSID"]:
+        codes.add(RM_CUSTOMER_DEFAULTS["C_SLSID"])
+    data["rm_codes"] = sorted(codes)
+    with get_db() as conn:
+        used = {r[0] for r in conn.execute("SELECT DISTINCT rm_branch FROM users WHERE rm_branch IS NOT NULL")}
+    data["branches"] = sorted(set(RM_BRANCHES) | used, key=int)
+    return jsonify(data)
+
+@app.route("/api/users/import", methods=["POST"])
+@admin_required
+def api_user_import():
+    """
+    Admin JSON endpoint: match people across M365, Arrivy and Pipedrive (email,
+    then name) and fill in the mappings. Existing users only get links they
+    don't have yet — nothing is overwritten; unmatched people are added as
+    mapping-only users without Pi access. {"apply": false} previews the plan.
+    """
+    apply = bool((request.get_json(silent=True) or {}).get("apply"))
+    clusters = user_directory.match_people(user_directory.directory())
+    links = ("m365_graph_id", "arrivy_entity_id", "pipedrive_user_id")
+    created, updated = [], []
+    with get_db() as conn:
+        users = [dict(r) for r in conn.execute("SELECT * FROM users")]
+        taken = {u["username"] for u in users}
+        linked = {(f, u[f]) for u in users for f in links if u[f]}
+        for c in clusters:
+            want = {f: c[f] for f in links if c.get(f) and (f, c[f]) not in linked}
+            if not want:
+                continue
+            nm = user_directory.norm_name(c["name"])
+            match = next((u for u in users if any(u[f] and u[f] == c.get(f) for f in links)), None) \
+                or next((u for u in users if nm and nm in (user_directory.norm_name(u["display_name"]),
+                                                          user_directory.norm_name(u["username"]))), None)
+            if match:
+                fill = {f: v for f, v in want.items() if not match[f]}
+                if not fill:
+                    continue
+                updated.append({"username": match["username"], "links": sorted(fill)})
+                if apply:
+                    conn.execute(f"UPDATE users SET {', '.join(f'{k}=?' for k in fill)} WHERE id=?",
+                                 (*fill.values(), match["id"]))
+                    if "m365_graph_id" in fill:
+                        _sync_rm_sales_id(conn, match["id"], adopt=True)
+                match.update(fill)
+            else:
+                username = user_directory.username_for(c["name"], taken)
+                taken.add(username)
+                created.append({"username": username, "name": c["name"], "links": sorted(want)})
+                if apply:
+                    cur = conn.execute(
+                        "INSERT INTO users (username, display_name, role, pi_access, created_at, "
+                        "m365_graph_id, arrivy_entity_id, pipedrive_user_id) VALUES (?,?,?,?,?,?,?,?)",
+                        (username, c["name"], "user", 0, datetime.utcnow().isoformat(),
+                         *(want.get(f) for f in links)))
+                    _sync_rm_sales_id(conn, cur.lastrowid, adopt=True)
+            linked.update(want.items())
+    if apply:
+        logger.info(f"User import: {len(created)} created, {len(updated)} updated")
+    return jsonify({"applied": apply, "created": created, "updated": updated})
 
 @app.route("/api/users/<int:user_id>", methods=["DELETE"])
 @admin_required
@@ -1420,10 +1641,10 @@ def map_pipedrive_customer(payload):
 
     contact = _pd_value(payload, "contact")
     owner   = _pd_value(payload, "salesperson")
-    # Mapped owner > fixed default > a bare code passed in the payload (≤6 chars,
-    # so a full owner name never lands in C_SLSID by accident).
-    slsid   = (RM_SALESPERSON_MAP.get(owner)
-               or RM_CUSTOMER_DEFAULTS["C_SLSID"]
+    # Fixed default > a bare code passed in the payload (≤6 chars, so a full owner
+    # name never lands in C_SLSID by accident). A new customer's owner mapping is
+    # applied later, by _resolve_salesperson.
+    slsid   = (RM_CUSTOMER_DEFAULTS["C_SLSID"]
                or (owner if len(owner) <= 6 else ""))
 
     # Pipedrive splits an address into "street number" and "street/road name"
@@ -1458,6 +1679,69 @@ def map_pipedrive_customer(payload):
             fields[key] = str(v).strip()
 
     return _normalize_customer_fields(fields), name
+
+
+def _salesperson_for_owner(owner_id=None, owner_name=""):
+    """Rollmaster salesperson id for a Pipedrive owner: RM_SALESPERSON_MAP first, then
+    the Users page mapping (by Pipedrive user id, else by name). '' when unmapped."""
+    for key in (str(owner_id or ""), owner_name):
+        if key and RM_SALESPERSON_MAP.get(key):
+            return RM_SALESPERSON_MAP[key]
+    with get_db() as conn:
+        if owner_id:
+            row = conn.execute("SELECT rm_sales_id FROM users WHERE pipedrive_user_id=? AND rm_sales_id IS NOT NULL",
+                               (str(owner_id),)).fetchone()
+            if row:
+                return row["rm_sales_id"]
+        nm = user_directory.norm_name(owner_name)
+        if nm:
+            for row in conn.execute(
+                    "SELECT u.display_name, u.username, m.display_name AS m365_name, u.rm_sales_id FROM users u "
+                    "LEFT JOIN m365_users m ON m.graph_id = u.m365_graph_id WHERE u.rm_sales_id IS NOT NULL"):
+                if nm in {user_directory.norm_name(row[k]) for k in ("display_name", "username", "m365_name")}:
+                    return row["rm_sales_id"]
+    return ""
+
+
+def _resolve_salesperson(payload, fields, deal_id, person_id):
+    """
+    Set fields["C_SLSID"] for a NEW customer (updates never touch the salesperson)
+    and return a short note on where it came from, for the event log.
+
+    A code sent in the payload stands. Otherwise the owner is the one the payload
+    names, else the deal's owner, else the person's owner, read from Pipedrive.
+    An owner with no mapping — or a Pipedrive lookup that fails — leaves the
+    RM_C_SLSID default in place rather than holding up the create.
+    """
+    keys = {str(k).strip().lower() for k in (payload or {})}
+    if keys & {"c_slsid", "slsid"}:
+        return f"salesperson {fields['C_SLSID']} (from payload)"
+    owner_id, owner_name = None, _pd_value(payload, "salesperson")
+    if owner_name.isdigit():
+        owner_id, owner_name = owner_name, ""
+    if not owner_id and not owner_name:
+        try:
+            if deal_id:
+                owner = pd_get_deal(deal_id).get("user_id")
+            elif person_id:
+                owner = pd_get_person(person_id).get("owner_id")
+            else:
+                owner = None
+            if isinstance(owner, dict):
+                owner_id, owner_name = owner.get("id"), owner.get("name") or ""
+            elif owner:
+                owner_id = owner
+        except Exception as e:
+            logger.warning(f"rm-customer-sync: could not read the Pipedrive owner: {_scrub_token(e)}")
+            return f"salesperson {fields['C_SLSID'] or '(none)'} (default — Pipedrive owner lookup failed)"
+    who = owner_name or (f"user {owner_id}" if owner_id else "")
+    if not who:
+        return f"salesperson {fields['C_SLSID'] or '(none)'} (default — no owner)"
+    code = _salesperson_for_owner(owner_id, owner_name)
+    if code:
+        fields["C_SLSID"] = code
+        return f"salesperson {code} ({who})"
+    return f"salesperson {fields['C_SLSID'] or '(none)'} (default — {who} has no RM sales id on the Users page)"
 
 
 def _cid_write_back_target(person_id):
@@ -1604,6 +1888,7 @@ def rm_customer_sync():
                 out["pipedrive"]  = _write_cid_to_person(person_id, existing_cid, deal_id)
             return jsonify(out), 200
 
+        sls_note = _resolve_salesperson(payload, fields, deal_id, person_id)
         if not RM_CUSTOMER_SYNC_ENABLED:
             first, last = rollmaster.split_name(name)
             try:
@@ -1613,7 +1898,7 @@ def rm_customer_sync():
             except Exception as e:
                 logger.exception("dry-run cid preview failed")
                 cid = f"(unavailable: {e})"
-            action = f"DRY RUN — would create {cid} ({fields['C_NAME']})"
+            action = f"DRY RUN — would create {cid} ({fields['C_NAME']}), {sls_note}"
             logger.info(f"rm-customer-sync {action}")
             with get_db() as conn:
                 store_event(conn, deal_id, None, "RM_CUSTOMER_DRYRUN", "customer", payload, action)
@@ -1623,7 +1908,7 @@ def rm_customer_sync():
                             "would_write_back": _cid_write_back_target(person_id)}), 200
 
         cid, resp = rollmaster.create_customer(fields, name=name)
-        action = f"Created Rollmaster customer {cid} ({fields['C_NAME']})"
+        action = f"Created Rollmaster customer {cid} ({fields['C_NAME']}), {sls_note}"
         logger.info(f"rm-customer-sync {action}")
         with get_db() as conn:
             store_event(conn, deal_id, None, "RM_CUSTOMER_CREATED", "customer", payload, action)

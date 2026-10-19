@@ -12,6 +12,7 @@ The schedule (time, days, timezone) lives in the `settings` table and is
 edited via /reports/settings — change it in the UI, no crontab edits needed.
 
 What it does on every cron tick:
+  0. Once a day, re-pull the M365 group membership (m365_users).
   1. Read schedule (HH:MM, days, tz) from the settings table.
   2. Skip if today's day-of-week isn't enabled.
   3. Skip if local time is before HH:MM.
@@ -140,10 +141,25 @@ def _dispatch_for_user(user, subscribed_keys: set[str], ctx: ReportContext,
         return False
 
 
+def _refresh_m365_daily(now: datetime) -> None:
+    """Re-pull the M365 group once a day (first cron tick of the day) so joiners and
+    leavers show up without anyone pressing Sync. A failure is logged, not fatal —
+    the reports still go out to the membership from the last good sync."""
+    today = now.strftime("%Y-%m-%d")
+    if m365_directory.get_setting("m365.last_synced_date") == today:
+        return
+    try:
+        log.info("M365 group sync: %s", m365_directory.sync_users())
+        m365_directory.set_setting("m365.last_synced_date", today)
+    except Exception:
+        log.exception("M365 group sync failed")
+
+
 def run_scheduled() -> dict:
     """Cron entry point. Returns a summary dict (also logged)."""
     schedule = _read_schedule()
     now = datetime.now(ZoneInfo(schedule["tz"]))
+    _refresh_m365_daily(now)
     due, why = _should_dispatch(now, schedule)
     if not due:
         log.info("scheduler tick: skipped (%s)", why)

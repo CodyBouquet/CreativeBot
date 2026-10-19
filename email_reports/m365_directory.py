@@ -250,6 +250,16 @@ def set_rm_sales_id(email: str, rm_sales_id: str | None) -> None:
             "UPDATE m365_users SET rm_sales_id = ? WHERE email = ?",
             (val, email.lower()),
         )
+        # Mirror onto the CreativeBot user mapped to this account (Users page),
+        # which keeps its own copy for the cross-system mapping.
+        try:
+            c.execute(
+                "UPDATE users SET rm_sales_id = ? WHERE m365_graph_id = "
+                "(SELECT graph_id FROM m365_users WHERE email = ?)",
+                (val, email.lower()),
+            )
+        except sqlite3.OperationalError:
+            pass  # users table/column not migrated yet (app.py hasn't started)
 
 
 # ---- Run audit ------------------------------------------------------------
