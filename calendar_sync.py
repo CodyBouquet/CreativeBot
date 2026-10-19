@@ -26,10 +26,10 @@ fingerprint of what was written, so unchanged events aren't re-sent.
 Outlook → Arrivy: every READBACK_MINUTES the synced events are read back
 from Outlook (poll_outlook). For someone with "Can reschedule from Outlook"
 on the Users page, on a single-day Measure or Inspection: a time change is
-pushed to Arrivy as a reschedule, and deleting the event cancels the task in
-Arrivy (cancel, not delete, so it can be reopened there). Arrivy's own
-webhook then carries either on to Pipedrive and the other assignees'
-calendars. Any other change (no permission, other task types, multi-day
+pushed to Arrivy as a reschedule, and deleting the event deletes the task in
+Arrivy (a delete, not a cancel, because the Pipedrive automations act on
+deletes). Arrivy's own webhook then carries either on to Pipedrive and the
+other assignees' calendars. Any other change (no permission, other task types, multi-day
 jobs) is put back to what Arrivy says.
 
 Notes: the event body is the task's Arrivy Details and nothing else. On
@@ -493,14 +493,12 @@ def push_reschedule(task_id, start_utc, end_utc):
     return r.json() if r.content else {}
 
 
-def push_cancel(task_id, who):
-    """Cancel an Arrivy task (a status change, so it can be reopened in Arrivy)."""
-    tz = _zone(None)
-    r = requests.post(f"{ARRIVY_BASE}/tasks/{task_id}/status/new", headers=_arrivy_headers(), timeout=30,
-                      json={"type": "CANCELLED", "time": datetime.now(tz).isoformat(timespec="seconds"),
-                            "extra_fields": {"notes": f"Cancelled from Outlook by {who} (CreativeBot)"}})
-    if r.status_code >= 400:
-        raise RuntimeError(f"Arrivy POST /tasks/{task_id}/status/new -> HTTP {r.status_code}: {r.text[:200]}")
+def push_delete(task_id):
+    """Delete an Arrivy task. Arrivy then sends TASK_DELETED, which the Pipedrive
+    automations act on (a cancel they ignore). Already gone counts as done."""
+    r = requests.delete(f"{ARRIVY_BASE}/tasks/{task_id}", headers=_arrivy_headers(), timeout=30)
+    if r.status_code >= 400 and r.status_code != 404:
+        raise RuntimeError(f"Arrivy DELETE /tasks/{task_id} -> HTTP {r.status_code}: {r.text[:200]}")
 
 
 def _put_back(row, task, why):
@@ -513,11 +511,11 @@ def _put_back(row, task, why):
 
 
 def _would_write(row, status, body):
-    """Which Arrivy write this event's Outlook state would cause ('cancel', 'notes',
+    """Which Arrivy write this event's Outlook state would cause ('delete', 'notes',
     'reschedule'), or None. Mirrors poll_outlook's rules without touching anything."""
     editable = row["template"] in READBACK_TEMPLATES and (row["days"] or 1) <= 1
     if status == 404 or (status == 200 and body.get("isCancelled")):
-        return "cancel" if editable and _can_reschedule(row["graph_id"])[1] else None
+        return "delete" if editable and _can_reschedule(row["graph_id"])[1] else None
     if status != 200:
         return None
     if row["template"] in READBACK_TEMPLATES:
@@ -592,7 +590,7 @@ def poll_outlook():
                           [(t,) for t in tasks])
         for t in tasks:
             sync_task(t)
-        kinds = ", ".join(f"{k} {sum(1 for _, x in pending if x == k)}" for k in ("notes", "reschedule", "cancel")
+        kinds = ", ".join(f"{k} {sum(1 for _, x in pending if x == k)}" for k in ("notes", "reschedule", "delete")
                           if any(x == k for _, x in pending))
         log.warning(f"calendar read-back: {len(pending)} Outlook changes in one pass ({kinds}) — "
                     f"over the limit of {MAX_ARRIVY_WRITES_PER_POLL}; nothing sent to Arrivy, events put back")
@@ -600,30 +598,30 @@ def poll_outlook():
                       f"in {READBACK_MINUTES} min — nothing sent to Arrivy, {len(tasks)} events put back from Arrivy",
                 "CAL_OUTLOOK_PAUSED")
         return {"checked": len(rows), "paused": len(pending)}
-    moved = reverted = recreated = cancelled = noted = 0
+    moved = reverted = recreated = deleted = noted = 0
     notes_done = set()
     for path, row in paths.items():
         status, body = results.get(path, (None, {}))
         if status == 404 or (status == 200 and body.get("isCancelled")):
-            # Deleted in Outlook: cancels the task in Arrivy when permitted, else it's put back.
+            # Deleted in Outlook: deletes the task in Arrivy when permitted, else it's put back.
             task = fetch_task(row["task_id"])
             who, allowed = _can_reschedule(row["graph_id"])
             label = TEMPLATE_LABELS.get(row["template"]) or "task"
             if (task and allowed and row["template"] in READBACK_TEMPLATES and (row["days"] or 1) <= 1
                     and str(task.get("status") or "").upper() not in GONE_STATUSES):
                 try:
-                    push_cancel(row["task_id"], who)
+                    push_delete(row["task_id"])
                 except Exception as e:
-                    _put_back(row, task, f"Arrivy refused {who}'s Outlook cancel of {label} {row['task_id']}: {str(e)[:160]} — put back")
+                    _put_back(row, task, f"Arrivy refused {who}'s Outlook delete of {label} {row['task_id']}: {str(e)[:160]} — put back")
                     reverted += 1
                     continue
                 with _conn() as c:   # the event is already gone from Outlook
                     c.execute("DELETE FROM calendar_events WHERE task_id=? AND graph_id=? AND day=?",
                               (row["task_id"], row["graph_id"], row["day"]))
-                _record(task, f"{who} deleted {label} {row['task_id']} in Outlook — cancelled in Arrivy",
-                        "CAL_OUTLOOK_CANCELLED")
+                _record(task, f"{who} deleted {label} {row['task_id']} in Outlook — deleted in Arrivy",
+                        "CAL_OUTLOOK_DELETED")
                 enqueue(row["task_id"])   # clear the other assignees' copies
-                cancelled += 1
+                deleted += 1
                 continue
             with _conn() as c:
                 c.execute("UPDATE calendar_events SET fingerprint='' WHERE task_id=? AND graph_id=? AND day=?",
@@ -631,7 +629,7 @@ def poll_outlook():
             sync_task(row["task_id"])
             if task and str(task.get("status") or "").upper() not in GONE_STATUSES:
                 why = ("can't change appointments from Outlook" if not allowed else
-                       "only single-day measures and inspections can be cancelled there")
+                       "only single-day measures and inspections can be deleted there")
                 _record(task, f"{who} deleted {label} {row['task_id']} in Outlook but {why} — put back",
                         "CAL_OUTLOOK_REVERTED")
             recreated += 1
@@ -701,10 +699,10 @@ def poll_outlook():
                     "CAL_OUTLOOK_RESCHEDULED")
             enqueue(row["task_id"])   # bring every other assignee's copy along
             moved += 1
-    if moved or reverted or recreated or cancelled or noted:
-        log.info(f"calendar read-back: checked {len(rows)}, rescheduled {moved}, cancelled {cancelled}, "
+    if moved or reverted or recreated or deleted or noted:
+        log.info(f"calendar read-back: checked {len(rows)}, rescheduled {moved}, deleted {deleted}, "
                  f"notes {noted}, put back {reverted}, recreated {recreated}")
-    return {"checked": len(rows), "rescheduled": moved, "cancelled": cancelled, "notes": noted,
+    return {"checked": len(rows), "rescheduled": moved, "deleted": deleted, "notes": noted,
             "reverted": reverted, "recreated": recreated}
 
 
