@@ -119,6 +119,10 @@
     z-index: 1;
   }
   .panel.active { display: flex; flex-direction: column; gap: 12px; }
+  /* Cards are overflow:hidden flex children — without this they shrink to the
+     panel's height and clip their rows, leaving nothing to scroll. */
+  .panel > *, .sheet-body > * { flex-shrink: 0; }
+  .panel, .sheet-body { touch-action: pan-y; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
 
   .section-title {
     font-size: 10px;
