@@ -14,7 +14,8 @@ webhook is missed, a crew is reassigned or a mapping changes. It runs:
   * per task, from the Arrivy webhook (queued to a worker thread, so a slow
     Graph call never holds up the webhook), and
   * as a sweep every SWEEP_MINUTES over tasks from yesterday to SWEEP_DAYS
-    ahead, which also does the first backfill.
+    ahead, which also does the first backfill and is the only thing that
+    catches notes edited in Arrivy (Arrivy sends no webhook for those).
 
 A multi-day task becomes one event per day with that day's hours (Arrivy's
 start time to end time), so a three-day install doesn't block nights.
@@ -63,7 +64,9 @@ MODE          = os.environ.get("M365_CALENDAR_SYNC", "off").strip().lower()
 DB_PATH       = os.environ.get("DB_PATH", "/home/admin/CreativeBot/data/sync.db")
 ARRIVY_BASE   = "https://app.arrivy.com/api"
 GRAPH_BASE    = "https://graph.microsoft.com/v1.0"
-SWEEP_MINUTES = int(os.environ.get("M365_CALENDAR_SWEEP_MINUTES", "30"))
+# Arrivy sends no webhook when only a task's Details (notes) change, so the sweep
+# is what carries those to Outlook — keep it short.
+SWEEP_MINUTES = int(os.environ.get("M365_CALENDAR_SWEEP_MINUTES", "5"))
 SWEEP_DAYS    = int(os.environ.get("M365_CALENDAR_SWEEP_DAYS", "60"))
 READBACK_MINUTES = int(os.environ.get("M365_CALENDAR_READBACK_MINUTES", "2"))
 # Circuit breaker: more Outlook→Arrivy writes than this in one read-back means
