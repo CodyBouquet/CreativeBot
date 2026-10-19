@@ -522,6 +522,15 @@ def _would_write(row, status, body):
     return None
 
 
+def _unchanged_since_read(row):
+    """True when the event hasn't been rewritten (by a sweep or webhook) since this read-back
+    loaded it — otherwise what we read from Outlook may predate the rewrite."""
+    with _conn() as c:
+        cur = c.execute("SELECT updated_at FROM calendar_events WHERE task_id=? AND graph_id=? AND day=?",
+                        (row["task_id"], row["graph_id"], row["day"])).fetchone()
+    return bool(cur) and cur["updated_at"] == row["updated_at"]
+
+
 def poll_outlook():
     """Read the synced, upcoming events back from Outlook and act on any changes (see module doc)."""
     if MODE != "on":
@@ -535,6 +544,8 @@ def poll_outlook():
     paths = {f"/users/{r['graph_id']}/events/{r['event_id']}?$select=start,end,isCancelled"
              + (",body" if r["template"] in READBACK_TEMPLATES else ""): r for r in rows}
     results = _batch_get(list(paths))
+    # Events rewritten while we were reading are skipped this round (next pass sees them fresh).
+    paths = {p: r for p, r in paths.items() if _unchanged_since_read(r)}
     pending = [(row, kind) for path, row in paths.items()
                if (kind := _would_write(row, *results.get(path, (None, {}))))]
     if len(pending) > MAX_ARRIVY_WRITES_PER_POLL:
@@ -595,12 +606,14 @@ def poll_outlook():
         edited = notes_from_body((body.get("body") or {}).get("content")) \
             if row["template"] in READBACK_TEMPLATES and row["task_id"] not in notes_done else None
         if edited is not None and row["notes"] is None:
-            # First look since the event was written: what Outlook shows is the baseline.
+            # First look since the event was written: what Outlook shows is the baseline —
+            # unless a rewrite landed after we read it, in which case the next pass takes it.
             with _conn() as c:
-                c.execute("UPDATE calendar_events SET notes=? WHERE task_id=? AND graph_id=? AND day=?",
-                          (edited, row["task_id"], row["graph_id"], row["day"]))
+                c.execute("UPDATE calendar_events SET notes=? WHERE task_id=? AND graph_id=? AND day=? "
+                          "AND notes IS NULL AND updated_at=?",
+                          (edited, row["task_id"], row["graph_id"], row["day"], row["updated_at"]))
         elif edited is not None:
-            if notes_key(edited) != notes_key(row["notes"]):
+            if notes_key(edited) != notes_key(row["notes"]) and _unchanged_since_read(row):
                 who, _ = _can_reschedule(row["graph_id"])
                 label = TEMPLATE_LABELS.get(row["template"]) or "task"
                 task = fetch_task(row["task_id"])
