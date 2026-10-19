@@ -22,6 +22,7 @@ load_dotenv()
 from email_reports import bp as reports_bp, m365_directory
 import rollmaster
 import user_directory
+import calendar_sync
 
 app = Flask(__name__)
 _secret = os.environ.get("FLASK_SECRET_KEY", "")
@@ -1446,6 +1447,13 @@ def arrivy_webhook():
         logger.info(f"Arrivy raw payload: {json.dumps(payload)}")
         logger.info(f"Arrivy: {event_type} (raw={raw_event_type}/{sub_type}) | template={template_id} | deal={external_id} | task={task_id}")
 
+        # Outlook calendars of the assigned (mapped) people follow every task, deal or
+        # not — queued, so Graph never slows the webhook. Progress-only status
+        # changes (en route, started…) can't move a calendar event, so skip those.
+        if (payload.get("OBJECT_TYPE") or "TASK") == "TASK" and (
+                raw_event_type != "TASK_STATUS" or event_type == "TASK_CANCELLED"):
+            calendar_sync.enqueue(task_id)
+
         deal_id   = arrivy_deal_id(payload)
         task_type = TEMPLATE_MAP.get(template_id)
 
@@ -1995,6 +2003,7 @@ def health():
 # ---------------------------------------------------------------------------
 init_db()
 app.register_blueprint(reports_bp)
+calendar_sync.start()   # Arrivy → M365 calendars; no-op unless M365_CALENDAR_SYNC is dry/on
 if RM_SYNC_SECRET:
     # Pull the customer-id list off-thread so the first sync webhook doesn't have
     # to wait on a multi-minute /customers walk.
