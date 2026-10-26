@@ -18,6 +18,7 @@ Two things about this API drive the shape of everything below:
 """
 import json
 from collections import Counter
+from contextlib import contextmanager
 import logging
 import os
 import re
@@ -99,6 +100,65 @@ def _headers(token):
     return {"Accept": "application/json", "x-api-key": API_KEY, "token": token}
 
 
+# One branch session at a time: the account allows a single client session.
+_branch_lock = threading.Lock()
+
+
+@contextmanager
+def branch_session(branch, company=None):
+    """
+    Yield the token of a private session with only `branch` active, closing it on exit.
+
+    Rollmaster defaults some of a new customer's records (its ship-to 0000 tax
+    code, among others) from the branches active in the creating session — a
+    customer keyed in by a branch-3 user gets USE-IN on its ship-to. The shared
+    application token has branches 1 and 3 both active, and the costing sync and
+    reports read through it, so it must never be narrowed. Instead this opens a
+    short-lived client session (its own branch selection), switches it with
+    /changebranch, and ends it with DELETE /token. The account allows one client
+    session, hence the lock; an orphaned one (a crash mid-create) idles out
+    after ~5 minutes.
+    """
+    company = str(company or COMPANY)
+    branch = str(branch).strip()
+    with _branch_lock:
+        r = requests.post(
+            f"{BASE_URL}/{ALIAS}/token",
+            headers={"Accept": "application/json", "x-api-key": API_KEY},
+            data={"username": USERNAME, "password": PASSWORD, "granttype": "client"},
+            timeout=30,
+        )
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        token = data.get("TOKEN") if isinstance(data, dict) else None
+        if r.status_code != 200 or not token:
+            raise RollmasterError(f"could not open a branch {branch} session: "
+                                  f"HTTP {r.status_code} {api_error(data) or r.text[:200]}")
+        try:
+            r = requests.post(f"{BASE_URL}/{ALIAS}/changebranch", headers=_headers(token),
+                              files={"company": (None, company), "branch[0]": (None, branch)}, timeout=30)
+            try:
+                rows = r.json()
+            except ValueError:
+                rows = None
+            if r.status_code != 200 or not isinstance(rows, list):
+                raise RollmasterError(f"POST /changebranch -> HTTP {r.status_code}: {r.text[:200]}")
+            active = {str(x.get("BRANCH") or "").strip() for x in rows
+                      if str(x.get("COMPANY") or "").strip() == company and x.get("SELECTED") == "Y"}
+            if active != {branch}:
+                raise RollmasterError(f"/changebranch left company {company} on branches "
+                                      f"{sorted(active) or 'none'}, wanted {branch}")
+            yield token
+        finally:
+            try:
+                requests.delete(f"{BASE_URL}/{ALIAS}/token", headers=_headers(token),
+                                data={"granttype": "client"}, timeout=30)
+            except requests.RequestException:
+                logger.warning(f"Rollmaster: could not close the branch {branch} session; it will idle out")
+
+
 def api_error(data):
     """
     Return the error message carried by a BMS response body, or None if it looks clean.
@@ -165,7 +225,7 @@ def get_salesreps():
     return sorted(reps.values(), key=lambda r: r["initials"])
 
 
-def post_form(path, fields, timeout=120):
+def post_form(path, fields, timeout=120, token=None):
     """
     POST multipart/form-data to a BMS endpoint (the shape /customer expects) and
     return parsed JSON.
@@ -173,10 +233,11 @@ def post_form(path, fields, timeout=120):
     Every value is sent as a form part, empty strings included — the documented
     call passes all fields whether or not they carry a value. Raises
     RollmasterError on an HTTP error or an ERRORMSG in an otherwise-200 body.
+    `token` overrides the shared session (see branch_session).
     """
     files = {k: (None, "" if v is None else str(v)) for k, v in fields.items()}
     r = requests.post(f"{BASE_URL}/{ALIAS}/{path}",
-                      headers=_headers(get_token()), files=files, timeout=timeout)
+                      headers=_headers(token or get_token()), files=files, timeout=timeout)
     body = r.text[:400]
     try:
         data = r.json()
@@ -500,9 +561,14 @@ def build_customer_form(fields):
     return form
 
 
-def create_customer(fields, cid=None, name=None, retries=3):
+def create_customer(fields, cid=None, name=None, retries=3, branch=None):
     """
     Create a customer in Rollmaster and return (cid, response).
+
+    With a `branch`, the create runs in a session switched to that branch only
+    (branch_session), so Rollmaster's branch defaults — the ship-to tax code —
+    come out as if a user of that branch had keyed it in. Without one it uses
+    the shared session, as before.
 
     Pass an explicit `cid` to use it verbatim, or a `name` to have one minted from
     the known-id list. Because that list can be slightly stale — and because two
@@ -518,11 +584,19 @@ def create_customer(fields, cid=None, name=None, retries=3):
         first, last = split_name(name)
         cid = next_free_cid(cid_base(first, last), load_known_cids())
 
+    if branch:
+        with branch_session(branch) as token:
+            return _create(fields, cid, retries, token)
+    return _create(fields, cid, retries, None)
+
+
+def _create(fields, cid, retries, token):
+    """create_customer's POST loop, retrying an id collision with the next suffix."""
     attempt_cid = cid
     for attempt in range(retries):
         form = build_customer_form({**fields, "C_CID": attempt_cid})
         try:
-            resp = post_form("customer", form)
+            resp = post_form("customer", form, token=token)
         except RollmasterError as e:
             # Only an id collision is worth retrying; everything else (missing
             # required field, bad value) would fail identically on the next try.

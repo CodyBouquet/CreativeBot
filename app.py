@@ -152,16 +152,12 @@ except ValueError:
 # to someone is offered too.
 RM_BRANCHES = [b.strip() for b in os.environ.get("RM_BRANCHES", "1,2,3").split(",") if b.strip()]
 
-# Rollmaster tax code (C_TAXID) a NEW customer gets from its Pipedrive owner's
-# branch on the Users page. JSON {branch: code}; codes are Rollmaster's /taxcode
-# keys (USE = Illinois use tax, USE-IN = Indiana use tax). A branch not listed
-# leaves C_TAXID blank, as before.
-try:
-    RM_BRANCH_TAX_CODES = {str(k): v for k, v in json.loads(
-        os.environ.get("RM_BRANCH_TAX_CODES", '{"1": "USE", "3": "USE-IN"}')).items()}
-except ValueError:
-    RM_BRANCH_TAX_CODES = {"1": "USE", "3": "USE-IN"}
-    logging.warning("RM_BRANCH_TAX_CODES is not valid JSON — using the built-in branch tax codes")
+# Company-99 branches a NEW customer can be created "from": the create runs in a
+# Rollmaster session switched to the owner's branch, so the defaults Rollmaster
+# fills from the creating user's branch (ship-to tax code, …) match a customer
+# keyed in by hand there. An owner with no branch, or one not listed, is created
+# through the shared session (branches 1 and 3 active), as before.
+RM_CREATE_BRANCHES = {b.strip() for b in os.environ.get("RM_CREATE_BRANCHES", "1,3").split(",") if b.strip()}
 
 ALLOWED_DASHBOARD_IPS = {"127.0.0.1", "::1", "10.54.10.135"}
 DASHBOARD_ENDPOINTS  = {"landing", "sync_dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout", "api_health",
@@ -1771,24 +1767,25 @@ def _owner_user(owner_id=None, owner_name=""):
 def _resolve_owner_defaults(payload, fields, deal_id, person_id):
     """
     For a NEW customer (updates never touch either), file it under its Pipedrive
-    owner: C_SLSID = the owner's Rollmaster sales rep, C_TAXID = the tax code for
-    the owner's branch (RM_BRANCH_TAX_CODES). Returns a short note for the event log.
+    owner: C_SLSID = the owner's Rollmaster sales rep, and the create runs from
+    the owner's branch (see RM_CREATE_BRANCHES). Returns (note for the event log,
+    branch to create from — None when the owner has no branch listed there).
 
-    A value sent in the payload stands. Otherwise the owner is the one the payload
+    A rep sent in the payload stands. Otherwise the owner is the one the payload
     names, else the deal's owner, else the person's owner, read from Pipedrive.
     RM_SALESPERSON_MAP still overrides the rep. An unmapped owner — or a Pipedrive
     lookup that fails — keeps the defaults rather than holding up the create.
     """
     keys = {str(k).strip().lower() for k in (payload or {})}
     sls_given = bool(keys & {"c_slsid", "slsid"})
-    tax_given = bool(keys & {"c_taxid", "taxid"})
+    branch = None
 
-    def note(sls_why, tax_why):
+    def note(sls_why, branch_why):
         return (f"salesperson {fields['C_SLSID'] or '(none)'} ({sls_why}), "
-                f"tax {fields.get('C_TAXID') or '(none)'} ({tax_why})")
+                f"branch {branch or '(shared session)'} ({branch_why})"), branch
 
-    if sls_given and tax_given:
-        return note("from payload", "from payload")
+    # The owner is looked up even when the payload names the rep: the branch
+    # still comes from them.
     owner_id, owner_name = None, _pd_value(payload, "salesperson") if not sls_given else ""
     if owner_name.isdigit():
         owner_id, owner_name = owner_name, ""
@@ -1807,11 +1804,10 @@ def _resolve_owner_defaults(payload, fields, deal_id, person_id):
         except Exception as e:
             logger.warning(f"rm-customer-sync: could not read the Pipedrive owner: {_scrub_token(e)}")
             return note("from payload" if sls_given else "default — Pipedrive owner lookup failed",
-                        "from payload" if tax_given else "default — Pipedrive owner lookup failed")
+                        "Pipedrive owner lookup failed")
     who = owner_name or (f"user {owner_id}" if owner_id else "")
     if not who:
-        return note("from payload" if sls_given else "default — no owner",
-                    "from payload" if tax_given else "default — no owner")
+        return note("from payload" if sls_given else "default — no owner", "no owner")
     user = _owner_user(owner_id, owner_name) or {}
 
     sls_why = "from payload"
@@ -1823,18 +1819,15 @@ def _resolve_owner_defaults(payload, fields, deal_id, person_id):
             sls_why = who
         else:
             sls_why = f"default — {who} has no RM sales rep on the Users page"
-    tax_why = "from payload"
-    if not tax_given:
-        branch = user.get("rm_branch")
-        tax = RM_BRANCH_TAX_CODES.get(str(branch)) if branch else None
-        if tax:
-            fields["C_TAXID"] = tax
-            tax_why = f"{who}, branch {branch}"
-        elif branch:
-            tax_why = f"default — no tax code set for branch {branch}"
-        else:
-            tax_why = f"default — {who} has no branch on the Users page"
-    return note(sls_why, tax_why)
+    owner_branch = str(user.get("rm_branch") or "")
+    if owner_branch in RM_CREATE_BRANCHES:
+        branch = owner_branch
+        branch_why = who
+    elif owner_branch:
+        branch_why = f"{who}'s branch {owner_branch} is not in RM_CREATE_BRANCHES"
+    else:
+        branch_why = f"{who} has no branch on the Users page"
+    return note(sls_why, branch_why)
 
 
 def _cid_write_back_target(person_id):
@@ -1981,7 +1974,7 @@ def rm_customer_sync():
                 out["pipedrive"]  = _write_cid_to_person(person_id, existing_cid, deal_id)
             return jsonify(out), 200
 
-        sls_note = _resolve_owner_defaults(payload, fields, deal_id, person_id)
+        sls_note, branch = _resolve_owner_defaults(payload, fields, deal_id, person_id)
         if not RM_CUSTOMER_SYNC_ENABLED:
             first, last = rollmaster.split_name(name)
             try:
@@ -1996,11 +1989,11 @@ def rm_customer_sync():
             with get_db() as conn:
                 store_event(conn, deal_id, None, "RM_CUSTOMER_DRYRUN", "customer", payload, action)
             sse_notify()
-            return jsonify({"status": "dry-run", "cid": cid,
+            return jsonify({"status": "dry-run", "cid": cid, "branch": branch,
                             "would_send": rollmaster.build_customer_form({**fields, "C_CID": cid}),
                             "would_write_back": _cid_write_back_target(person_id)}), 200
 
-        cid, resp = rollmaster.create_customer(fields, name=name)
+        cid, resp = rollmaster.create_customer(fields, name=name, branch=branch)
         action = f"Created Rollmaster customer {cid} ({fields['C_NAME']}), {sls_note}"
         logger.info(f"rm-customer-sync {action}")
         with get_db() as conn:
