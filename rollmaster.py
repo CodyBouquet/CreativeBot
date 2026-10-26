@@ -48,6 +48,11 @@ CID_CACHE          = os.environ.get(
 )
 CID_CACHE_MAX_AGE_HOURS = 12
 
+# Emails staff key in when a customer won't give one. Many unrelated customers
+# share them, so they never link a Pipedrive person to a Rollmaster account.
+PLACEHOLDER_EMAILS = {e.strip().lower() for e in os.environ.get(
+    "RM_PLACEHOLDER_EMAILS", "test@creativecarpetinc.com").split(",") if e.strip()}
+
 _token_lock = threading.Lock()
 _token      = None
 _token_at   = 0.0
@@ -493,13 +498,16 @@ def find_existing_customer(name, phones=(), email=""):
     Phone (either number on the record) or email must match exactly — a name
     alone is never enough, since the same name recurs many times. When several
     customers share a phone (families, landlords) the one whose name carries
-    the person's surname wins.
+    the person's surname wins. A placeholder email (PLACEHOLDER_EMAILS) is
+    ignored, leaving phone as the only way to match.
     """
     _, customers, _ = _read_cache()
     if not customers:
         return None
     want_phones = {p for p in (_digits(x) for x in phones) if p}
     want_email  = (email or "").strip().lower()
+    if want_email in PLACEHOLDER_EMAILS:
+        want_email = ""
     hits = {}
     for c in customers:
         cid, cname, p1, p2, em = c[0].upper(), c[1], c[2], c[3], c[4]
