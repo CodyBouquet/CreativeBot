@@ -32,10 +32,12 @@ deletes). Arrivy's own webhook then carries either on to Pipedrive and the
 other assignees' calendars. Any other change (no permission, other task types, multi-day
 jobs) is put back to what Arrivy says.
 
-Notes: the event body is the task's Arrivy Details and nothing else. On
-Measures and Inspections anyone mapped may edit it in Outlook; the read-back
-pushes the whole body to Arrivy's Details (and so to every other assignee's
-copy). On other task types the body is shown but edits aren't synced.
+Notes: the event body is the customer's phone and email (CONTACT_LABELS
+lines) and then the task's Arrivy Details. On Measures and Inspections anyone
+mapped may edit the notes in Outlook; the read-back pushes them to Arrivy's
+Details (and so to every other assignee's copy) — the contact lines are
+always rewritten from Arrivy, never read back. On other task types the body
+is shown but edits aren't synced.
 
 M365_CALENDAR_SYNC: "off" (default), "dry" (log what it would do, write
 nothing), "on".
@@ -86,6 +88,11 @@ TEMPLATE_LABELS = {
 }
 # Templates an Outlook reschedule may write back to Arrivy (Measure, Inspection).
 READBACK_TEMPLATES = {5627485400596480, 5546469558321152}
+# Lines heading the event body; dropped again when notes are read back from Outlook.
+CONTACT_LABELS = ("Phone", "Email")
+# Shared 'no email' filler in Arrivy — not worth showing.
+PLACEHOLDER_EMAILS = {e.strip().lower() for e in os.environ.get(
+    "RM_PLACEHOLDER_EMAILS", "test@creativecarpetinc.com").split(",") if e.strip()}
 # Arrivy statuses whose task no longer happens.
 GONE_STATUSES = {"CANCELLED", "CANCEL"}
 
@@ -248,10 +255,15 @@ def event_body(task, day_index, day_count, crew_names):
     address = (task.get("customer_address") or ", ".join(p for p in (
         task.get("customer_address_line_1"), task.get("customer_city"),
         task.get("customer_state"), task.get("customer_zipcode")) if p) or "").strip()
-    # The body is the Arrivy notes and nothing else: the name is in the subject,
-    # the address in the location.
+    # The body is the customer's phone and email, then the Arrivy notes: the name
+    # is in the subject, the address in the location.
+    phone = (task.get("customer_mobile_number") or task.get("customer_phone") or "").strip()
+    email = (task.get("customer_email") or "").strip()
+    if email.lower() in PLACEHOLDER_EMAILS:
+        email = ""
+    contact = [f"{k}: {html.escape(v)}<br>" for k, v in zip(CONTACT_LABELS, (phone, email)) if v]
     notes = (task.get("details") or "").strip()
-    parts = [html.escape(notes).replace("\n", "<br>")]
+    parts = contact + (["<br>"] if contact and notes else []) + [html.escape(notes).replace("\n", "<br>")]
     return {
         "subject": subject[:255],
         "body": {"contentType": "HTML", "content": "".join(parts)},
@@ -460,8 +472,14 @@ def notes_key(text):
 
 
 def notes_from_body(text):
-    """The notes from an event body read as text — the whole body."""
-    return norm_notes(text or "")
+    """The notes from an event body read as text — the body less the contact lines heading it."""
+    lines = norm_notes(text or "").split("\n")
+    for label in CONTACT_LABELS:
+        while lines and not lines[0].strip():   # Outlook may space the lines out
+            lines.pop(0)
+        if lines and lines[0].startswith(f"{label}:"):
+            lines.pop(0)
+    return norm_notes("\n".join(lines))
 
 
 def push_notes(task_id, notes):
