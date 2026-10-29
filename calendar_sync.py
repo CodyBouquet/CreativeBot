@@ -1,8 +1,11 @@
 """
 Arrivy → Microsoft 365 calendars.
 
-Every Arrivy task is copied into the Outlook calendar of each assigned person
-who is mapped on the Users page (Arrivy entity → M365 account). Events are
+Every Arrivy Measure and Inspection is copied into the Outlook calendar of each
+assigned person who is mapped on the Users page (Arrivy entity → M365 account).
+Other task types (installs, deliveries, pickups, ...) are not synced, and any
+copies of them already in Outlook are removed. Assigned people who aren't
+mapped get nothing: there is no fallback calendar. Events are
 written straight into the person's calendar through Graph (application
 permission Calendars.ReadWrite) with no attendees, so nobody gets an invite.
 
@@ -86,6 +89,8 @@ TEMPLATE_LABELS = {
     6631019675910144: "Pickup",
     538634486456320:  "Customer Pickup",
 }
+# Templates copied to Outlook at all (Measure, Inspection). Anything else is left off the calendars.
+SYNC_TEMPLATES = {5627485400596480, 5546469558321152}
 # Templates an Outlook reschedule may write back to Arrivy (Measure, Inspection).
 READBACK_TEMPLATES = {5627485400596480, 5546469558321152}
 # Lines heading the event body; dropped again when notes are read back from Outlook.
@@ -303,7 +308,7 @@ def sync_task(task_id, task=None, fetched=False):
             task = fetch_task(task_id)
         want = {}   # (graph_id, day) → event resource
         meta = {}
-        if task:
+        if task and task.get("template") in SYNC_TEMPLATES:   # other types: want stays empty, so any copies are deleted
             people = _mapped_people(task.get("entity_ids"))
             slots = task_slots(task) if people else []
             for gid in people:
