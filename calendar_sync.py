@@ -51,6 +51,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
@@ -249,6 +250,17 @@ def _deal_id(task):
     return ref if ref.isdigit() else None
 
 
+def format_phone(raw):
+    """Arrivy's '+17085190261' → '(708) 519-0261'. Anything that isn't a 10-digit
+    US number (or 1 + 10 digits) is shown as Arrivy has it."""
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 11 and digits[0] == "1":
+        digits = digits[1:]
+    if len(digits) == 10:
+        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+    return (raw or "").strip()
+
+
 def event_body(task, day_index, day_count, crew_names):
     """The Graph event resource for one day of a task (start/end are filled in by the caller)."""
     label = TEMPLATE_LABELS.get(task.get("template")) or ""
@@ -262,7 +274,7 @@ def event_body(task, day_index, day_count, crew_names):
         task.get("customer_state"), task.get("customer_zipcode")) if p) or "").strip()
     # The body is the customer's phone and email, then the Arrivy notes: the name
     # is in the subject, the address in the location.
-    phone = (task.get("customer_mobile_number") or task.get("customer_phone") or "").strip()
+    phone = format_phone(task.get("customer_mobile_number") or task.get("customer_phone"))
     email = (task.get("customer_email") or "").strip()
     if email.lower() in PLACEHOLDER_EMAILS:
         email = ""
