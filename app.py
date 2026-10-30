@@ -93,9 +93,6 @@ MEASURE_ROLLBACK_STAGE_ID      = 70   # "in store contact" — when measure is c
 # Scheduling a measure only advances a deal that is still in an early sales stage; anything
 # further along keeps the stage it already has.
 MEASURE_SCHEDULABLE_STAGE_IDS  = {1, 70, 2}   # Lead In, In Store - Contact, Via Phone - Contact
-INSPECTION_SCHEDULED_STAGE_ID  = 36
-INSPECTION_COMPLETE_STAGE_ID   = 37
-INSPECTION_ROLLBACK_STAGE_ID   = 50   # "Customer Contacted/Attempted" — when inspection is cancelled/deleted
 DELIVERY_STATUS_COMPLETE_ID    = 114  # option ID for "Complete" in the delivery_status dropdown
 
 INSTALL_PHASE_OPTIONS = {
@@ -549,25 +546,25 @@ def handle_measure(conn, event_type, deal_id, task_id, object_date):
         return "Moved to Measure Complete"
 
 def handle_inspection(conn, event_type, deal_id, task_id, object_date):
-    """Apply an Arrivy inspection-task event to the deal: set/clear the date (reuses the measure_date field) and move between scheduled/complete/rollback stages. Returns an action summary string."""
+    """Apply an Arrivy inspection-task event to the deal: set/clear the date in the
+    measure_date field, and nothing else — inspections never move the deal's stage.
+    Returns an action summary string."""
     date = parse_arrivy_date(object_date)
     if event_type in ("TASK_CREATED", "TASK_UPDATED", "TASK_RESCHEDULED"):
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: date})
         upsert_task_state(conn, task_id, deal_id, "inspection", date)
-        pd_move_stage(deal_id, INSPECTION_SCHEDULED_STAGE_ID)
-        return f"Set inspection date → {date}, moved to Scheduled"
+        return f"Set inspection date → {date}"
     elif event_type == "TASK_DELETED":
         delete_task_state(conn, task_id)
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
-        return f"Cleared inspection date, {move_stage_if_in(deal_id, {INSPECTION_SCHEDULED_STAGE_ID}, INSPECTION_ROLLBACK_STAGE_ID, 'Customer Contacted/Attempted')}"
+        return "Cleared inspection date"
     elif event_type == "TASK_CANCELLED":
         pd_update_deal(deal_id, {PD_FIELDS["measure_date"]: None})
         upsert_task_state(conn, task_id, deal_id, "inspection", date, status="cancelled")
-        return f"Cleared inspection date, {move_stage_if_in(deal_id, {INSPECTION_SCHEDULED_STAGE_ID}, INSPECTION_ROLLBACK_STAGE_ID, 'Customer Contacted/Attempted')}"
+        return "Cleared inspection date"
     elif event_type == "TASK_COMPLETED":
         upsert_task_state(conn, task_id, deal_id, "inspection", date, status="completed")
-        pd_move_stage(deal_id, INSPECTION_COMPLETE_STAGE_ID)
-        return "Moved to Inspection Complete"
+        return "Inspection completed (no Pipedrive change)"
 
 def delete_task_state(conn, task_id):
     """Hard-delete a task's tracked state row (used on TASK_DELETED)."""
