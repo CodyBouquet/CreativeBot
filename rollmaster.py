@@ -24,7 +24,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -195,6 +195,57 @@ def get(path, params, timeout=300):
     if err:
         raise RollmasterError(f"GET /{path} -> {err}")
     return data
+
+
+class ServerError(RollmasterError):
+    """A 5xx from Rollmaster: its side failed, not our request."""
+
+
+def get_orderlines(company, branch, startdate, enddate, fetch=None):
+    """
+    Every /orderline row for one branch between startdate and enddate ('YYYYMMDD'),
+    one row per order line.
+
+    Rollmaster answers a big /orderline pull with an HTTP 500 (branch 1 crossed
+    that point in October 2026 at roughly 3,000 lines), so a range that fails
+    with a 5xx is split in half and each half fetched, down to a single day.
+    The date filter matches lines on more than one day, so the halves overlap
+    and rows are de-duplicated by order and line number.
+
+    fetch(params) -> list of rows, raising ServerError on a 5xx; it defaults to
+    get() and lets a caller with its own session reuse the splitting.
+    """
+    if fetch is None:
+        def fetch(params):
+            try:
+                return get("orderline", params)
+            except RollmasterError as e:
+                if re.search(r"HTTP 5\d\d", str(e)):
+                    raise ServerError(str(e)) from e
+                raise
+
+    def _day(s):
+        return datetime.strptime(s, "%Y%m%d").date()
+
+    rows, splits = {}, 0
+    pending = [(_day(startdate), _day(enddate))]
+    while pending:
+        start, end = pending.pop()
+        try:
+            got = fetch({"company": company, "branch": branch,
+                         "startdate": start.strftime("%Y%m%d"), "enddate": end.strftime("%Y%m%d")})
+        except ServerError:
+            if start >= end:
+                raise
+            mid = start + (end - start) // 2
+            pending += [(start, mid), (mid + timedelta(days=1), end)]
+            splits += 1
+            continue
+        for ln in got or []:
+            rows[(str(ln.get("DMI_ORDNO", "")).strip(), str(ln.get("DMI_LNNUM", "")).strip())] = ln
+    if splits:
+        logger.info(f"Rollmaster: /orderline company {company} branch {branch} was split {splits}x to stay under its size limit")
+    return list(rows.values())
 
 
 # Companies whose sales reps are offered on the Users page. Reps are set up per

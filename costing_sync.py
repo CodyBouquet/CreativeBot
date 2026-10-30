@@ -138,8 +138,7 @@ def rm_material_status(stocked, company):
     branches = sorted({str(o.get("DMO_WHSE", "")).strip() for o in orders if str(o.get("DMO_WHSE", "")).strip()})
     lines_by_order = {}
     for br in branches:
-        for ln in rollmaster.get("orderline", {"company": company, "branch": br,
-                                               "startdate": ORDER_HISTORY_FLOOR, "enddate": end}):
+        for ln in rollmaster.get_orderlines(company, br, ORDER_HISTORY_FLOOR, end):
             ordno = str(ln.get("DMI_ORDNO", "")).strip()
             if ordno in open_nos:
                 lines_by_order.setdefault(ordno, []).append(ln)

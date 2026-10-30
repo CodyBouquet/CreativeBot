@@ -49,6 +49,10 @@ except ImportError:
 
 load_dotenv()
 
+# The repo root, so rollmaster imports when this file is run directly too.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+import rollmaster  # noqa: E402  (needs .env loaded first)
+
 API_KEY  = os.environ["BMS_API_KEY"]
 USERNAME = os.environ["BMS_USERNAME"]
 PASSWORD = os.environ["BMS_PASSWORD"]
@@ -236,14 +240,24 @@ def pull_open_orders(S, end):
 
 
 def pull_orderline_bulk(S, branch, end):
-    """Fetch every order line for one branch over the history window; [] on non-200. /orderline has no per-SKU filter, so we pull the branch and filter locally."""
-    r = _get(
-        S, "orderline",
-        {"company": COMPANY, "branch": branch,
-         "startdate": cfg.ORDER_HISTORY_FLOOR, "enddate": end},
-        timeout=300,
-    )
-    return r.json() if r.status_code == 200 else []
+    """
+    Fetch every order line for one branch over the history window; [] if it can't
+    be read. /orderline has no per-SKU filter, so we pull the branch and filter
+    locally. Rollmaster 500s on a big pull, so rollmaster.get_orderlines splits the
+    date range until each piece comes back.
+    """
+    def fetch(params):
+        r = _get(S, "orderline", params, timeout=300)
+        if r.status_code >= 500:
+            raise rollmaster.ServerError(f"GET /orderline -> HTTP {r.status_code}")
+        if r.status_code != 200:
+            raise rollmaster.RollmasterError(f"GET /orderline -> HTTP {r.status_code}: {r.text[:200]}")
+        return r.json()
+    try:
+        return rollmaster.get_orderlines(COMPANY, branch, cfg.ORDER_HISTORY_FLOOR, end, fetch=fetch)
+    except rollmaster.RollmasterError as e:
+        print(f"orderline branch {branch}: {e} — its committed quantities are left out", file=sys.stderr)
+        return []
 
 
 def pull_committed(S, target):
