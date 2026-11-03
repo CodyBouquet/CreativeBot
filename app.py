@@ -1990,13 +1990,21 @@ def rm_customer_sync():
                             "would_send": rollmaster.build_customer_form({**fields, "C_CID": cid}),
                             "would_write_back": _cid_write_back_target(person_id)}), 200
 
-        cid, resp = rollmaster.create_customer(fields, name=name, branch=branch)
+        cid, resp, branch_used = rollmaster.create_customer(fields, name=name, branch=branch)
         action = f"Created Rollmaster customer {cid} ({fields['C_NAME']}), {sls_note}"
+        branch_fallback = bool(branch) and not branch_used
+        if branch_fallback:
+            # The branch session was taken (Rollmaster allows one client session),
+            # so the create went through the shared session and the record carries
+            # the shared session's defaults, not branch {branch}'s.
+            action += (f" — WARNING: branch {branch} session was in use, created on the shared "
+                       f"session instead; check the ship-to tax code in Rollmaster")
         logger.info(f"rm-customer-sync {action}")
         with get_db() as conn:
             store_event(conn, deal_id, None, "RM_CUSTOMER_CREATED", "customer", payload, action)
         sse_notify()
         return jsonify({"status": "ok", "action": "create", "cid": cid, "response": resp,
+                        "branch": branch_used, "branch_fallback": branch_fallback,
                         "pipedrive": _write_cid_to_person(person_id, cid, deal_id)}), 200
 
     except rollmaster.RollmasterError as e:

@@ -108,6 +108,22 @@ def _headers(token):
 # One branch session at a time: the account allows a single client session.
 _branch_lock = threading.Lock()
 
+# When that one session is already taken (a person logged in as the API user,
+# or an orphan Rollmaster hasn't idled out yet), the open is retried a few
+# times before giving up. Kept short: the Pipedrive automation that calls the
+# create endpoint is waiting on the answer.
+SESSION_OPEN_ATTEMPTS = 3
+SESSION_OPEN_PAUSE    = 5   # seconds between attempts
+
+
+class SessionLimit(RollmasterError):
+    """Rollmaster refused a client session: its one allowed session is already in use."""
+
+
+def _is_session_limit(msg):
+    """True for Rollmaster's 'LIMIT OF 001 SESSIONS REACHED client' refusal."""
+    return "SESSIONS REACHED" in str(msg or "").upper()
+
 
 @contextmanager
 def branch_session(branch, company=None):
@@ -127,20 +143,31 @@ def branch_session(branch, company=None):
     company = str(company or COMPANY)
     branch = str(branch).strip()
     with _branch_lock:
-        r = requests.post(
-            f"{BASE_URL}/{ALIAS}/token",
-            headers={"Accept": "application/json", "x-api-key": API_KEY},
-            data={"username": USERNAME, "password": PASSWORD, "granttype": "client"},
-            timeout=30,
-        )
-        try:
-            data = r.json()
-        except ValueError:
-            data = {}
-        token = data.get("TOKEN") if isinstance(data, dict) else None
-        if r.status_code != 200 or not token:
-            raise RollmasterError(f"could not open a branch {branch} session: "
-                                  f"HTTP {r.status_code} {api_error(data) or r.text[:200]}")
+        token = None
+        for attempt in range(1, SESSION_OPEN_ATTEMPTS + 1):
+            r = requests.post(
+                f"{BASE_URL}/{ALIAS}/token",
+                headers={"Accept": "application/json", "x-api-key": API_KEY},
+                data={"username": USERNAME, "password": PASSWORD, "granttype": "client"},
+                timeout=30,
+            )
+            try:
+                data = r.json()
+            except ValueError:
+                data = {}
+            token = data.get("TOKEN") if isinstance(data, dict) else None
+            if r.status_code == 200 and token:
+                break
+            err = api_error(data) or r.text[:200]
+            why = f"could not open a branch {branch} session: HTTP {r.status_code} {err}"
+            if not _is_session_limit(err):
+                raise RollmasterError(why)
+            if attempt < SESSION_OPEN_ATTEMPTS:
+                logger.warning(f"Rollmaster: client session in use (attempt {attempt}/{SESSION_OPEN_ATTEMPTS}); "
+                               f"retrying in {SESSION_OPEN_PAUSE}s")
+                time.sleep(SESSION_OPEN_PAUSE)
+            else:
+                raise SessionLimit(why)
         try:
             r = requests.post(f"{BASE_URL}/{ALIAS}/changebranch", headers=_headers(token),
                               files={"company": (None, company), "branch[0]": (None, branch)}, timeout=30)
@@ -622,12 +649,18 @@ def build_customer_form(fields):
 
 def create_customer(fields, cid=None, name=None, retries=3, branch=None):
     """
-    Create a customer in Rollmaster and return (cid, response).
+    Create a customer in Rollmaster and return (cid, response, branch_used).
 
     With a `branch`, the create runs in a session switched to that branch only
     (branch_session), so Rollmaster's branch defaults — the ship-to tax code —
     come out as if a user of that branch had keyed it in. Without one it uses
     the shared session, as before.
+
+    If the branch session can't be opened because the account's one client
+    session is taken (SessionLimit, after branch_session's own retries), the
+    customer is still created, on the shared session, rather than dropped: a
+    missed customer costs more than a tax code to fix. `branch_used` is then
+    None, so the caller can say so in its log.
 
     Pass an explicit `cid` to use it verbatim, or a `name` to have one minted from
     the known-id list. Because that list can be slightly stale — and because two
@@ -644,9 +677,15 @@ def create_customer(fields, cid=None, name=None, retries=3, branch=None):
         cid = next_free_cid(cid_base(first, last), load_known_cids())
 
     if branch:
-        with branch_session(branch) as token:
-            return _create(fields, cid, retries, token)
-    return _create(fields, cid, retries, None)
+        try:
+            with branch_session(branch) as token:
+                cid, resp = _create(fields, cid, retries, token)
+                return cid, resp, str(branch).strip()
+        except SessionLimit as e:
+            logger.warning(f"Rollmaster: {e}; creating {cid} on the shared session instead "
+                           f"(branch {branch} defaults not applied)")
+    cid, resp = _create(fields, cid, retries, None)
+    return cid, resp, None
 
 
 def _create(fields, cid, retries, token):
