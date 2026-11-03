@@ -35,8 +35,12 @@ deletes). Arrivy's own webhook then carries either on to Pipedrive and the
 other assignees' calendars. Any other change (no permission, other task types, multi-day
 jobs) is put back to what Arrivy says.
 
-Notes: the event body is the customer's phone and email (CONTACT_LABELS
-lines) and then the task's Arrivy Details. On Measures and Inspections anyone
+A completed task stays on the calendars (Arrivy archives it on completion;
+that is not treated as gone), but read-only: a delete, move or notes edit in
+Outlook is put back from Arrivy, never pushed.
+
+Notes: the event body is the customer's phone (10 bare digits) and email
+(CONTACT_LABELS lines) and then the task's Arrivy Details. On Measures and Inspections anyone
 mapped may edit the notes in Outlook; the read-back pushes them to Arrivy's
 Details (and so to every other assignee's copy) — the contact lines are
 always rewritten from Arrivy, never read back. On other task types the body
@@ -101,6 +105,14 @@ PLACEHOLDER_EMAILS = {e.strip().lower() for e in os.environ.get(
     "RM_PLACEHOLDER_EMAILS", "test@creativecarpetinc.com").split(",") if e.strip()}
 # Arrivy statuses whose task no longer happens.
 GONE_STATUSES = {"CANCELLED", "CANCEL"}
+# Statuses the Outlook read-back must never write back to Arrivy: a finished job
+# is not deleted, moved or re-noted from a calendar — any such change is put back.
+READONLY_STATUSES = GONE_STATUSES | {"COMPLETE"}
+
+
+def _readonly(task):
+    """True when a task's status means Outlook edits to its events are put back, not pushed."""
+    return str((task or {}).get("status") or "").upper() in READONLY_STATUSES
 
 _namespace = uuid.UUID("6f1d3c52-6c7e-4c38-9a53-0a1f3e0c2b11")
 _queue: "queue.Queue[int]" = queue.Queue()
@@ -214,8 +226,12 @@ def task_slots(task):
     isn't on the schedule (cancelled, unscheduled, no time). Multi-day tasks
     get one slot per day running from the start time to the end time.
     """
-    if (str(task.get("status") or "").upper() in GONE_STATUSES or task.get("unscheduled")
-            or task.get("is_without_datetime") or task.get("to_be_deleted") or task.get("is_archived")):
+    status = str(task.get("status") or "").upper()
+    # Arrivy archives a task when it is completed; a finished appointment stays
+    # on the calendar, so "archived" only counts as gone for anything else.
+    archived = bool(task.get("is_archived")) and status != "COMPLETE"
+    if (status in GONE_STATUSES or task.get("unscheduled")
+            or task.get("is_without_datetime") or task.get("to_be_deleted") or archived):
         return []
     start_s = task.get("start_datetime_original_iso_str") or task.get("start_datetime")
     end_s   = task.get("end_datetime_original_iso_str") or task.get("end_datetime")
@@ -251,13 +267,14 @@ def _deal_id(task):
 
 
 def format_phone(raw):
-    """Arrivy's '+17085190261' → '(708) 519-0261'. Anything that isn't a 10-digit
-    US number (or 1 + 10 digits) is shown as Arrivy has it."""
+    """Arrivy's '+17085190261' → '7085190261': the bare 10 digits, so it can be
+    dialled or pasted as is. Anything that isn't a 10-digit US number (or 1 + 10
+    digits) is shown as Arrivy has it."""
     digits = re.sub(r"\D", "", raw or "")
     if len(digits) == 11 and digits[0] == "1":
         digits = digits[1:]
     if len(digits) == 10:
-        return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
+        return digits
     return (raw or "").strip()
 
 
@@ -266,7 +283,10 @@ def event_body(task, day_index, day_count, crew_names):
     label = TEMPLATE_LABELS.get(task.get("template")) or ""
     customer = (task.get("customer_name") or " ".join(
         p for p in (task.get("customer_first_name"), task.get("customer_last_name")) if p) or "").strip()
-    subject = f"{label}: {customer}" if label and customer else (task.get("title") or label or "Arrivy task")
+    # "Measure: Jane Smith", or "Measure: <Arrivy title>" when the task carries
+    # no customer name — the label leads either way, so every copy reads alike.
+    name = customer or (task.get("title") or "").strip()
+    subject = f"{label}: {name}" if label and name else (name or label or "Arrivy task")
     if day_count > 1:
         subject += f" (day {day_index + 1} of {day_count})"
     address = (task.get("customer_address") or ", ".join(p for p in (
@@ -643,7 +663,7 @@ def poll_outlook():
             who, allowed = _can_reschedule(row["graph_id"])
             label = TEMPLATE_LABELS.get(row["template"]) or "task"
             if (task and allowed and row["template"] in READBACK_TEMPLATES and (row["days"] or 1) <= 1
-                    and str(task.get("status") or "").upper() not in GONE_STATUSES):
+                    and not _readonly(task)):
                 try:
                     push_delete(row["task_id"])
                 except Exception as e:
@@ -663,7 +683,8 @@ def poll_outlook():
                           (row["task_id"], row["graph_id"], row["day"]))
             sync_task(row["task_id"])
             if task and str(task.get("status") or "").upper() not in GONE_STATUSES:
-                why = ("can't change appointments from Outlook" if not allowed else
+                why = ("it is completed" if _readonly(task) else
+                       "can't change appointments from Outlook" if not allowed else
                        "only single-day measures and inspections can be deleted there")
                 _record(task, f"{who} deleted {label} {row['task_id']} in Outlook but {why} — put back",
                         "CAL_OUTLOOK_REVERTED")
@@ -686,7 +707,11 @@ def poll_outlook():
                 who, _ = _can_reschedule(row["graph_id"])
                 label = TEMPLATE_LABELS.get(row["template"]) or "task"
                 task = fetch_task(row["task_id"])
-                if task and str(task.get("status") or "").upper() not in GONE_STATUSES:
+                if task and _readonly(task) and str(task.get("status") or "").upper() not in GONE_STATUSES:
+                    _put_back(row, task, f"{who} edited the notes on {label} {row['task_id']} in Outlook but it is completed — put back")
+                    reverted += 1
+                    continue
+                if task and not _readonly(task):
                     try:
                         push_notes(row["task_id"], notes_key(edited))   # without the blank lines Outlook adds
                         notes_done.add(row["task_id"])   # other copies still show the old text this round
@@ -709,7 +734,12 @@ def poll_outlook():
         label = (TEMPLATE_LABELS.get(row["template"]) or "task")
         if not task:
             continue   # task deleted in Arrivy; the next reconcile removes the event
-        if not allowed:
+        if _readonly(task):
+            if str(task.get("status") or "").upper() in GONE_STATUSES:
+                continue   # cancelled in Arrivy; the next reconcile removes the event
+            _put_back(row, task, f"{who} moved {label} {row['task_id']} in Outlook but it is completed — put back")
+            reverted += 1
+        elif not allowed:
             _put_back(row, task, f"{who} moved {label} {row['task_id']} in Outlook but can't reschedule from Outlook — put back")
             reverted += 1
         elif row["template"] not in READBACK_TEMPLATES or (row["days"] or 1) > 1:
