@@ -156,6 +156,14 @@ RM_BRANCHES = [b.strip() for b in os.environ.get("RM_BRANCHES", "1,2,3").split("
 # through the shared session (branches 1 and 3 active), as before.
 RM_CREATE_BRANCHES = {b.strip() for b in os.environ.get("RM_CREATE_BRANCHES", "1,3").split(",") if b.strip()}
 
+# Warehouse (C_WHSE) a NEW customer gets from its owner's branch, as "branch:whse"
+# pairs. The branch session alone does not give a branch-3 customer branch 3's
+# ship-to tax code; the warehouse is what Rollmaster keys that default from.
+# A branch not listed keeps RM_C_WHSE; a C_WHSE sent in the payload always wins.
+RM_BRANCH_WHSE = dict(pair.split(":", 1) for pair in
+                      (p.strip() for p in os.environ.get("RM_BRANCH_WHSE", "3:3").split(","))
+                      if ":" in pair)
+
 ALLOWED_DASHBOARD_IPS = {"127.0.0.1", "::1", "10.54.10.135"}
 DASHBOARD_ENDPOINTS  = {"landing", "sync_dashboard", "logs", "users", "pin_page", "verify_pin", "change_pin", "logout", "api_health",
                         "api_stats", "api_stream", "api_logs", "settings_page",
@@ -1775,11 +1783,13 @@ def _resolve_owner_defaults(payload, fields, deal_id, person_id):
     """
     keys = {str(k).strip().lower() for k in (payload or {})}
     sls_given = bool(keys & {"c_slsid", "slsid"})
+    whse_given = "c_whse" in keys
     branch = None
 
     def note(sls_why, branch_why):
         return (f"salesperson {fields['C_SLSID'] or '(none)'} ({sls_why}), "
-                f"branch {branch or '(shared session)'} ({branch_why})"), branch
+                f"branch {branch or '(shared session)'} ({branch_why}), "
+                f"warehouse {fields.get('C_WHSE') or '(none)'}"), branch
 
     # The owner is looked up even when the payload names the rep: the branch
     # still comes from them.
@@ -1817,6 +1827,8 @@ def _resolve_owner_defaults(payload, fields, deal_id, person_id):
         else:
             sls_why = f"default — {who} has no RM sales rep on the Users page"
     owner_branch = str(user.get("rm_branch") or "")
+    if not whse_given and RM_BRANCH_WHSE.get(owner_branch):
+        fields["C_WHSE"] = RM_BRANCH_WHSE[owner_branch]
     if owner_branch in RM_CREATE_BRANCHES:
         branch = owner_branch
         branch_why = who
