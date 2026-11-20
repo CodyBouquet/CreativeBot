@@ -1869,9 +1869,70 @@ def _sync_key_ok():
     return hmac.compare_digest(supplied.strip().rstrip("/"), RM_SYNC_SECRET)
 
 
+# Pipedrive resends an automation webhook it gets no answer to within ~10s, and a
+# create can take longer than that (waiting on a busy branch session). Without
+# serialising, the resend passes every duplicate check before the first request
+# has created the customer, and the person ends up with SMIJOH and SMIJOH1.
+# So requests for the same person run one at a time: the resend waits, then sees
+# the Customer ID the first one wrote and updates instead of creating.
+_CUSTOMER_SYNC_LOCK_WAIT = 180          # s; past this, 503 and let Pipedrive retry
+_RECENT_CID_TTL          = 30 * 60      # s; how long a just-created id is remembered
+_customer_sync_locks = {}
+_customer_sync_locks_guard = threading.Lock()
+_recent_cids = {}                       # person key -> (cid, created_at)
+
+
+def _customer_sync_key(payload):
+    """Serialisation key for a sync payload: the Pipedrive person id, else the normalised name."""
+    pid = str(_pd_value(payload, "person_id") or "").strip()
+    if pid.isdigit():
+        return f"person:{pid}"
+    name = re.sub(r"[^a-z0-9]", "", str(_pd_value(payload, "name") or "").lower())
+    return f"name:{name}" if name else None
+
+
+def _customer_sync_lock(key):
+    """The lock for one person (created on first use)."""
+    with _customer_sync_locks_guard:
+        return _customer_sync_locks.setdefault(key, threading.Lock())
+
+
+def _remember_cid(key, cid):
+    """Record a just-created customer id, so a resend still sees it if the Pipedrive write-back failed."""
+    if key:
+        _recent_cids[key] = (cid, time.time())
+
+
+def _recent_cid(key):
+    """A customer id this process created for this person in the last _RECENT_CID_TTL seconds, else ''."""
+    hit = _recent_cids.get(key) if key else None
+    if hit and time.time() - hit[1] < _RECENT_CID_TTL:
+        return hit[0]
+    return ""
+
+
 @app.route("/rm-customer-sync/", methods=["POST"])
 @app.route("/rm-customer-sync", methods=["POST"])
 def rm_customer_sync():
+    """Serialise sync requests per person (see _customer_sync_lock), then run the sync."""
+    if not _sync_key_ok():
+        logger.warning(f"Rejected rm-customer-sync from {request.remote_addr} (bad or missing key)")
+        return jsonify({"error": "unauthorized"}), 401
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    key = _customer_sync_key(payload)
+    if not key:
+        return _rm_customer_sync(None)
+    lock = _customer_sync_lock(key)
+    if not lock.acquire(timeout=_CUSTOMER_SYNC_LOCK_WAIT):
+        logger.warning(f"rm-customer-sync: {key} still busy after {_CUSTOMER_SYNC_LOCK_WAIT}s, asking for a retry")
+        return jsonify({"error": "a sync for this customer is already running, retry"}), 503
+    try:
+        return _rm_customer_sync(key)
+    finally:
+        lock.release()
+
+
+def _rm_customer_sync(sync_key):
     """
     Pipedrive → Rollmaster customer create.
 
@@ -1912,6 +1973,10 @@ def rm_customer_sync():
         # it (or fires on every edit) can't create duplicates.
         existing_cid = _pd_value(payload, "cid").strip().upper()
         matched_how = None
+        if not existing_cid:
+            existing_cid = _recent_cid(sync_key)
+            if existing_cid:
+                logger.info(f"rm-customer-sync: {sync_key} was created as {existing_cid} moments ago — updating, not creating")
         if not existing_cid and _cid_write_back_target(person_id):
             try:
                 existing_cid = str(pd_get_person(person_id).get(RM_PD_CID_FIELD) or "").strip().upper()
@@ -1991,6 +2056,7 @@ def rm_customer_sync():
                             "would_write_back": _cid_write_back_target(person_id)}), 200
 
         cid, resp, branch_used = rollmaster.create_customer(fields, name=name, branch=branch)
+        _remember_cid(sync_key, cid)
         action = f"Created Rollmaster customer {cid} ({fields['C_NAME']}), {sls_note}"
         branch_fallback = bool(branch) and not branch_used
         if branch_fallback:
