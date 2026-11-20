@@ -20,6 +20,11 @@ An order's material is all in when every material line on it is one of:
 Anything else — a line still on a PO (status O), or a special-order SKU that is
 unassigned with no PO — means the order is still waiting.
 
+A deal sitting in the Quality Control stage is never marked Costed, even when
+its order is all in: an all-stocked order can still be waiting on a special
+charge line standing in for a SKU that hasn't been added yet, and QC has to
+look at it before it moves on.
+
 Once a deal is Costed, the sync remembers which material lines the order had.
 If a NEW material line later appears on the order and is waiting (on a PO or
 not yet ordered), Material Received is cleared back to (none) and "Short
@@ -65,6 +70,9 @@ ENABLED            = os.environ.get("RM_COSTING_SYNC_ENABLED", "0") == "1"
 PD_JOB_FIELD   = os.environ.get("PD_RM_JOB_FIELD",   "90775bc3828d314573699aab24c6c7fb8c9019ec")
 PD_MAT_FIELD   = os.environ.get("PD_MATERIAL_FIELD", "93b963a5979add976477b833fcab6803ea30bdbe")
 PD_MAT_COSTED  = os.environ.get("PD_MATERIAL_COSTED_OPTION", "29")     # option id of "Costed"
+
+# Deals in this stage (Installation > "Quality control") are never marked Costed.
+PD_QC_STAGE_ID = int(os.environ.get("PD_QC_STAGE_ID", "7"))
 
 # When a deal is un-costed because material was added, also tick this option
 # on the "Short or Add On / Excess Material on Jobsite" multi-select (option 132
@@ -276,6 +284,7 @@ def run(dry_run=False):
     """
     One pass over every open deal that carries an RM Job #:
 
+      not Costed, deal in Quality Control    -> nothing (QC must clear it first)
       not Costed, order all in / labor-only  -> mark Costed, record baseline
       Costed, no baseline yet                -> record baseline (hand-marked deals)
       Costed, a NEW line is waiting          -> clear Costed (+ optional field)
@@ -353,6 +362,9 @@ def run(dry_run=False):
             drop_baseline(job)                       # someone cleared it by hand; start fresh
         if info["status"] == "waiting":
             summary["waiting"] += 1
+            continue
+        if deal.get("stage_id") is not None and int(deal["stage_id"]) == PD_QC_STAGE_ID:
+            summary["in quality control"] += 1
             continue
         action = f"{'Marked' if write else 'DRY RUN — would mark'} Costed — {info['detail']}"
         if write:
